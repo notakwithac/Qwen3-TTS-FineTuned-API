@@ -7,7 +7,7 @@
 <p>
 
 <p align="center">
-&nbsp&nbsp🤗 <a href="https://huggingface.co/collections/Qwen/qwen3-tts">Hugging Face</a>&nbsp&nbsp | &nbsp&nbsp🤖 <a href="https://modelscope.cn/collections/Qwen/Qwen3-TTS">ModelScope</a>&nbsp&nbsp | &nbsp&nbsp📑 <a href="https://qwen.ai/blog?id=qwen3tts-0115">Blog</a>&nbsp&nbsp | &nbsp&nbsp📑 <a href="https://github.com/QwenLM/Qwen3-TTS/blob/main/assets/Qwen3_TTS.pdf">Paper</a>&nbsp&nbsp
+&nbsp&nbsp🤗 <a href="https://huggingface.co/collections/Qwen/qwen3-tts">Hugging Face</a>&nbsp&nbsp | &nbsp&nbsp🤖 <a href="https://modelscope.cn/collections/Qwen/Qwen3-TTS">ModelScope</a>&nbsp&nbsp | &nbsp&nbsp📑 <a href="https://qwen.ai/blog?id=qwen3tts-0115">Blog</a>&nbsp&nbsp | &nbsp&nbsp📑 <a href="https://arxiv.org/abs/2601.15621">Paper</a>&nbsp&nbsp
 <br>
 🖥️ <a href="https://huggingface.co/spaces/Qwen/Qwen3-TTS">Hugging Face Demo</a>&nbsp&nbsp | &nbsp&nbsp 🖥️ <a href="https://modelscope.cn/studios/Qwen/Qwen3-TTS">ModelScope Demo</a>&nbsp&nbsp | &nbsp&nbsp💬 <a href="https://github.com/QwenLM/Qwen/blob/main/assets/wechat.png">WeChat (微信)</a>&nbsp&nbsp | &nbsp&nbsp🫨 <a href="https://discord.gg/CV4E9rpNSD">Discord</a>&nbsp&nbsp | &nbsp&nbsp📑 <a href="https://help.aliyun.com/zh/model-studio/qwen-tts-realtime">API</a>
 
@@ -38,7 +38,7 @@ We release **Qwen3-TTS**, a series of powerful speech generation capabilities de
 - [vLLM Usage](#vllm-usage)
 - [Fine Tuning](#fine-tuning)
 - [Evaluation](#evaluation)
-<!-- - [Citation](#citation) -->
+- [Citation](#citation)
 
 ## Overview
 ### Introduction
@@ -1339,18 +1339,23 @@ During evaluation, we ran inference for all models with `dtype=torch.bfloat16` a
 </details>
 
 
-<!-- ## Citation
+## Citation
 
 If you find our paper and code useful in your research, please consider giving a star :star: and citation :pencil: :)
-
 
 ```BibTeX
 @article{Qwen3-TTS,
   title={Qwen3-TTS Technical Report},
-  author={},
-  journal={arXiv preprint arXiv:},
+  author={Hangrui Hu and Xinfa Zhu and Ting He and Dake Guo and Bin Zhang and Xiong Wang and Zhifang Guo and Ziyue Jiang and Hongkun Hao and Zishan Guo and Xinyu Zhang and Pei Zhang and Baosong Yang and Jin Xu and Jingren Zhou and Junyang Lin},
+  journal={arXiv preprint arXiv:2601.15621},
   year={2026}
 }
-``` -->
+```
+
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=QwenLM/Qwen-TTS&type=Date)](https://star-history.com/#QwenLM/Qwen-TTS&Date)
+
 
 <br>
