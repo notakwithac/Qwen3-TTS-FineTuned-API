@@ -7,10 +7,9 @@ name = "qwen-tts"
 version = "0.0.4"
 description = "Qwen-TTS python package"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 classifiers = [
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
@@ -29,6 +28,7 @@ dependencies = [
   "sox",
   "onnxruntime",
   "einops",
+  "flash-attn",
 ]
 
 [project.urls]
@@ -44,3 +44,27 @@ include-package-data = true
 
 [tool.setuptools.package-data]
 qwen_tts = ["py.typed", "**/*.npz"]
+
+[project.optional-dependencies]
+cu128 = [
+  "torch==2.8.0",
+  "torchvision>=0.23.0",
+  "torchaudio>=2.8.0"
+]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu128", extra = "cu128" },
+]
+torchvision = [
+  { index = "pytorch-cu128", extra = "cu128" },
+]
+torchaudio = [
+  { index = "pytorch-cu128", extra = "cu128" },
+]
+flash-attn = { path = "flash_attn-2.8.3+cu128torch2.8.0cxx11abiFALSE-cp311-cp311-win_amd64.whl" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
