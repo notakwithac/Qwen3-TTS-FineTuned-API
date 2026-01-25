@@ -50,20 +50,6 @@ def train():
     parser.add_argument("--speaker_name", type=str, default="speaker_test")
     parser.add_argument("--save_interval", type=int, default=1, help="Save a checkpoint every N epochs.")
     parser.add_argument("--save_last/--no-save_last", dest="save_last", default=True, action=argparse.BooleanOptionalAction, help="Always save the final epoch checkpoint.")
-    parser.add_argument(
-        "--save_inference_copy/--no-save_inference_copy",
-        dest="save_inference_copy",
-        default=False,
-        action=argparse.BooleanOptionalAction,
-        help="Save an inference-ready checkpoint copy with tts_model_type=custom_voice.",
-    )
-    parser.add_argument(
-        "--checkpoint_model_type",
-        type=str,
-        default="custom_voice",
-        choices=["base", "custom_voice"],
-        help="tts_model_type written into saved checkpoints.",
-    )
     parser.add_argument("--log_interval", type=int, default=10, help="Log loss every N steps.")
     parser.add_argument("--logging_dir", type=str, default=None, help="Accelerate logging directory (e.g., runs/run1/logs).")
     parser.add_argument(
@@ -247,7 +233,6 @@ def train():
         output_config_file = os.path.join(output_dir, "config.json")
         with open(input_config_file, 'r', encoding='utf-8') as f:
             config_dict = json.load(f)
-        config_dict["tts_model_type"] = args.checkpoint_model_type
         talker_config = config_dict.get("talker_config", {})
         talker_config["spk_id"] = {
             args.speaker_name: 3000
@@ -276,15 +261,6 @@ def train():
         with open(trainer_state_path, "w", encoding="utf-8") as f:
             json.dump({"next_epoch": epoch_idx + 1, "global_step": global_step}, f, indent=2)
 
-        if args.save_inference_copy:
-            inference_root = Path(args.output_model_path) / "inference"
-            inference_dir = inference_root / f"checkpoint-epoch-{epoch_idx}"
-            shutil.copytree(output_dir, inference_dir, dirs_exist_ok=True)
-            inference_config_file = inference_dir / "config.json"
-            inference_config = dict(config_dict)
-            inference_config["tts_model_type"] = "custom_voice"
-            with open(inference_config_file, "w", encoding="utf-8") as f:
-                json.dump(inference_config, f, indent=2, ensure_ascii=False)
 
     for epoch in range(start_epoch, num_epochs):
         for step, batch in enumerate(train_dataloader):
