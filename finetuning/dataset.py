@@ -47,6 +47,10 @@ class TTSDataset(Dataset):
         if audio.ndim > 1:
             audio = np.mean(audio, axis=-1)
 
+        if int(sr) != 24000:
+            audio = librosa.resample(y=audio, orig_sr=sr, target_sr=24000)
+            sr = 24000
+
         return audio.astype(np.float32), int(sr)
 
     def _normalize_audio_inputs(self, audios: Union[AudioLike, List[AudioLike]]) -> List[Tuple[np.ndarray, int]]:

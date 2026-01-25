@@ -13,11 +13,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import sox
+try:
+    import sox
+except Exception:
+    sox = None
 import copy
 import torch
 import operator
 import onnxruntime
+import numpy as np
 
 import torch.nn as nn
 import torch.nn.functional as F
@@ -124,8 +128,10 @@ class XVectorExtractor(nn.Module):
         providers = ["CPUExecutionProvider"]
         self.ort_session = onnxruntime.InferenceSession(audio_codec_with_xvector, sess_options=option, providers=providers)
 
-        self.tfm = sox.Transformer()
-        self.tfm.norm(db_level=-6)
+        self.tfm = None
+        if sox is not None:
+            self.tfm = sox.Transformer()
+            self.tfm.norm(db_level=-6)
 
         self.mel_ext = MelSpectrogramFeatures(
             filter_length=1024,
@@ -155,7 +161,23 @@ class XVectorExtractor(nn.Module):
         return norm_embedding.numpy(), ref_mel.permute(0,2,1).squeeze(0).numpy()
     
     def sox_norm(self, audio):
-        wav_norm = self.tfm.build_array(input_array=audio, sample_rate_in=16000)
+        if self.tfm is None:
+            audio = np.asarray(audio, dtype=np.float32)
+            rms = float(np.sqrt(np.mean(np.square(audio)))) if audio.size else 0.0
+            if rms > 0.0:
+                target_rms = 10 ** (-6.0 / 20.0)
+                audio = audio * (target_rms / rms)
+            return audio
+
+        try:
+            wav_norm = self.tfm.build_array(input_array=audio, sample_rate_in=16000)
+        except Exception:
+            audio = np.asarray(audio, dtype=np.float32)
+            rms = float(np.sqrt(np.mean(np.square(audio)))) if audio.size else 0.0
+            if rms > 0.0:
+                target_rms = 10 ** (-6.0 / 20.0)
+                audio = audio * (target_rms / rms)
+            return audio
         return wav_norm
 
 

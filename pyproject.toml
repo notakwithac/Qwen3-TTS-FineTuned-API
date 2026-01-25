@@ -29,6 +29,7 @@ dependencies = [
   "onnxruntime",
   "einops",
   "flash-attn",
+  "tensorboard>=2.20.0",
 ]
 
 [project.urls]
