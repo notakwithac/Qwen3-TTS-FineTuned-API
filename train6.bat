@@ -7,6 +7,6 @@ uv run finetuning/sft_12hz.py ^
 --output_model_path runs/run1 ^
 --train_jsonl qwen3_test_qwen3_tts_dataset/train_with_codes.jsonl ^
 --batch_size 2 ^
---lr 2e-6 ^
+--lr 1e-7 ^
 --num_epochs 50 ^
 --speaker_name speaker_test
