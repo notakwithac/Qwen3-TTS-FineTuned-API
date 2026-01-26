@@ -1,0 +1,1 @@
+uv run finetuning/sft_12hz.py --no-flash-attn --lr_scheduler cosine --warmup_ratio 0.05 --save_interval 10 --init_model_path models/Qwen3-TTS-12Hz-0.6B-Base --output_model_path runs/run0_6 --train_jsonl qwen3_test_qwen3_tts_dataset/train_with_codes.jsonl --batch_size 32 --lr 2e-6 --num_epochs 50 --speaker_name speaker_1
