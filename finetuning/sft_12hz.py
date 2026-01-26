@@ -233,6 +233,7 @@ def train():
         output_config_file = os.path.join(output_dir, "config.json")
         with open(input_config_file, 'r', encoding='utf-8') as f:
             config_dict = json.load(f)
+        config_dict["tts_model_type"] = "custom_voice"
         talker_config = config_dict.get("talker_config", {})
         talker_config["spk_id"] = {
             args.speaker_name: 3000
