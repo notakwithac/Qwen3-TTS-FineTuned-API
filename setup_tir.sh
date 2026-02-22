@@ -1,34 +1,22 @@
 #!/bin/bash
-# =============================================================
-# E2E Networks TIR — One-time environment setup
-# Run this ONCE after cloning the repo inside the TIR notebook.
-# =============================================================
 set -e
 
-echo "=== [1/5] Installing uv package manager ==="
+echo "=== [1/6] Installing uv ==="
 curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 
-echo "=== [2/5] Creating Python 3.11 virtual environment ==="
-uv venv --python 3.11 .venv
+echo "=== [2/6] Creating Python 3.10 venv ==="
+uv venv --python 3.10 .venv
 source .venv/bin/activate
 
-echo "=== [3/5] Installing project dependencies ==="
-# On Linux we install flash-attn from PyPI (builds from source),
-# so we override the Windows-only .whl source.
-uv sync --extra cu128
+echo "=== [3/6] Syncing stable CUDA 12.1 deps ==="
+uv sync --extra cu121
 
-echo "=== [4/5] Verifying GPU access ==="
-python -c "import torch; print(f'PyTorch {torch.__version__}  CUDA available: {torch.cuda.is_available()}  Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"N/A\"}')"
+echo "=== [4/6] Limiting build to A100 arch ==="
+export TORCH_CUDA_ARCH_LIST="8.0"
 
-echo "=== [5/5] Downloading Qwen3-TTS models from HuggingFace ==="
-python download_models.py
+echo "=== [5/6] Installing flash-attn skipped ==="
+#uv pip install flash-attn --no-build-isolation
 
-echo ""
-echo "✅  Setup complete!  Next steps:"
-echo "   1. Set E2E storage credentials (optional):"
-echo "      export E2E_ACCESS_KEY=your_key"
-echo "      export E2E_SECRET_KEY=your_secret"
-echo "   2. Start the API server:"
-echo "      bash start_api.sh"
-echo "   3. API docs at: http://0.0.0.0:8000/docs"
+echo "=== [6/6] Verifying GPU ==="
+python -c "import torch; print(f'PyTorch {torch.__version__} | CUDA: {torch.version.cuda} | GPU: {torch.cuda.get_device_name(0)}')"

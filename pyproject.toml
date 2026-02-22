@@ -23,12 +23,10 @@ dependencies = [
   "accelerate==1.12.0",
   "gradio",
   "librosa",
-  "torchaudio",
   "soundfile",
   "sox",
   "onnxruntime",
   "einops",
-  "flash-attn",
   "tensorboard>=2.20.0",
   "fastapi>=0.115.0",
   "uvicorn[standard]>=0.34.0",
@@ -52,30 +50,28 @@ include-package-data = true
 qwen_tts = ["py.typed", "**/*.npz"]
 
 [project.optional-dependencies]
-cu128 = [
-  "torch==2.8.0",
-  "torchvision>=0.23.0",
-  "torchaudio>=2.8.0"
+cu121 = [
+  "torch==2.2.1",
+  "torchvision>=0.17.1",
+  "torchaudio>=2.2.1",
+  "flash-attn>=2.5.0"
 ]
 
 [tool.uv.sources]
 torch = [
-  { index = "pytorch-cu128", extra = "cu128" },
+  { index = "pytorch-cu121", extra = "cu121" },
 ]
 torchvision = [
-  { index = "pytorch-cu128", extra = "cu128" },
+  { index = "pytorch-cu121", extra = "cu121" },
 ]
 torchaudio = [
-  { index = "pytorch-cu128", extra = "cu128" },
-]
-flash-attn = [
-  { path = "flash_attn-2.8.3+cu128torch2.8.0cxx11abiFALSE-cp311-cp311-win_amd64.whl", marker = "sys_platform == 'win32'" },
+  { index = "pytorch-cu121", extra = "cu121" },
 ]
 
 [tool.uv.extra-build-dependencies]
 flash-attn = ["torch"]
 
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
 explicit = true
