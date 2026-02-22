@@ -1,0 +1,5 @@
+# Override file for Linux: install flash-attn from PyPI instead of the Windows .whl
+# Usage:  uv sync --extra cu128 --override pyproject-linux.toml
+
+[[tool.uv.override]]
+name = "flash-attn"

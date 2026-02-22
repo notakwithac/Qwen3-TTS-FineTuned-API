@@ -1,0 +1,40 @@
+# Dockerfile for running the fine-tuning API on E2E Networks TIR
+# Build:  docker build -f Dockerfile.tir -t qwen3-tts-api .
+# Run:    docker run --gpus all -p 8000:8000 qwen3-tts-api
+
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+
+# System dependencies for audio processing & building flash-attn
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl git build-essential libsndfile1 sox \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install uv
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
+
+# Copy project files
+COPY pyproject.toml pyproject-linux.toml uv.lock ./
+COPY qwen_tts/ ./qwen_tts/
+COPY finetuning/ ./finetuning/
+COPY MANIFEST.in ./
+
+# Install dependencies (Linux mode — flash-attn from PyPI)
+RUN uv venv --python 3.11 .venv && \
+    . .venv/bin/activate && \
+    uv sync --extra cu128 --override pyproject-linux.toml && \
+    uv pip install fastapi uvicorn python-multipart
+
+# Copy API / pipeline code
+COPY api_server.py pipeline.py inference_manager.py ./
+
+# Expose API port
+EXPOSE 8000
+
+# Run the API server
+ENV DEVICE=cuda:0
+ENV USE_FLASH_ATTN=1
+
+CMD ["/app/.venv/bin/uvicorn", "api_server:app", "--host", "0.0.0.0", "--port", "8000"]
