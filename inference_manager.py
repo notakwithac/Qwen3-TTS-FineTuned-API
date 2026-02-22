@@ -14,6 +14,7 @@ from typing import Optional, Dict
 
 import soundfile as sf
 import torch
+import traceback
 from qwen_tts import Qwen3TTSModel
 from ops_logger import ops_log
 
@@ -179,12 +180,32 @@ class InferenceManager:
         op = ops_log.start("model_load", extra={"model_type": model_type, "path": path})
         try:
             logger.info(f"Loading {model_type} model from {path}...")
-            model = Qwen3TTSModel.from_pretrained(
-                path,
-                device_map=self._device,
-                dtype=torch.bfloat16,
-                attn_implementation=self._attn_impl,
-            )
+            try:
+                model = Qwen3TTSModel.from_pretrained(
+                    path,
+                    device_map=self._device,
+                    dtype=torch.bfloat16,
+                    attn_implementation=self._attn_impl,
+                )
+            except Exception as e:
+                # If we tried flash_attention_2 and it failed, fallback to eager
+                if self._attn_impl == "flash_attention_2":
+                    err_str = str(e)
+                    if "FlashAttention2" in err_str or "flash-attn" in err_str or "package f" in err_str:
+                        logger.warning(
+                            f"Flash Attention (v2) could not be loaded for {path}. "
+                            f"Error: {err_str}. Falling back to 'eager' implementation."
+                        )
+                        model = Qwen3TTSModel.from_pretrained(
+                            path,
+                            device_map=self._device,
+                            dtype=torch.bfloat16,
+                            attn_implementation="eager",
+                        )
+                    else:
+                        raise e
+                else:
+                    raise e
             self._models[path] = (model, model_type, speaker_name)
             self._last_path = path
             self._last_type = model_type
