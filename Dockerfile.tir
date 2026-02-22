@@ -16,7 +16,7 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.local/bin:$PATH"
 
 # Copy project files
-COPY pyproject.toml pyproject-linux.toml uv.lock ./
+COPY pyproject.toml uv.lock ./
 COPY qwen_tts/ ./qwen_tts/
 COPY finetuning/ ./finetuning/
 COPY MANIFEST.in ./
@@ -24,7 +24,7 @@ COPY MANIFEST.in ./
 # Install dependencies (Linux mode — flash-attn from PyPI)
 RUN uv venv --python 3.11 .venv && \
     . .venv/bin/activate && \
-    uv sync --extra cu128 --override pyproject-linux.toml && \
+    uv sync --extra cu128 && \
     uv pip install fastapi uvicorn python-multipart
 
 # Copy API / pipeline code

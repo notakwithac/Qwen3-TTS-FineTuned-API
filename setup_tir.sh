@@ -16,7 +16,7 @@ source .venv/bin/activate
 echo "=== [3/5] Installing project dependencies ==="
 # On Linux we install flash-attn from PyPI (builds from source),
 # so we override the Windows-only .whl source.
-uv sync --extra cu128 --override pyproject-linux.toml
+uv sync --extra cu128
 
 echo "=== [4/5] Verifying GPU access ==="
 python -c "import torch; print(f'PyTorch {torch.__version__}  CUDA available: {torch.cuda.is_available()}  Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"N/A\"}')"
