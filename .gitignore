@@ -22,7 +22,7 @@ wheels/
 .vscode/
 venv/
 env/
-models/
+/models/
 runs/
 jobs/
 .env
