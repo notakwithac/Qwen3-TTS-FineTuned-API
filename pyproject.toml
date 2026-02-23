@@ -52,9 +52,9 @@ qwen_tts = ["py.typed", "**/*.npz"]
 
 [project.optional-dependencies]
 cu121 = [
-  "torch==2.2.1",
-  "torchvision>=0.17.1",
-  "torchaudio>=2.2.1",
+  "torch>=2.4.0",
+  "torchvision>=0.19.0",
+  "torchaudio>=2.4.0",
 ]
 
 flash = [
