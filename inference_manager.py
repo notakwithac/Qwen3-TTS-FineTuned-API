@@ -64,6 +64,7 @@ class InferenceManager:
         # Idle timeout (applies to the entire cache)
         self._idle_timeout = idle_timeout_seconds
         self._last_used: float = 0.0
+        self._active_requests: int = 0
         self._idle_timer: Optional[threading.Timer] = None
         self._auto_unload_enabled = idle_timeout_seconds > 0
 

@@ -64,7 +64,10 @@ class StorageClient:
                 aws_secret_access_key=self.secret_key,
                 endpoint_url=self.endpoint_url,
                 region_name=self.region,
-                config=BotoConfig(signature_version="s3v4"),
+                config=BotoConfig(
+                    signature_version="s3v4",
+                    max_pool_connections=50,
+                ),
             )
         return self._client
 

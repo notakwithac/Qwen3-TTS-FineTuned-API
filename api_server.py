@@ -23,6 +23,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -511,72 +512,74 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
     import asyncio
     from functools import partial
 
+    # Create a Semaphore to limit concurrent S3 checks and generation launching
+    # This matches the S3 connection pool size (50) to prevent urllib3 connection drops
+    concurrency_limit = asyncio.Semaphore(10)
+
     async def process_item(item, index):
-        text = item.get("text", "")
-        language = item.get("language", req.language)
-        instruct = item.get("instruct", "")
-        filename = item.get("filename", f"audio_{index:04d}.wav")
-        overwrite = item.get("overwrite", req.overwrite)
-        
-        # Construct S3 prefix
-        s3_prefix = f"audio/segments/{req.book_id}/{req.chapter_id}" if req.book_id and req.chapter_id else f"audio/{job_id}"
-        s3_key = f"{s3_prefix}/{filename}"
-        
-        # Fast-path check
-        if not overwrite and storage.is_configured:
-            # We must use thread executor since boto3 is blocking
+        async with concurrency_limit:
+            text = item.get("text", "")
+            language = item.get("language", req.language)
+            instruct = item.get("instruct", "")
+            filename = item.get("filename", f"audio_{index:04d}.wav")
+            overwrite = item.get("overwrite", req.overwrite)
+            
+            # Construct S3 prefix
+            s3_prefix = f"audio/segments/{req.book_id}/{req.chapter_id}" if req.book_id and req.chapter_id else f"audio/{job_id}"
+            s3_key = f"{s3_prefix}/{filename}"
+            
+            # Fast-path check
+            if not overwrite and storage.is_configured:
+                # We must use thread executor since boto3 is blocking
+                loop = asyncio.get_running_loop()
+                exists = await loop.run_in_executor(None, storage.object_exists, s3_key)
+                if exists:
+                    return {
+                        "s3_url": storage._object_url(s3_key),
+                        "presigned_url": storage.get_presigned_url(s3_key, expires_in=86400),
+                        "s3_key": s3_key,
+                        "sample_rate": 24000,
+                        "text": text,
+                        "job_id": job_id,
+                    }
+
+            # Run generation in a thread pool (InferenceManager handles the GPU semaphore)
             loop = asyncio.get_running_loop()
-            exists = await loop.run_in_executor(None, storage.object_exists, s3_key)
-            if exists:
+            try:
+                checkpoint_path = str(job.checkpoint_path)
+                wav_bytes, sr = await loop.run_in_executor(
+                    None,  # Uses default ThreadPoolExecutor
+                    partial(
+                        pipeline.generate,
+                        job_id=job_id,
+                        text=text,
+                        language=language,
+                        instruct=instruct,
+                        checkpoint_path=checkpoint_path,
+                        speaker_name=job.speaker_name,
+                    )
+                )
+
+                # Parallel S3 upload
+                s3_url = await loop.run_in_executor(
+                    None,
+                    partial(storage.upload_wav, wav_bytes, job_id, filename=filename, prefix=s3_prefix)
+                )
+                
+                s3_key = f"{s3_prefix}/{filename}"
+                presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
+
                 return {
-                    "s3_url": storage._object_url(s3_key),
-                    "presigned_url": storage.get_presigned_url(s3_key, expires_in=86400),
+                    "s3_url": s3_url,
+                    "presigned_url": presigned_url,
                     "s3_key": s3_key,
-                    "sample_rate": 24000,
+                    "sample_rate": sr,
                     "text": text,
                     "job_id": job_id,
                 }
-
-        # Run generation in a thread pool (InferenceManager handles the GPU semaphore)
-        loop = asyncio.get_running_loop()
-        try:
-            checkpoint_path = str(job.checkpoint_path)
-            wav_bytes, sr = await loop.run_in_executor(
-                None,  # Uses default ThreadPoolExecutor
-                partial(
-                    pipeline.generate,
-                    job_id=job_id,
-                    text=text,
-                    language=language,
-                    instruct=instruct,
-                    checkpoint_path=checkpoint_path,
-                    speaker_name=job.speaker_name,
-                )
-            )
-
-            # Construct S3 prefix
-            s3_prefix = f"audio/segments/{req.book_id}/{req.chapter_id}" if req.book_id and req.chapter_id else f"audio/{job_id}"
-
-            # Parallel S3 upload
-            s3_url = await loop.run_in_executor(
-                None,
-                partial(storage.upload_wav, wav_bytes, job_id, filename=filename, prefix=s3_prefix)
-            )
-            
-            s3_key = f"{s3_prefix}/{filename}"
-            presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
-
-            return {
-                "s3_url": s3_url,
-                "presigned_url": presigned_url,
-                "s3_key": s3_key,
-                "sample_rate": sr,
-                "text": text,
-                "job_id": job_id,
-            }
-        except Exception as e:
-            logger.error(f"Inference failed for item {index}: {e}")
-            return None
+            except Exception as e:
+                logger.error(f"Inference failed for item {index}: {e}")
+                return None
 
     tasks = [process_item(item, i) for i, item in enumerate(req.items)]
     results_raw = await asyncio.gather(*tasks)
