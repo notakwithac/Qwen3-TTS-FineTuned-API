@@ -114,6 +114,8 @@ class VoiceDesignRequest(BaseModel):
     language: str = "English"
     upload_to_s3: bool = True
     s3_filename: Optional[str] = None
+    character_name: Optional[str] = None
+    character_uuid: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -461,11 +463,43 @@ async def voice_design(req: VoiceDesignRequest):
     - "A young female voice, energetic and cheerful"
     - "A deep, gravelly old man's voice, speaking slowly"
     """
+    parts = []
+    if req.character_name:
+        safe_name = "".join(c for c in req.character_name if c.isalnum() or c in ("-", "_", " ")).strip().replace(" ", "_")
+        if safe_name:
+            parts.append(safe_name)
+    if req.character_uuid:
+        parts.append(req.character_uuid)
+        
+    if parts:
+        prefix = "_".join(parts)
+        if req.s3_filename:
+            if not req.s3_filename.startswith(prefix):
+                req.s3_filename = f"{prefix}_{req.s3_filename}"
+        else:
+            req.s3_filename = f"{prefix}.wav"
+
     with ops_log.operation("voice_design_api", extra={
         "text_length": len(req.text),
         "instruct_length": len(req.instruct),
         "upload_to_s3": req.upload_to_s3,
     }):
+        if req.upload_to_s3 and req.s3_filename:
+            if not storage.is_configured:
+                raise HTTPException(status_code=503, detail="Storage not configured.")
+            
+            s3_key = f"audio/voice_design/{req.s3_filename}"
+            if storage.object_exists(s3_key):
+                presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
+                return {
+                    "s3_url": storage._object_url(s3_key),
+                    "presigned_url": presigned_url,
+                    "s3_key": s3_key,
+                    "sample_rate": 24000,
+                    "text": req.text,
+                    "instruct": req.instruct,
+                }
+
         try:
             wav_bytes, sr = pipeline.inference.generate_voice_design(
                 text=req.text,

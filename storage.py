@@ -162,6 +162,14 @@ class StorageClient:
         response = self.client.list_objects_v2(Bucket=self.bucket, Prefix=prefix)
         return [obj["Key"] for obj in response.get("Contents", [])]
 
+    def object_exists(self, key: str) -> bool:
+        """Check if an object exists."""
+        try:
+            self.client.head_object(Bucket=self.bucket, Key=key)
+            return True
+        except Exception:
+            return False
+
     def delete_object(self, key: str):
         """Delete an object."""
         self.client.delete_object(Bucket=self.bucket, Key=key)
