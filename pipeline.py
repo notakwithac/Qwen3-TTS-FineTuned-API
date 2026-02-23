@@ -9,6 +9,7 @@ import threading
 import traceback
 import logging
 import uuid
+import json
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -499,17 +500,25 @@ class Pipeline:
             )
             ops_log.end(train_op, extra={"checkpoint_path": str(checkpoint_path)})
             
-            # --- MODEL OFFLOAD: Zip and upload to S3 ---
+            # --- MODEL OFFLOAD: Zip and upload to S3 (Background Thread) ---
             from storage import storage
             if storage.is_configured:
-                job.progress = {"stage": "offloading", "detail": "Zipping and uploading model to S3..."}
-                offload_op = ops_log.start("model_offload", job_id=job.job_id)
-                try:
-                    s3_key = self._upload_model_to_s3(job, Path(checkpoint_path))
-                    ops_log.end(offload_op, extra={"s3_key": s3_key})
-                except Exception as e:
-                    ops_log.fail(offload_op, f"Model upload failed: {e}")
-                    # Don't fail the whole job if S3 upload fails
+                def run_s3_upload(j: Job, cp_path: str):
+                    j.progress = {"stage": "offloading", "detail": "Zipping and uploading model to S3 in background..."}
+                    j.save()
+                    offload_op = ops_log.start("model_offload", job_id=j.job_id)
+                    try:
+                        s3_k = self._upload_model_to_s3(j, Path(cp_path))
+                        ops_log.end(offload_op, extra={"s3_key": s3_k})
+                    except Exception as err:
+                        ops_log.fail(offload_op, f"Model upload failed: {err}")
+                
+                upload_thread = threading.Thread(
+                    target=run_s3_upload, 
+                    args=(job, str(checkpoint_path)), 
+                    daemon=True
+                )
+                upload_thread.start()
             
             # AGGRESSIVE CLEANUP: Remove intermediate runs and raw dataset
             cleanup_op = ops_log.start("cleanup", job_id=job.job_id)
