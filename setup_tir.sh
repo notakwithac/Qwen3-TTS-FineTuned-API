@@ -16,18 +16,16 @@ echo "=== [4/6] Limiting build to A100 arch ==="
 export TORCH_CUDA_ARCH_LIST="8.0"
 
 echo "=== [5/6] Installing flash-attn ==="
-# Check if there is a linux wheel for flash-attn in the current directory
-FLASH_WHEEL=$(ls flash_attn-*.whl 2>/dev/null | grep "manylinux" || true)
+# Search for any flash_attn linux wheel in the current directory
+FLASH_WHEEL=$(ls flash_attn-*.whl 2>/dev/null | grep -E "linux|manylinux" | head -n 1 || true)
 if [ -n "$FLASH_WHEEL" ]; then
     echo "Found local flash-attn wheel: $FLASH_WHEEL. Installing..."
     uv pip install "$FLASH_WHEEL"
-elif [ -f "flash_attn_linux.whl" ]; then
-    echo "Found flash_attn_linux.whl. Installing..."
-    uv pip install flash_attn_linux.whl
 else
-    echo "No local Linux wheel found. Attempting to install from PyPI (this may take a long time to compile)..."
+    echo "No local Linux wheel found (checked for flash_attn-*.whl with 'linux' in name)."
+    echo "Attempting to install from PyPI (this may take a long time to compile)..."
     # uv pip install flash-attn --no-build-isolation
-    echo "Skipping compilation to avoid OOM. Please provide a pre-built wheel if possible."
+    echo "Skipping compilation to avoid OOM. Please provide a pre-built wheel."
 fi
 
 echo "=== [6/6] Verifying GPU ==="
