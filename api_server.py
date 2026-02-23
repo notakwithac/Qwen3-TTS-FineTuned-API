@@ -253,6 +253,8 @@ class FinetuneRequest(BaseModel):
     lr: float = 2e-6
     book_id: Optional[str] = None
     chapter_id: Optional[str] = None
+    character_id: Optional[str] = None
+    resume_job_id: Optional[str] = None
 
 @app.post("/finetune", summary="Start a fine-tuning job", response_model=JobSummary)
 def create_finetune_job(req: FinetuneRequest):
@@ -286,6 +288,19 @@ def create_finetune_job(req: FinetuneRequest):
     })
     
     try:
+        # Resolve resume_job_id to a base_model_path
+        base_model_path = None
+        if req.resume_job_id:
+            previous_job = pipeline.get_job(req.resume_job_id)
+            if not previous_job:
+                ops_log.start("resume_job_fallback", extra={"reason": "job_not_found", "resume_job_id": req.resume_job_id})
+                logger.warning(f"Job to resume ({req.resume_job_id}) not found. Falling back to default base model.")
+            elif not previous_job.checkpoint_path or not os.path.exists(previous_job.checkpoint_path):
+                ops_log.start("resume_job_fallback", extra={"reason": "checkpoint_not_found", "resume_job_id": req.resume_job_id})
+                logger.warning(f"Job to resume ({req.resume_job_id}) does not have a valid checkpoint. Falling back to default base model.")
+            else:
+                base_model_path = previous_job.checkpoint_path
+
         # Download the file from S3
         storage.download_file(req.dataset_s3_key, tmp_path)
         
@@ -297,6 +312,8 @@ def create_finetune_job(req: FinetuneRequest):
             lr=req.lr,
             book_id=req.book_id,
             chapter_id=req.chapter_id,
+            character_id=req.character_id,
+            base_model_path=base_model_path,
         )
         ops_log.end(op, extra={"job_id": job.job_id})
     except Exception as e:
@@ -341,6 +358,15 @@ async def delete_job(job_id: str):
     if not pipeline.delete_job(job_id):
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
     return {"detail": f"Job {job_id} deleted"}
+
+
+@app.post("/jobs/{job_id}/retry", summary="Retry a failed job", response_model=JobSummary)
+async def retry_job(job_id: str):
+    """Retry a job that has failed or been cancelled."""
+    job = pipeline.retry_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found, or it is not in a failed/cancelled state.")
+    return JSONResponse(content=job.to_dict(), status_code=202)
 
 
 @app.post(

@@ -86,6 +86,8 @@ Content-Type: application/json
 | `lr` | float | `2e-6` | Learning rate |
 | `book_id` | string | `null` | Optional book ID for S3 organization |
 | `chapter_id` | string | `null` | Optional chapter ID for S3 organization |
+| `character_id` | string | `null` | Optional character ID for local directory organization (`jobs/{job_id}`) |
+| `resume_job_id` | string | `null` | Optional ID of a previous job to continue training from. Falls back to base model if not found. |
 
 **Dataset zip format:**
 ```

@@ -56,6 +56,9 @@ class Job:
         flash_attn: bool = True,
         book_id: Optional[str] = None,
         chapter_id: Optional[str] = None,
+        character_id: Optional[str] = None,
+        job_dir: Optional[str] = None,
+        base_model_path: Optional[str] = None,
     ):
         self.job_id = job_id
         self.speaker_name = speaker_name
@@ -67,6 +70,9 @@ class Job:
         self.flash_attn = flash_attn
         self.book_id = book_id
         self.chapter_id = chapter_id
+        self.character_id = character_id
+        self.job_dir = job_dir
+        self.base_model_path = base_model_path
 
         self.status = JobStatus.QUEUED
         self.progress: Dict[str, Any] = {}
@@ -95,12 +101,65 @@ class Job:
                 "flash_attn": self.flash_attn,
                 "book_id": self.book_id,
                 "chapter_id": self.chapter_id,
+                "character_id": self.character_id,
+                "base_model_path": self.base_model_path,
             },
         }
         if self.status == JobStatus.READY:
             d["inference_url"] = f"/infer/{self.job_id}"
             d["last_accessed_at"] = self.last_accessed_at
         return d
+
+    def save(self):
+        """Persist job state to disk."""
+        if not self.job_dir:
+            return
+        job_file = Path(self.job_dir) / "job.json"
+        try:
+            with open(job_file, "w") as f:
+                json.dump(self.to_dict(), f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save job {self.job_id}: {e}")
+
+    @classmethod
+    def load(cls, job_dir: str) -> Optional['Job']:
+        """Load job state from disk."""
+        job_file = Path(job_dir) / "job.json"
+        if not job_file.exists():
+            return None
+        try:
+            with open(job_file, "r") as f:
+                data = json.load(f)
+            
+            config = data.get("config", {})
+            job = cls(
+                job_id=data["job_id"],
+                speaker_name=data["speaker_name"],
+                dataset_dir=str(Path(job_dir) / "dataset"),
+                output_dir=str(Path(job_dir) / "output"),
+                num_epochs=config.get("num_epochs", 10),
+                batch_size=config.get("batch_size", 1),
+                lr=config.get("lr", 2e-6),
+                flash_attn=config.get("flash_attn", True),
+                book_id=config.get("book_id"),
+                chapter_id=config.get("chapter_id"),
+                character_id=config.get("character_id"),
+                job_dir=job_dir,
+                base_model_path=config.get("base_model_path"),
+            )
+            job.status = data.get("status", JobStatus.QUEUED)
+            job.progress = data.get("progress", {})
+            job.checkpoint_path = data.get("checkpoint_path")
+            job.error = data.get("error")
+            job.created_at = data.get("created_at", job.created_at)
+            job.finished_at = data.get("finished_at")
+            if "last_accessed_at" in data:
+                job.last_accessed_at = data["last_accessed_at"]
+                
+            return job
+        except Exception as e:
+            logger.error(f"Failed to load job from {job_dir}: {e}")
+            return None
 
     def touch(self):
         """Update last access time."""
@@ -133,6 +192,7 @@ class Pipeline:
 
         self.jobs: Dict[str, Job] = {}
         self._lock = threading.Lock()
+        self._training_queue = threading.Semaphore(1)
         self.inference = InferenceManager(
             device=device,
             use_flash_attn=use_flash_attn,
@@ -153,6 +213,8 @@ class Pipeline:
         lr: float = 2e-6,
         book_id: Optional[str] = None,
         chapter_id: Optional[str] = None,
+        character_id: Optional[str] = None,
+        base_model_path: Optional[str] = None,
     ) -> Job:
         """Create a new fine-tuning job from an uploaded dataset zip.
 
@@ -162,6 +224,7 @@ class Pipeline:
         """
         job_id = uuid.uuid4().hex[:12]
         job_dir = self.jobs_dir / job_id
+        
         dataset_dir = job_dir / "dataset"
         output_dir = job_dir / "output"
 
@@ -201,15 +264,32 @@ class Pipeline:
             flash_attn=self.use_flash_attn,
             book_id=book_id,
             chapter_id=chapter_id,
+            character_id=character_id,
+            job_dir=str(job_dir),
+            base_model_path=base_model_path,
         )
 
         with self._lock:
             self.jobs[job_id] = job
 
+        job.save()
         return job
 
     def get_job(self, job_id: str) -> Optional[Job]:
-        return self.jobs.get(job_id)
+        job = self.jobs.get(job_id)
+        if job:
+            return job
+            
+        # Try to load from disk if not in memory
+        job_dir = self.jobs_dir / job_id
+        if job_dir.exists():
+            job = Job.load(str(job_dir))
+            if job:
+                with self._lock:
+                    self.jobs[job_id] = job
+                return job
+                
+        return None
 
     def list_jobs(self) -> list:
         return [j.to_dict() for j in self.jobs.values()]
@@ -299,6 +379,25 @@ class Pipeline:
             del self.jobs[job_id]
         return True
 
+    def retry_job(self, job_id: str) -> Optional[Job]:
+        """Retry a failed or cancelled job."""
+        job = self.jobs.get(job_id)
+        if not job:
+            return None
+            
+        if job.status not in (JobStatus.FAILED, JobStatus.CANCELLED):
+            return None # Only allow retrying if it actually failed or died.
+            
+        # Reset the job state
+        job.status = JobStatus.QUEUED
+        job.error = None
+        job._cancel_requested = False
+        job.progress = {}
+        
+        # Start execution
+        self.start_job(job_id)
+        return job
+
     # -- Pipeline execution -------------------------------------------------
 
     def start_job(self, job_id: str):
@@ -319,8 +418,15 @@ class Pipeline:
         })
         try:
             # Stage 1: Data preparation
+            # Wait for our turn in the GPU training queue
+            job.status = JobStatus.QUEUED
+            job.progress = {"stage": "queued", "detail": "Waiting in queue for next available slot..."}
+            
+            self._training_queue.acquire()
+            
             job.status = JobStatus.PREPARING
             job.progress = {"stage": "preparing", "detail": "Encoding audio to codec tokens..."}
+            job.save()
 
             train_jsonl = os.path.join(job.dataset_dir, "train.jsonl")
             prepared_jsonl = os.path.join(job.dataset_dir, "train_with_codes.jsonl")
@@ -357,6 +463,7 @@ class Pipeline:
             # Stage 2: Training
             job.status = JobStatus.TRAINING
             job.progress = {"stage": "training", "epoch": 0, "total_epochs": job.num_epochs}
+            job.save()
 
             from sft_12hz import train_programmatic
 
@@ -369,9 +476,12 @@ class Pipeline:
             train_op = ops_log.start("training", job_id=job.job_id, extra={
                 "num_epochs": job.num_epochs, "batch_size": job.batch_size, "lr": job.lr,
             })
+            
+            init_model = job.base_model_path if job.base_model_path and os.path.exists(job.base_model_path) else "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+            
             checkpoint_path = train_programmatic(
                 config={
-                    "init_model_path": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+                    "init_model_path": init_model,
                     "output_model_path": job.output_dir,
                     "train_jsonl": prepared_jsonl,
                     "batch_size": job.batch_size,
@@ -434,6 +544,7 @@ class Pipeline:
             # Stage 3: Load for inference
             job.status = JobStatus.LOADING
             job.progress = {"stage": "loading", "detail": "Loading fine-tuned model for inference..."}
+            job.save()
 
             self.inference.load(str(checkpoint_path), job.speaker_name)
 
@@ -444,13 +555,17 @@ class Pipeline:
                 "detail": "Model loaded and ready for inference",
                 "inference_url": f"/infer/{job.job_id}",
             }
+            job.save()
             ops_log.end(pipeline_op)
 
         except Exception as e:
             job.status = JobStatus.FAILED
             job.error = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
             job.finished_at = datetime.now(timezone.utc).isoformat()
+            job.save()
             ops_log.fail(pipeline_op, str(e))
+        finally:
+            self._training_queue.release()
 
     # -- Inference -----------------------------------------------------------
 
