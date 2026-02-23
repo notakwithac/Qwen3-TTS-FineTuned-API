@@ -10,6 +10,7 @@ import io
 import logging
 import threading
 import time
+import asyncio
 from typing import Optional, Dict
 
 import soundfile as sf
@@ -281,6 +282,53 @@ class InferenceManager:
 
     # -- CustomVoice inference ------------------------------------------------
 
+    def generate_batch(
+        self,
+        texts: list[str],
+        checkpoint_path: str,
+        speaker_name: str,
+        languages: list[str] = None,
+        instructs: list[str] = None,
+    ) -> tuple[list[bytes], int]:
+        """Generate speech for multiple texts using CustomVoice model."""
+        if not languages:
+            languages = ["English"] * len(texts)
+        if not instructs:
+            instructs = [""] * len(texts)
+            
+        with self._lock:
+            model, spk = self._get_model(checkpoint_path, "custom_voice", speaker_name)
+            self._total_requests += len(texts)
+
+        with self._inference_semaphore:
+            op = ops_log.start("inference_custom_voice_batch", extra={
+                "batch_size": len(texts),
+                "speaker": spk,
+            })
+            try:
+                # model.generate_custom_voice expects a single speaker duplicated if batched
+                speakers = [spk.lower() if spk else spk] * len(texts)
+                
+                wavs_list, sr = model.generate_custom_voice(
+                    text=texts,
+                    language=languages,
+                    speaker=speakers,
+                    instruct=instructs,
+                )
+
+                results = []
+                for wav in wavs_list:
+                    buf = io.BytesIO()
+                    sf.write(buf, wav, sr, format="WAV")
+                    buf.seek(0)
+                    results.append(buf.read())
+                    
+                ops_log.end(op, extra={"sample_rate": sr})
+                return results, sr
+            except Exception as e:
+                ops_log.fail(op, str(e))
+                raise
+
     def generate(
         self,
         text: str,
@@ -321,6 +369,45 @@ class InferenceManager:
                 raise
 
     # -- VoiceDesign inference ------------------------------------------------
+
+    def generate_voice_design_batch(
+        self,
+        texts: list[str],
+        instructs: list[str],
+        languages: list[str] = None,
+    ) -> tuple[list[bytes], int]:
+        """Generate speech for multiple texts using VoiceDesign model."""
+        if not languages:
+            languages = ["English"] * len(texts)
+            
+        with self._lock:
+            model, _ = self._get_model(VOICE_DESIGN_MODEL, "voice_design")
+            self._total_requests += len(texts)
+            self._touch()
+
+        with self._inference_semaphore:
+            op = ops_log.start("inference_voice_design_batch", extra={
+                "batch_size": len(texts),
+            })
+            try:
+                wavs_list, sr = model.generate_voice_design(
+                    text=texts,
+                    instruct=instructs,
+                    language=languages,
+                )
+
+                results = []
+                for wav in wavs_list:
+                    buf = io.BytesIO()
+                    sf.write(buf, wav, sr, format="WAV")
+                    buf.seek(0)
+                    results.append(buf.read())
+                    
+                ops_log.end(op, extra={"sample_rate": sr})
+                return results, sr
+            except Exception as e:
+                ops_log.fail(op, str(e))
+                raise
 
     def generate_voice_design(
         self,

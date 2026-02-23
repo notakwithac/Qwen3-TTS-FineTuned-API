@@ -56,6 +56,111 @@ pipeline = Pipeline(
     compile=USE_TORCH_COMPILE,
 )
 
+# ---------------------------------------------------------------------------
+# Dynamic Batching
+# ---------------------------------------------------------------------------
+
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from typing import Callable, Any
+
+class DynamicBatcher:
+    """Pools completely independent concurrent requests into unified GPU tensor batches."""
+    def __init__(self, batch_size: int, timeout_ms: int, process_fn: Callable):
+        self.batch_size = batch_size
+        self.timeout = timeout_ms / 1000.0
+        self.process_fn = process_fn
+        
+        self.queue = []
+        self.lock = asyncio.Lock()
+        self.timer_task = None
+        self.executor = ThreadPoolExecutor(max_workers=1) # One batch at a time for this specific model
+
+    async def submit(self, **kwargs) -> Any:
+        future = asyncio.Future()
+        
+        async with self.lock:
+            self.queue.append((kwargs, future))
+            if len(self.queue) == 1:
+                # First item in batch, start timer
+                self.timer_task = asyncio.create_task(self._wait_and_process())
+            
+            if len(self.queue) >= self.batch_size:
+                # Batch full, process immediately
+                if self.timer_task:
+                    self.timer_task.cancel()
+                asyncio.create_task(self._process_batch(list(self.queue)))
+                self.queue.clear()
+                
+        return await future
+
+    async def _wait_and_process(self):
+        try:
+            await asyncio.sleep(self.timeout)
+        except asyncio.CancelledError:
+            return  # Batch was processed because it got full
+            
+        async with self.lock:
+            if not self.queue:
+                return
+            batch = list(self.queue)
+            self.queue.clear()
+            
+        await self._process_batch(batch)
+
+    async def _process_batch(self, batch: list[tuple[dict, asyncio.Future]]):
+        if not batch: return
+        
+        # Unzip merged kwargs
+        kwargs_keys = batch[0][0].keys()
+        batched_kwargs = {k: [item[0][k] for item in batch] for k in kwargs_keys}
+        futures = [item[1] for item in batch]
+        
+        try:
+            # Run the heavy blocking batch process in a thread
+            loop = asyncio.get_running_loop()
+            results, sr = await loop.run_in_executor(
+                self.executor,
+                lambda: self.process_fn(**batched_kwargs)
+            )
+            
+            # Map results back to individual futures
+            for i, future in enumerate(futures):
+                if not future.done():
+                    future.set_result((results[i], sr))
+                    
+        except Exception as e:
+            for future in futures:
+                if not future.done():
+                    future.set_exception(e)
+
+
+# Instantiate global batchers
+voice_design_batcher = DynamicBatcher(
+    batch_size=GPU_MAX_CONCURRENCY,
+    timeout_ms=100,
+    process_fn=pipeline.inference.generate_voice_design_batch
+)
+
+custom_voice_batchers = {}  # Map job_id -> DynamicBatcher
+
+def get_custom_voice_batcher(job_id: str, checkpoint_path: str, speaker_name: str) -> DynamicBatcher:
+    if job_id not in custom_voice_batchers:
+        def process_fn(texts: list[str], languages: list[str], instructs: list[str]):
+            return pipeline.inference.generate_batch(
+                texts=texts,
+                checkpoint_path=checkpoint_path,
+                speaker_name=speaker_name,
+                languages=languages,
+                instructs=instructs
+            )
+        custom_voice_batchers[job_id] = DynamicBatcher(
+            batch_size=GPU_MAX_CONCURRENCY,
+            timeout_ms=100,
+            process_fn=process_fn
+        )
+    return custom_voice_batchers[job_id]
+
 
 # ---------------------------------------------------------------------------
 # Request / Response models
@@ -248,7 +353,7 @@ async def delete_job(job_id: str):
         }
     },
 )
-def infer(job_id: str, req: InferRequest):
+async def infer(job_id: str, req: InferRequest):
     """Generate speech using a completed fine-tuned model.
 
     Set `upload_to_s3: true` to upload the audio to E2E Object Storage
@@ -270,16 +375,15 @@ def infer(job_id: str, req: InferRequest):
 
     try:
         checkpoint_path = str(job.checkpoint_path)
+        batcher = get_custom_voice_batcher(job_id, checkpoint_path, job.speaker_name)
+        
         with ops_log.operation("inference_api", job_id=job_id, extra={
             "text_length": len(req.text), "upload_to_s3": req.upload_to_s3,
         }):
-            wav_bytes, sr = pipeline.generate(
-                job_id=job_id,
-                text=req.text,
-                language=req.language,
-                instruct=req.instruct,
-                checkpoint_path=checkpoint_path,
-                speaker_name=job.speaker_name,
+            wav_bytes, sr = await batcher.submit(
+                texts=req.text,
+                languages=req.language,
+                instructs=req.instruct,
             )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Inference failed: {str(e)}")
@@ -452,7 +556,7 @@ def list_storage(job_id: str, book_id: Optional[str] = None, chapter_id: Optiona
         }
     },
 )
-def voice_design(req: VoiceDesignRequest):
+async def voice_design(req: VoiceDesignRequest):
     """Generate speech from a text description of the desired voice.
 
     No fine-tuning needed — uses the VoiceDesign model directly.
@@ -501,10 +605,10 @@ def voice_design(req: VoiceDesignRequest):
                 }
 
         try:
-            wav_bytes, sr = pipeline.inference.generate_voice_design(
-                text=req.text,
-                instruct=req.instruct,
-                language=req.language,
+            wav_bytes, sr = await voice_design_batcher.submit(
+                texts=req.text,
+                instructs=req.instruct,
+                languages=req.language,
             )
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Voice design failed: {str(e)}")

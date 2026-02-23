@@ -7,6 +7,7 @@ import shutil
 import sys
 import threading
 import traceback
+import logging
 import uuid
 import zipfile
 from datetime import datetime, timezone
@@ -17,6 +18,8 @@ import torch
 
 from inference_manager import InferenceManager
 from ops_logger import ops_log
+
+logger = logging.getLogger(__name__)
 
 # Add finetuning dir to path so we can import prepare_data / sft_12hz
 _finetuning_dir = str(Path(__file__).parent / "finetuning")
@@ -239,7 +242,7 @@ class Pipeline:
         if current_size <= threshold_bytes:
             return
 
-        ops_log.info(f"Disk usage ({current_size / 1024**3:.2f}GB) exceeds threshold ({threshold_gb}GB). Pruning oldest jobs...")
+        logger.info(f"Disk usage ({current_size / 1024**3:.2f}GB) exceeds threshold ({threshold_gb}GB). Pruning oldest jobs...")
 
         # Sort completed/failed jobs by last_accessed_at
         candidates = []
@@ -260,9 +263,9 @@ class Pipeline:
                 try:
                     shutil.rmtree(job_dir)
                     current_size -= size
-                    ops_log.info(f"LRU: Deleted job {job.job_id} (retrieved {size / 1024**2:.1f}MB)")
+                    logger.info(f"LRU: Deleted job {job.job_id} (retrieved {size / 1024**2:.1f}MB)")
                 except Exception as e:
-                    ops_log.error(f"LRU: Failed to delete job {job.job_id}: {e}")
+                    logger.error(f"LRU: Failed to delete job {job.job_id}: {e}")
 
     def cancel_job(self, job_id: str) -> bool:
         job = self.jobs.get(job_id)
