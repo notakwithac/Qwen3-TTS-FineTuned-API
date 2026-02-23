@@ -150,7 +150,7 @@ class FinetuneRequest(BaseModel):
     chapter_id: Optional[str] = None
 
 @app.post("/finetune", summary="Start a fine-tuning job", response_model=JobSummary)
-async def create_finetune_job(req: FinetuneRequest):
+def create_finetune_job(req: FinetuneRequest):
     """Start fine-tuning using a dataset zip stored in S3.
 
     The dataset must be a zip file in the configured S3 bucket containing:
@@ -248,7 +248,7 @@ async def delete_job(job_id: str):
         }
     },
 )
-async def infer(job_id: str, req: InferRequest):
+def infer(job_id: str, req: InferRequest):
     """Generate speech using a completed fine-tuned model.
 
     Set `upload_to_s3: true` to upload the audio to E2E Object Storage
@@ -419,7 +419,7 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
     "/storage/list/{job_id}",
     summary="List all audio files in S3 for a job",
 )
-async def list_storage(job_id: str, book_id: Optional[str] = None, chapter_id: Optional[str] = None):
+def list_storage(job_id: str, book_id: Optional[str] = None, chapter_id: Optional[str] = None):
     """List all audio files stored in S3 for a given job.
     If book_id and chapter_id are provided, it lists files in the segments folder.
     """
@@ -452,7 +452,7 @@ async def list_storage(job_id: str, book_id: Optional[str] = None, chapter_id: O
         }
     },
 )
-async def voice_design(req: VoiceDesignRequest):
+def voice_design(req: VoiceDesignRequest):
     """Generate speech from a text description of the desired voice.
 
     No fine-tuning needed — uses the VoiceDesign model directly.
