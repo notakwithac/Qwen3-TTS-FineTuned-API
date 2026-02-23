@@ -43,6 +43,7 @@ USE_FLASH_ATTN = os.environ.get("USE_FLASH_ATTN", "1") == "1"
 GPU_IDLE_TIMEOUT = int(os.environ.get("GPU_IDLE_TIMEOUT", "300"))
 GPU_MAX_CONCURRENCY = int(os.environ.get("GPU_MAX_CONCURRENCY", "2"))
 GPU_MAX_MODELS = int(os.environ.get("GPU_MAX_MODELS", "1"))
+USE_TORCH_COMPILE = os.environ.get("USE_TORCH_COMPILE", "0") == "1"
 
 pipeline = Pipeline(
     base_dir=".",
@@ -52,6 +53,7 @@ pipeline = Pipeline(
     idle_timeout_seconds=GPU_IDLE_TIMEOUT,
     max_concurrency=GPU_MAX_CONCURRENCY,
     max_models=GPU_MAX_MODELS,
+    compile=USE_TORCH_COMPILE,
 )
 
 

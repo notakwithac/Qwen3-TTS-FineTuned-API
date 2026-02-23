@@ -41,9 +41,11 @@ class InferenceManager:
         idle_timeout_seconds: int = 300,
         max_concurrency: int = 2,
         max_models: int = 1,  # Default to 1 (good for 12GB), increase for A100 40GB
+        compile: bool = False,
     ):
         self._device = device
         self._attn_impl = "flash_attention_2" if use_flash_attn else "eager"
+        self._compile = compile
         self._lock = threading.Lock()
         self._inference_semaphore = threading.Semaphore(max_concurrency)
 
@@ -206,6 +208,13 @@ class InferenceManager:
                         raise e
                 else:
                     raise e
+            
+            # Speed up inference using torch.compile (requires Torch 2.0+)
+            if self._compile:
+                logger.info("Compiling model for faster inference (this may take a few minutes)...")
+                # We compile the underlying Qwen3TTSForConditionalGeneration model
+                model.model = torch.compile(model.model, mode="reduce-overhead")
+            
             self._models[path] = (model, model_type, speaker_name)
             self._last_path = path
             self._last_type = model_type

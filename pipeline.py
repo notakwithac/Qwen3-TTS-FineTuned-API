@@ -120,6 +120,7 @@ class Pipeline:
         idle_timeout_seconds: int = 300,
         max_concurrency: int = 2,
         max_models: int = 4,
+        compile: bool = False,
     ):
         self.base_dir = Path(base_dir)
         self.jobs_dir = self.base_dir / jobs_dir
@@ -135,6 +136,7 @@ class Pipeline:
             idle_timeout_seconds=idle_timeout_seconds,
             max_concurrency=max_concurrency,
             max_models=max_models,
+            compile=compile,
         )
 
     # -- Job management -----------------------------------------------------
