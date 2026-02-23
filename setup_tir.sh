@@ -14,6 +14,8 @@ uv sync --extra cu121
 
 echo "=== [4/6] Limiting build to A100 arch ==="
 export TORCH_CUDA_ARCH_LIST="8.0"
+export GPU_IDLE_TIMEOUT="${GPU_IDLE_TIMEOUT:-300}"
+export GPU_MAX_MODELS="${GPU_MAX_MODELS:-4}"
 
 echo "=== [5/6] Installing flash-attn ==="
 # Search for any flash_attn linux wheel in the current directory

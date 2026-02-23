@@ -7,7 +7,7 @@ name = "qwen-tts"
 version = "0.0.4"
 description = "Qwen-TTS python package"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.13"
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
@@ -52,9 +52,9 @@ qwen_tts = ["py.typed", "**/*.npz"]
 
 [project.optional-dependencies]
 cu121 = [
-  "torch==2.6.0",
-  "torchvision==0.21.0",
-  "torchaudio==2.6.0",
+   "torch>=2.4.0",
+  "torchvision>=0.19.0",
+  "torchaudio>=2.4.0",
 ]
 
 flash = [

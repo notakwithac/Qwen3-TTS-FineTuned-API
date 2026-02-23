@@ -386,28 +386,17 @@ class Pipeline:
             )
             ops_log.end(train_op, extra={"checkpoint_path": str(checkpoint_path)})
             
-            # --- DISK OPTIMIZATION: Model Offloading & Cleanup ---
+            # --- MODEL OFFLOAD: Zip and upload to S3 ---
             from storage import storage
             if storage.is_configured:
-                job.progress = {"stage": "offloading", "detail": "Uploading model weights to S3..."}
+                job.progress = {"stage": "offloading", "detail": "Zipping and uploading model to S3..."}
                 offload_op = ops_log.start("model_offload", job_id=job.job_id)
                 try:
-                    # Model key structure: models/{book_id or 'unsorted'}/{speaker_name}/{job_id}/
-                    model_prefix = f"models/{job.book_id or 'unsorted'}/{job.speaker_name}/{job.job_id}"
-                    
-                    # Upload key model files
-                    weight_file = os.path.join(checkpoint_path, "model.safetensors")
-                    config_file = os.path.join(checkpoint_path, "config.json")
-                    
-                    if os.path.exists(weight_file):
-                        storage.upload_file(weight_file, f"{model_prefix}/model.safetensors")
-                    if os.path.exists(config_file):
-                        storage.upload_file(config_file, f"{model_prefix}/config.json")
-                    
-                    ops_log.end(offload_op, extra={"s3_prefix": model_prefix})
+                    s3_key = self._upload_model_to_s3(job, Path(checkpoint_path))
+                    ops_log.end(offload_op, extra={"s3_key": s3_key})
                 except Exception as e:
-                    ops_log.fail(offload_op, f"Model offload failed: {e}")
-                    # Don't fail the whole job if S3 upload fails, but log it
+                    ops_log.fail(offload_op, f"Model upload failed: {e}")
+                    # Don't fail the whole job if S3 upload fails
             
             # AGGRESSIVE CLEANUP: Remove intermediate runs and raw dataset
             cleanup_op = ops_log.start("cleanup", job_id=job.job_id)
@@ -491,3 +480,31 @@ class Pipeline:
             language=language,
             instruct=instruct,
         )
+
+    def _upload_model_to_s3(self, job: Job, checkpoint_path: Path):
+        """Zips and uploads the fine-tuned model to S3."""
+        from storage import storage
+        import tempfile
+        
+        # Structure: models/{book_id}/{speaker_name}/{speaker_name}_{job_id}.zip
+        book_folder = job.book_id or "unsorted"
+        speaker_name = job.speaker_name
+        zip_filename = f"{speaker_name}_{job.job_id}.zip"
+        s3_key = f"models/{book_folder}/{speaker_name}/{zip_filename}"
+        
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            # We want to zip the CONTENTS of the checkpoint_path, not the folder itself
+            # Base name for zip (without extension)
+            base_zip_path = os.path.join(tmp_dir, f"{speaker_name}_{job.job_id}")
+            
+            # shutil.make_archive(base_name, format, root_dir)
+            archive_path = shutil.make_archive(
+                base_zip_path, 
+                'zip', 
+                root_dir=str(checkpoint_path)
+            )
+            
+            # Upload to S3
+            storage.upload_file(archive_path, s3_key, content_type="application/zip")
+            
+        return s3_key
