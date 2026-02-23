@@ -37,3 +37,4 @@ dist/
 flash_attn*.whl
 *tts_dataset
 Qwen3-TTS-*
+uv.lock

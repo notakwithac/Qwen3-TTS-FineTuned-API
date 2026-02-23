@@ -191,7 +191,7 @@ class InferenceManager:
                 # If we tried flash_attention_2 and it failed, fallback to eager
                 if self._attn_impl == "flash_attention_2":
                     err_str = str(e)
-                    if "FlashAttention2" in err_str or "flash-attn" in err_str or "package f" in err_str:
+                    if any(x in err_str for x in ["FlashAttention2", "flash-attn", "flash_attn", "package f", "DLL load failed"]):
                         logger.warning(
                             f"Flash Attention (v2) could not be loaded for {path}. "
                             f"Error: {err_str}. Falling back to 'eager' implementation."
