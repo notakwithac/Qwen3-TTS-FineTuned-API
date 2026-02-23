@@ -197,7 +197,12 @@ def train():
     dataset = TTSDataset(train_data, qwen3tts.processor, config)
     train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate_fn)
 
-    optimizer = AdamW(qwen3tts.model.parameters(), lr=args.lr, weight_decay=0.01)
+    # Freeze text embeddings to maintain base intelligence and grammatical consistency
+    for name, param in qwen3tts.model.named_parameters():
+        if "text_embedding" in name or "text_projection" in name:
+            param.requires_grad = False
+
+    optimizer = AdamW((p for p in qwen3tts.model.parameters() if p.requires_grad), lr=args.lr, weight_decay=0.01)
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / grad_accum_steps)
     max_train_steps = args.num_epochs * num_update_steps_per_epoch
     warmup_steps = args.warmup_steps
@@ -492,7 +497,12 @@ def train_programmatic(
     dataset = TTSDataset(train_data, qwen3tts.processor, model_config)
     train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate_fn)
 
-    optimizer = AdamW(qwen3tts.model.parameters(), lr=args.lr, weight_decay=0.01)
+    # Freeze text embeddings to maintain base intelligence and grammatical consistency
+    for name, param in qwen3tts.model.named_parameters():
+        if "text_embedding" in name or "text_projection" in name:
+            param.requires_grad = False
+
+    optimizer = AdamW((p for p in qwen3tts.model.parameters() if p.requires_grad), lr=args.lr, weight_decay=0.01)
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / grad_accum_steps)
     max_train_steps = args.num_epochs * num_update_steps_per_epoch
     warmup_steps = args.warmup_steps
@@ -538,12 +548,21 @@ def train_programmatic(
         output_dir = os.path.join(args.output_model_path, f"checkpoint-epoch-{epoch_idx}")
         # Only copy essential config/tokenizer files, NOT the massive weights
         os.makedirs(output_dir, exist_ok=True)
-        for item in os.listdir(MODEL_PATH):
-            s = os.path.join(MODEL_PATH, item)
+        
+        # Fallback to copy configuration from the base model if the source is an older incomplete checkpoint
+        source_config_path = MODEL_PATH
+        if not os.path.exists(os.path.join(source_config_path, "speech_tokenizer")):
+            source_config_path = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+
+        for item in os.listdir(source_config_path):
+            s = os.path.join(source_config_path, item)
             d = os.path.join(output_dir, item)
             if os.path.isfile(s) and not item.endswith(('.safetensors', '.bin', '.pt', '.ckpt')):
                 shutil.copy2(s, d)
-        input_config_file = os.path.join(MODEL_PATH, "config.json")
+            elif os.path.isdir(s):
+                shutil.copytree(s, d, dirs_exist_ok=True)
+                
+        input_config_file = os.path.join(source_config_path, "config.json")
         output_config_file = os.path.join(output_dir, "config.json")
         with open(input_config_file, 'r', encoding='utf-8') as f:
             config_dict = json.load(f)

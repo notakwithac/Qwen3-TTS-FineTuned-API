@@ -39,9 +39,9 @@ class InferenceManager:
         self,
         device: str = "cuda:0",
         use_flash_attn: bool = True,
-        idle_timeout_seconds: int = 300,
-        max_concurrency: int = 2,
-        max_models: int = 1,  # Default to 1 (good for 12GB), increase for A100 40GB
+        idle_timeout_seconds: int = 600,
+        max_concurrency: int = 16,
+        max_models: int = 4,  # Default to 4 (good for 40GB)
         compile: bool = False,
     ):
         self._device = device
