@@ -447,6 +447,7 @@ class Pipeline:
                 input_jsonl=train_jsonl,
                 output_jsonl=prepared_jsonl,
                 device=self.device,
+                batch_size=16,
                 on_progress=on_prepare_progress,
             )
             ops_log.end(prep_op)

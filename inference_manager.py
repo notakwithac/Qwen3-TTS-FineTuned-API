@@ -11,6 +11,7 @@ import logging
 import threading
 import time
 import asyncio
+import contextlib
 from typing import Optional, Dict
 
 import soundfile as sf
@@ -155,6 +156,10 @@ class InferenceManager:
     def _on_idle_timeout(self):
         with self._lock:
             if self.is_loaded:
+                if self._active_requests > 0:
+                    # Delay unloading if requests are currently active
+                    self._reset_idle_timer()
+                    return
                 elapsed = time.time() - self._last_used
                 if elapsed >= self._idle_timeout:
                     logger.info(
@@ -166,6 +171,17 @@ class InferenceManager:
     def _touch(self):
         self._last_used = time.time()
         self._reset_idle_timer()
+
+    @contextlib.contextmanager
+    def _track_active(self):
+        with self._lock:
+            self._active_requests += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._active_requests -= 1
+                self._touch()
 
     # -- Load / Unload --------------------------------------------------------
 
@@ -300,7 +316,7 @@ class InferenceManager:
             model, spk = self._get_model(checkpoint_path, "custom_voice", speaker_name)
             self._total_requests += len(texts)
 
-        with self._inference_semaphore:
+        with self._track_active(), self._inference_semaphore:
             op = ops_log.start("inference_custom_voice_batch", extra={
                 "batch_size": len(texts),
                 "speaker": spk,
@@ -344,7 +360,7 @@ class InferenceManager:
             self._total_requests += 1
 
         # 2. Run inference (protected by semaphore)
-        with self._inference_semaphore:
+        with self._track_active(), self._inference_semaphore:
             op = ops_log.start("inference_custom_voice", extra={
                 "text_length": len(text),
                 "language": language,
@@ -383,9 +399,8 @@ class InferenceManager:
         with self._lock:
             model, _ = self._get_model(VOICE_DESIGN_MODEL, "voice_design")
             self._total_requests += len(texts)
-            self._touch()
 
-        with self._inference_semaphore:
+        with self._track_active(), self._inference_semaphore:
             op = ops_log.start("inference_voice_design_batch", extra={
                 "batch_size": len(texts),
             })
@@ -420,10 +435,9 @@ class InferenceManager:
         with self._lock:
             model, _ = self._get_model(VOICE_DESIGN_MODEL, "voice_design")
             self._total_requests += 1
-            self._touch()
 
         # 2. Run inference (protected by semaphore)
-        with self._inference_semaphore:
+        with self._track_active(), self._inference_semaphore:
             op = ops_log.start("inference_voice_design", extra={
                 "text_length": len(text),
                 "instruct_length": len(instruct),

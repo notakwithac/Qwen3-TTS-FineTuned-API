@@ -66,7 +66,7 @@ from typing import Callable, Any
 
 class DynamicBatcher:
     """Pools completely independent concurrent requests into unified GPU tensor batches."""
-    def __init__(self, batch_size: int, timeout_ms: int, process_fn: Callable):
+    def __init__(self, batch_size: int, timeout_ms: int, process_fn: Callable, max_workers: int = 1):
         self.batch_size = batch_size
         self.timeout = timeout_ms / 1000.0
         self.process_fn = process_fn
@@ -74,7 +74,7 @@ class DynamicBatcher:
         self.queue = []
         self.lock = asyncio.Lock()
         self.timer_task = None
-        self.executor = ThreadPoolExecutor(max_workers=1) # One batch at a time for this specific model
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
 
     async def submit(self, **kwargs) -> Any:
         future = asyncio.Future()
@@ -139,7 +139,8 @@ class DynamicBatcher:
 voice_design_batcher = DynamicBatcher(
     batch_size=GPU_MAX_CONCURRENCY,
     timeout_ms=100,
-    process_fn=pipeline.inference.generate_voice_design_batch
+    process_fn=pipeline.inference.generate_voice_design_batch,
+    max_workers=GPU_MAX_MODELS
 )
 
 custom_voice_batchers = {}  # Map job_id -> DynamicBatcher
@@ -157,7 +158,8 @@ def get_custom_voice_batcher(job_id: str, checkpoint_path: str, speaker_name: st
         custom_voice_batchers[job_id] = DynamicBatcher(
             batch_size=GPU_MAX_CONCURRENCY,
             timeout_ms=100,
-            process_fn=process_fn
+            process_fn=process_fn,
+            max_workers=GPU_MAX_MODELS
         )
     return custom_voice_batchers[job_id]
 
@@ -174,6 +176,7 @@ class InferRequest(BaseModel):
     s3_filename: Optional[str] = None
     book_id: Optional[str] = None
     chapter_id: Optional[str] = None
+    overwrite: bool = False  # If false, skips generation if file already exists on S3
 
 
 class InferS3Response(BaseModel):
@@ -187,10 +190,11 @@ class InferS3Response(BaseModel):
 
 class BatchInferRequest(BaseModel):
     """Generate multiple audio files in one call, all uploaded to S3."""
-    items: list  # list of {"text": str, "language": str, "instruct": str, "filename": str}
+    items: list  # list of {"text": str, "language": str, "instruct": str, "filename": str, "overwrite": bool}
     language: str = "English"
     book_id: Optional[str] = None
     chapter_id: Optional[str] = None
+    overwrite: bool = False  # Default overwrite flag for all items
 
 
 class JobSummary(BaseModel):
@@ -221,6 +225,7 @@ class VoiceDesignRequest(BaseModel):
     s3_filename: Optional[str] = None
     character_name: Optional[str] = None
     character_uuid: Optional[str] = None
+    overwrite: bool = False  # If false, skips generation if file already exists on S3
 
 
 # ---------------------------------------------------------------------------
@@ -399,6 +404,22 @@ async def infer(job_id: str, req: InferRequest):
     pipeline.touch_job(job_id) # Update LRU timestamp
     pipeline._cleanup_disk_lru(20.0) # Background check usage
 
+    # Fast-path check: Return existing S3 URL if overwrite=False and we have an exact target
+    s3_prefix = f"audio/segments/{req.book_id}/{req.chapter_id}" if req.book_id and req.chapter_id else f"audio/{job_id}"
+    s3_target_key = f"{s3_prefix}/{req.s3_filename}" if req.s3_filename else None
+    
+    if req.upload_to_s3 and s3_target_key and not req.overwrite and storage.is_configured:
+        if storage.object_exists(s3_target_key):
+            presigned_url = storage.get_presigned_url(s3_target_key, expires_in=86400)
+            return {
+                "s3_url": storage._object_url(s3_target_key),
+                "presigned_url": presigned_url,
+                "s3_key": s3_target_key,
+                "sample_rate": 24000,
+                "text": req.text,
+                "job_id": job_id,
+            }
+
     try:
         checkpoint_path = str(job.checkpoint_path)
         batcher = get_custom_voice_batcher(job_id, checkpoint_path, job.speaker_name)
@@ -495,6 +516,26 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
         language = item.get("language", req.language)
         instruct = item.get("instruct", "")
         filename = item.get("filename", f"audio_{index:04d}.wav")
+        overwrite = item.get("overwrite", req.overwrite)
+        
+        # Construct S3 prefix
+        s3_prefix = f"audio/segments/{req.book_id}/{req.chapter_id}" if req.book_id and req.chapter_id else f"audio/{job_id}"
+        s3_key = f"{s3_prefix}/{filename}"
+        
+        # Fast-path check
+        if not overwrite and storage.is_configured:
+            # We must use thread executor since boto3 is blocking
+            loop = asyncio.get_running_loop()
+            exists = await loop.run_in_executor(None, storage.object_exists, s3_key)
+            if exists:
+                return {
+                    "s3_url": storage._object_url(s3_key),
+                    "presigned_url": storage.get_presigned_url(s3_key, expires_in=86400),
+                    "s3_key": s3_key,
+                    "sample_rate": 24000,
+                    "text": text,
+                    "job_id": job_id,
+                }
 
         # Run generation in a thread pool (InferenceManager handles the GPU semaphore)
         loop = asyncio.get_running_loop()
@@ -619,7 +660,7 @@ async def voice_design(req: VoiceDesignRequest):
                 raise HTTPException(status_code=503, detail="Storage not configured.")
             
             s3_key = f"audio/voice_design/{req.s3_filename}"
-            if storage.object_exists(s3_key):
+            if not req.overwrite and storage.object_exists(s3_key):
                 presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
                 return {
                     "s3_url": storage._object_url(s3_key),
