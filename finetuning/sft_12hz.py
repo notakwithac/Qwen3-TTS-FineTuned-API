@@ -60,6 +60,13 @@ def train():
         help="Resume from the latest checkpoint in output_model_path if available.",
     )
     parser.add_argument(
+        "--save_optimizer/--no-save_optimizer",
+        dest="save_optimizer",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="Save optimizer and scheduler states (large files).",
+    )
+    parser.add_argument(
         "--accelerate-trackers/--no-accelerate-trackers",
         dest="accelerate_trackers",
         default=False,
@@ -234,7 +241,14 @@ def train():
 
     def _save_checkpoint(epoch_idx: int):
         output_dir = os.path.join(args.output_model_path, f"checkpoint-epoch-{epoch_idx}")
-        shutil.copytree(MODEL_PATH, output_dir, dirs_exist_ok=True)
+        # Only copy essential config/tokenizer files, NOT the massive weights
+        os.makedirs(output_dir, exist_ok=True)
+        for item in os.listdir(MODEL_PATH):
+            s = os.path.join(MODEL_PATH, item)
+            d = os.path.join(output_dir, item)
+            # Skip weight files (.safetensors, .bin, .pt, .ckpt) to save space
+            if os.path.isfile(s) and not item.endswith(('.safetensors', '.bin', '.pt', '.ckpt')):
+                shutil.copy2(s, d)
 
         input_config_file = os.path.join(MODEL_PATH, "config.json")
         output_config_file = os.path.join(output_dir, "config.json")
@@ -260,11 +274,13 @@ def train():
         state_dict['talker.model.codec_embedding.weight'][3000] = target_speaker_embedding[0].detach().to(weight.device).to(weight.dtype)
         save_path = os.path.join(output_dir, "model.safetensors")
         save_file(state_dict, save_path)
+        del state_dict # Free memory
 
-        optimizer_state_path = os.path.join(output_dir, "optimizer.pt")
-        torch.save(optimizer.state_dict(), optimizer_state_path)
-        scheduler_state_path = os.path.join(output_dir, "scheduler.pt")
-        torch.save(lr_scheduler.state_dict(), scheduler_state_path)
+        if args.save_optimizer:
+            optimizer_state_path = os.path.join(output_dir, "optimizer.pt")
+            torch.save(optimizer.state_dict(), optimizer_state_path)
+            scheduler_state_path = os.path.join(output_dir, "scheduler.pt")
+            torch.save(lr_scheduler.state_dict(), scheduler_state_path)
         trainer_state_path = os.path.join(output_dir, "trainer_state.json")
         with open(trainer_state_path, "w", encoding="utf-8") as f:
             json.dump({"next_epoch": epoch_idx + 1, "global_step": global_step}, f, indent=2)
@@ -385,6 +401,7 @@ def train_programmatic(
         "lr_scheduler": "cosine",
         "warmup_steps": 0,
         "warmup_ratio": 0.0,
+        "save_optimizer": False,
     }
     defaults.update(config)
 
@@ -519,7 +536,13 @@ def train_programmatic(
 
     def _save_ckpt(epoch_idx):
         output_dir = os.path.join(args.output_model_path, f"checkpoint-epoch-{epoch_idx}")
-        shutil.copytree(MODEL_PATH, output_dir, dirs_exist_ok=True)
+        # Only copy essential config/tokenizer files, NOT the massive weights
+        os.makedirs(output_dir, exist_ok=True)
+        for item in os.listdir(MODEL_PATH):
+            s = os.path.join(MODEL_PATH, item)
+            d = os.path.join(output_dir, item)
+            if os.path.isfile(s) and not item.endswith(('.safetensors', '.bin', '.pt', '.ckpt')):
+                shutil.copy2(s, d)
         input_config_file = os.path.join(MODEL_PATH, "config.json")
         output_config_file = os.path.join(output_dir, "config.json")
         with open(input_config_file, 'r', encoding='utf-8') as f:
@@ -538,8 +561,11 @@ def train_programmatic(
         state_dict['talker.model.codec_embedding.weight'][3000] = target_speaker_embedding[0].detach().to(weight.device).to(weight.dtype)
         save_path = os.path.join(output_dir, "model.safetensors")
         save_file(state_dict, save_path)
-        torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
-        torch.save(lr_scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
+        del state_dict # Free memory
+
+        if args.save_optimizer:
+            torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
+            torch.save(lr_scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
         with open(os.path.join(output_dir, "trainer_state.json"), "w", encoding="utf-8") as f:
             json.dump({"next_epoch": epoch_idx + 1, "global_step": global_step}, f, indent=2)
 

@@ -160,6 +160,9 @@ class Pipeline:
         dataset_dir = job_dir / "dataset"
         output_dir = job_dir / "output"
 
+        # Cleanup old jobs if disk is full before starting new one
+        self._cleanup_disk_lru()
+
         dataset_dir.mkdir(parents=True, exist_ok=True)
         output_dir.mkdir(parents=True, exist_ok=True)
 
