@@ -81,9 +81,9 @@ Content-Type: application/json
 |-------|------|---------|-------------|
 | `dataset_s3_key` | string | *required* | S3 key to the dataset .zip (e.g. `datasets/Hero1/dataset.zip`) |
 | `speaker_name` | string | `speaker_custom` | Name for the fine-tuned voice (Avoid `_` + number) |
-| `num_epochs` | int | `10` | Training epochs |
-| `batch_size` | int | `1` | Batch size (increase on larger GPUs) |
-| `lr` | float | `2e-6` | Learning rate |
+| `num_epochs` | int | `15` | Training epochs |
+| `batch_size` | int | `2` | Batch size (increase on larger GPUs) |
+| `lr` | float | `1e-6` | Learning rate |
 | `book_id` | string | `null` | Optional book ID for S3 organization |
 | `chapter_id` | string | `null` | Optional chapter ID for S3 organization |
 | `character_id` | string | `null` | Optional character ID for local directory organization (`jobs/{job_id}`) |
@@ -113,9 +113,9 @@ curl -X POST http://localhost:8000/finetune \
   -d '{
     "dataset_s3_key": "datasets/Hero1/dataset.zip",
     "speaker_name": "hero_voice",
-    "num_epochs": 10,
-    "batch_size": 1,
-    "lr": 2e-6
+    "num_epochs": 15,
+    "batch_size": 2,
+    "lr": 1e-6
   }'
 ```
 
@@ -125,7 +125,7 @@ curl -X POST http://localhost:8000/finetune \
   "job_id": "a1b2c3d4e5f6",
   "status": "queued",
   "speaker_name": "hero_voice",
-  "config": { "num_epochs": 10, "batch_size": 1, "lr": 2e-6, "flash_attn": true }
+  "config": { "num_epochs": 15, "batch_size": 2, "lr": 1e-6, "flash_attn": true }
 }
 ```
 
@@ -358,6 +358,49 @@ curl -X POST http://localhost:8000/voice-design \
 
 ---
 
+### Voice Cloning (Zero-shot)
+
+#### Batch Voice Cloning
+Generate multiple speech audio files in parallel from a single reference audio and text. Uses the Qwen3-TTS Base model.
+
+```
+POST /voice-clone/batch
+Content-Type: application/json
+```
+
+**Body:**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `ref_audio_url` | string | *required* | URL or base64 of the reference audio for voice cloning |
+| `ref_text` | string | *required* | Transcript of the reference audio (used for ICL mode) |
+| `items` | array | *required* | List of `{text, filename?}` to generate |
+| `language` | string | `English` | Target language |
+| `use_xvec` | bool | `false` | If true, uses only speaker embedding (ignores `ref_text`) |
+| `upload_to_s3` | bool | `true` | Upload outputs to S3 |
+| `overwrite` | bool | `false` | Overwrite existing files on S3 |
+
+**Example:**
+```bash
+curl -X POST http://localhost:8000/voice-clone/batch \
+  -H "Content-Type: application/json" \
+  -d '{
+    "ref_audio_url": "https://example.com/audio/sample.wav",
+    "ref_text": "This is the reference spoken text.",
+    "items": [
+        {"text": "First sentence to generate in this voice.", "filename": "clone_001.wav"},
+        {"text": "Second sentence to generate concurrently.", "filename": "clone_002.wav"}
+    ],
+    "language": "English",
+    "upload_to_s3": true
+  }'
+```
+
+**Response:**
+Returns a JSON array containing objects similar to the standard `InferS3Response`, with `s3_url` and `presigned_url` for each item.
+
+---
+
 ### Storage (E2E Object Storage)
 
 #### Check storage configuration
@@ -507,8 +550,8 @@ curl http://localhost:8000/ops/running
 | `DEVICE` | `cuda:0` | GPU device |
 | `USE_FLASH_ATTN` | `1` | Enable flash attention (`0` to disable) |
 | `GPU_IDLE_TIMEOUT` | `300` | Seconds before auto-unloading model from VRAM |
-| `GPU_MAX_CONCURRENCY` | `2` | Max concurrent inference tasks on GPU |
-| `GPU_MAX_MODELS` | `1` | Max models kept in VRAM cache (increase for A100) |
+| `GPU_MAX_CONCURRENCY` | `16` | Max concurrent inference tasks on GPU |
+| `GPU_MAX_MODELS` | `4` | Max models kept in VRAM cache (increase for A100) |
 | `E2E_ACCESS_KEY` | *(unset)* | E2E Object Storage access key |
 | `E2E_SECRET_KEY` | *(unset)* | E2E Object Storage secret key |
 | `E2E_BUCKET` | `qwen3-tts` | S3 bucket name |
@@ -529,7 +572,7 @@ The service implements an **LRU (Least Recently Used) VRAM cache**:
 |---------|-------|-------------|
 | `GPU_MAX_MODELS` | `4` | Keep up to 4 voices hot in VRAM |
 | `GPU_IDLE_TIMEOUT` | `600` | 10 min idle before clearing all |
-| `GPU_MAX_CONCURRENCY` | `4` | Handle 4 parallel inference requests |
+| `GPU_MAX_CONCURRENCY` | `16` | Handle 16 parallel inference requests |
 
 ---
 

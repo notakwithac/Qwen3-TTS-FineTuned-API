@@ -1,0 +1,102 @@
+{
+    "info": {
+        "_postman_id": "6a3fe033-b1d6-4e50-a92c-7b06b2cd8df6",
+        "name": "Qwen3-TTS API",
+        "description": "Postman Collection for Qwen3-TTS Fine-Tuning API",
+        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    },
+    "item": [
+        {
+            "name": "Voice Design",
+            "request": {
+                "method": "POST",
+                "header": [
+                    {
+                        "key": "Content-Type",
+                        "value": "application/json"
+                    }
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\n    \"text\": \"Welcome to this audiobook. This voice was generated entirely from a text description.\",\n    \"instruct\": \"A warm male voice, middle-aged, calm and authoritative\",\n    \"language\": \"English\",\n    \"upload_to_s3\": true,\n    \"overwrite\": false\n}",
+                    "options": {
+                        "raw": {
+                            "language": "json"
+                        }
+                    }
+                },
+                "url": {
+                    "raw": "{{base_url}}/voice-design",
+                    "host": [
+                        "{{base_url}}"
+                    ],
+                    "path": [
+                        "voice-design"
+                    ]
+                },
+                "description": "Generate speech from a text description of the desired voice, using the VoiceDesign model directly."
+            },
+            "response": []
+        },
+        {
+            "name": "Voice Clone (Batch)",
+            "request": {
+                "method": "POST",
+                "header": [
+                    {
+                        "key": "Content-Type",
+                        "value": "application/json"
+                    }
+                ],
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\n    \"ref_audio_url\": \"https://github.com/gradio-app/gradio/raw/main/test/test_files/audio_sample.wav\",\n    \"ref_text\": \"Beavers are second only to humans in their ability to manipulate their environment.\",\n    \"items\": [\n        {\n            \"text\": \"First sentence to generate in this newly cloned voice.\",\n            \"filename\": \"clone_001.wav\"\n        },\n        {\n            \"text\": \"Second sentence to generate concurrently.\",\n            \"filename\": \"clone_002.wav\"\n        }\n    ],\n    \"language\": \"English\",\n    \"upload_to_s3\": true,\n    \"overwrite\": false,\n    \"use_xvec\": false\n}",
+                    "options": {
+                        "raw": {
+                            "language": "json"
+                        }
+                    }
+                },
+                "url": {
+                    "raw": "{{base_url}}/voice-clone/batch",
+                    "host": [
+                        "{{base_url}}"
+                    ],
+                    "path": [
+                        "voice-clone",
+                        "batch"
+                    ]
+                },
+                "description": "Batch generate zero-shot voice cloning from a reference audio and text. Uses the Qwen3-TTS Base model."
+            },
+            "response": []
+        }
+    ],
+    "event": [
+        {
+            "listen": "prerequest",
+            "script": {
+                "type": "text/javascript",
+                "exec": [
+                    ""
+                ]
+            }
+        },
+        {
+            "listen": "test",
+            "script": {
+                "type": "text/javascript",
+                "exec": [
+                    ""
+                ]
+            }
+        }
+    ],
+    "variable": [
+        {
+            "key": "base_url",
+            "value": "http://localhost:8000",
+            "type": "string"
+        }
+    ]
+}

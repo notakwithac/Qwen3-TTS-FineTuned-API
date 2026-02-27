@@ -25,6 +25,9 @@ logger = logging.getLogger(__name__)
 # Default VoiceDesign model from HuggingFace
 VOICE_DESIGN_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
 
+# Default Base model from HuggingFace
+VOICE_CLONE_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+
 
 class InferenceManager:
     """Manages loaded TTS models with automatic GPU idle unloading.
@@ -272,6 +275,14 @@ class InferenceManager:
                 return  # Already loaded
             self._load_model(model_path, "voice_design")
 
+    def load_voice_clone(self, model_path: str = VOICE_CLONE_MODEL):
+        """Load the Base model for zero-shot voice cloning."""
+        with self._lock:
+            if self._last_type == "voice_clone" and self._last_path == model_path:
+                self._touch()
+                return  # Already loaded
+            self._load_model(model_path, "voice_clone")
+
     def _unload_all_unsafe(self):
         count = len(self._models)
         self._models.clear()
@@ -457,6 +468,51 @@ class InferenceManager:
                 result = buf.read()
                 ops_log.end(op, extra={"audio_bytes": len(result), "sample_rate": sr})
                 return result, sr
+            except Exception as e:
+                ops_log.fail(op, str(e))
+                raise
+
+    # -- VoiceClone inference -------------------------------------------------
+
+    def generate_voice_clone_batch(
+        self,
+        texts: list[str],
+        ref_audio: str,
+        ref_text: str,
+        languages: list[str] = None,
+        x_vector_only_mode: bool = False,
+    ) -> tuple[list[bytes], int]:
+        """Generate speech for multiple texts using zero-shot VoiceClone Base model."""
+        if not languages:
+            languages = ["English"] * len(texts)
+            
+        with self._lock:
+            model, _ = self._get_model(VOICE_CLONE_MODEL, "voice_clone")
+            self._total_requests += len(texts)
+
+        with self._track_active(), self._inference_semaphore:
+            op = ops_log.start("inference_voice_clone_batch", extra={
+                "batch_size": len(texts),
+            })
+            try:
+                # Assuming all batches share the same reference audio and text for the API use case
+                wavs_list, sr = model.generate_voice_clone(
+                    text=texts,
+                    ref_audio=ref_audio,
+                    ref_text=ref_text,
+                    language=languages,
+                    x_vector_only_mode=x_vector_only_mode,
+                )
+
+                results = []
+                for wav in wavs_list:
+                    buf = io.BytesIO()
+                    sf.write(buf, wav, sr, format="WAV")
+                    buf.seek(0)
+                    results.append(buf.read())
+                    
+                ops_log.end(op, extra={"sample_rate": sr})
+                return results, sr
             except Exception as e:
                 ops_log.fail(op, str(e))
                 raise

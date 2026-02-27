@@ -229,6 +229,20 @@ class VoiceDesignRequest(BaseModel):
     overwrite: bool = False  # If false, skips generation if file already exists on S3
 
 
+class VoiceCloneBatchItem(BaseModel):
+    text: str
+    filename: Optional[str] = None
+
+class VoiceCloneBatchRequest(BaseModel):
+    """Batch generate zero-shot voice cloning from a reference audio and upload to S3."""
+    ref_audio_url: str
+    ref_text: str
+    items: list[VoiceCloneBatchItem]
+    language: str = "English"
+    use_xvec: bool = False
+    upload_to_s3: bool = True
+    overwrite: bool = False
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -613,8 +627,134 @@ def list_storage(job_id: str, book_id: Optional[str] = None, chapter_id: Optiona
 
 
 # ---------------------------------------------------------------------------
-# Voice Design
+# Voice Design & Voice Clone
 # ---------------------------------------------------------------------------
+
+@app.post(
+    "/voice-clone/batch",
+    summary="Batch generate zero-shot voice cloning",
+    response_model=list[InferS3Response],
+)
+async def voice_clone_batch(req: VoiceCloneBatchRequest):
+    """Generate multiple audio files in parallel using zero-shot VoiceClone Base model and upload to S3."""
+    if req.upload_to_s3 and not storage.is_configured:
+        raise HTTPException(
+            status_code=503,
+            detail="Storage not configured. Set E2E_ACCESS_KEY and E2E_SECRET_KEY.",
+        )
+
+    # 1. Start timer to unload model if idle after this job
+    pipeline.inference._touch()
+
+    # 2. Extract texts and prepare filenames
+    texts_to_process = []
+    filenames_to_process = []
+    
+    for i, item in enumerate(req.items):
+        texts_to_process.append(item.text)
+        filenames_to_process.append(item.filename or f"clone_{uuid.uuid4().hex[:8]}.wav")
+
+    # 3. Check fast-path for existing S3 files if overwrite=False
+    results = [None] * len(texts_to_process)
+    indices_to_generate = []
+    
+    s3_prefix = "audio/voice_clone"
+    
+    import asyncio
+    loop = asyncio.get_running_loop()
+
+    if not req.overwrite and req.upload_to_s3 and storage.is_configured:
+        for i, filename in enumerate(filenames_to_process):
+            s3_key = f"{s3_prefix}/{filename}"
+            exists = await loop.run_in_executor(None, storage.object_exists, s3_key)
+            if exists:
+                presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
+                results[i] = {
+                    "s3_url": storage._object_url(s3_key),
+                    "presigned_url": presigned_url,
+                    "s3_key": s3_key,
+                    "sample_rate": 24000,
+                    "text": texts_to_process[i],
+                    "job_id": "voice_clone",
+                }
+            else:
+                indices_to_generate.append(i)
+    else:
+        indices_to_generate = list(range(len(texts_to_process)))
+
+    if not indices_to_generate:
+        return results
+
+    # 4. Generate the missing items
+    texts_gen = [texts_to_process[i] for i in indices_to_generate]
+    try:
+        from functools import partial
+        wav_bytes_list, sr = await loop.run_in_executor(
+            None,
+            partial(
+                pipeline.inference.generate_voice_clone_batch,
+                texts=texts_gen,
+                ref_audio=req.ref_audio_url,
+                ref_text=req.ref_text,
+                languages=[req.language] * len(texts_gen),
+                x_vector_only_mode=req.use_xvec,
+            )
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Voice clone generation failed: {str(e)}")
+
+    # 5. Upload to S3 in parallel
+    if req.upload_to_s3:
+        # Create a Semaphore to limit concurrent S3 uploads matching S3 connection pool
+        concurrency_limit = asyncio.Semaphore(10)
+
+        async def upload_single(wav_bytes, filename, text, original_index):
+            async with concurrency_limit:
+                s3_key = f"{s3_prefix}/{filename}"
+                s3_url = await loop.run_in_executor(
+                    None,
+                    partial(storage.upload_wav, wav_bytes, "voice_clone", filename=filename, prefix=s3_prefix)
+                )
+                presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
+                return {
+                    "s3_url": s3_url,
+                    "presigned_url": presigned_url,
+                    "s3_key": s3_key,
+                    "sample_rate": sr,
+                    "text": text,
+                    "job_id": "voice_clone",
+                }, original_index
+
+        tasks = []
+        for i, wav_bytes in enumerate(wav_bytes_list):
+            orig_idx = indices_to_generate[i]
+            tasks.append(upload_single(
+                wav_bytes, 
+                filenames_to_process[orig_idx], 
+                texts_to_process[orig_idx],
+                orig_idx
+            ))
+            
+        upload_results = await asyncio.gather(*tasks)
+        for res, orig_idx in upload_results:
+            results[orig_idx] = res
+
+    else:
+        # For non-S3 users, this returns raw base64 or similar - not ideal for batch, but we can return basic JSON
+        # Here we just encode audio into base64 mapping so the user can grab it
+        import base64
+        for i, wav_bytes in enumerate(wav_bytes_list):
+            orig_idx = indices_to_generate[i]
+            results[orig_idx] = {
+                "s3_url": "",
+                "presigned_url": f"data:audio/wav;base64,{base64.b64encode(wav_bytes).decode('utf-8')}",
+                "s3_key": filenames_to_process[orig_idx],
+                "sample_rate": sr,
+                "text": texts_to_process[orig_idx],
+                "job_id": "voice_clone_local",
+            }
+
+    return results
 
 @app.post(
     "/voice-design",
