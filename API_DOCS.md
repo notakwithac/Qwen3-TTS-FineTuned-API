@@ -30,6 +30,7 @@ The API is optimized for instances with limited storage (e.g., 50GB SSD).
    - Local model weights (~3.5GB) are kept in a **Disk LRU** cache. 
    - When the `jobs/` directory exceeds **20GB**, the oldest models (by last access time) are automatically removed.
    - All models are safely backed up to S3 before local deletion.
+   - For S3-backed jobs, only the heavy `output/` directory is deleted — `job.json` is kept locally and on S3 for fast lookups.
 
 2. **Manual Cleanup**:
    ```
@@ -140,8 +141,12 @@ GET /jobs/{job_id}
 **Status transitions:**
 ```
 queued → preparing → training → loading → ready
-                                         ↘ failed
+                                        ↘ failed
+                                restoring ↗
 ```
+
+> **Note**: `restoring` means the checkpoint is being downloaded from S3 (e.g. after LRU cleanup).
+> Jobs restored from S3 transition: `restoring → ready`.
 
 **Example:**
 ```bash
@@ -193,6 +198,39 @@ DELETE /jobs/{job_id}
 ```
 
 Cancels a running job or deletes a completed one (including files).
+
+---
+
+#### Retry a failed job
+
+```
+POST /jobs/{job_id}/retry
+```
+
+**Smart retry**: automatically detects what stage the job failed at.
+- If **training completed** (checkpoint exists locally or on S3), skips straight to loading — no re-training.
+- If training never completed, restarts the full pipeline from scratch.
+
+**Example:**
+```bash
+curl -X POST http://localhost:8000/jobs/a1b2c3d4e5f6/retry
+```
+
+**Response** (HTTP 202):
+```json
+{
+  "job_id": "a1b2c3d4e5f6",
+  "status": "loading",
+  "progress": {
+    "stage": "loading",
+    "detail": "Retrying: loading model for inference (training already completed)..."
+  }
+}
+```
+
+> **Auto-recovery**: You can also just call `/infer/{job_id}` directly on a failed job.
+> If the model was successfully trained (backed up to S3), inference will **automatically
+> restore the checkpoint and serve** without needing an explicit retry.
 
 ---
 

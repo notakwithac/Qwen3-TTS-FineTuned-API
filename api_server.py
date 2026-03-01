@@ -409,12 +409,18 @@ async def infer(job_id: str, req: InferRequest):
     if not job:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
 
-    if job.status != JobStatus.READY:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Job {job_id} is not ready (status: {job.status}). "
-                   f"Poll GET /jobs/{job_id} to check progress.",
+    if job.status not in (JobStatus.READY, JobStatus.RESTORING):
+        # Auto-recover: if job FAILED but training completed (has S3 backup or local checkpoint),
+        # transparently recover instead of returning an error
+        can_recover = job.status == JobStatus.FAILED and (
+            job.s3_model_key or (job.checkpoint_path and os.path.exists(str(job.checkpoint_path)))
         )
+        if not can_recover:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Job {job_id} is not ready (status: {job.status}). "
+                       f"Poll GET /jobs/{job_id} to check progress.",
+            )
 
     pipeline.touch_job(job_id) # Update LRU timestamp
     pipeline._cleanup_disk_lru(20.0) # Background check usage
@@ -436,7 +442,13 @@ async def infer(job_id: str, req: InferRequest):
             }
 
     try:
-        checkpoint_path = str(job.checkpoint_path)
+        checkpoint_path = str(job.checkpoint_path) if job.checkpoint_path else None
+        # If checkpoint is missing locally, restore from S3
+        if not checkpoint_path or not os.path.exists(checkpoint_path):
+            if job.s3_model_key:
+                checkpoint_path = pipeline._restore_checkpoint_from_s3(job)
+            else:
+                raise HTTPException(status_code=500, detail=f"Job {job_id} has no checkpoint and no S3 backup")
         batcher = get_custom_voice_batcher(job_id, checkpoint_path, job.speaker_name)
         
         with ops_log.operation("inference_api", job_id=job_id, extra={
@@ -514,11 +526,15 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
     job = pipeline.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
-    if job.status != JobStatus.READY:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Job {job_id} is not ready (status: {job.status}).",
+    if job.status not in (JobStatus.READY, JobStatus.RESTORING):
+        can_recover = job.status == JobStatus.FAILED and (
+            job.s3_model_key or (job.checkpoint_path and os.path.exists(str(job.checkpoint_path)))
         )
+        if not can_recover:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Job {job_id} is not ready (status: {job.status}).",
+            )
 
     pipeline.touch_job(job_id)
     pipeline._cleanup_disk_lru(20.0)
@@ -560,7 +576,7 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
             # Run generation in a thread pool (InferenceManager handles the GPU semaphore)
             loop = asyncio.get_running_loop()
             try:
-                checkpoint_path = str(job.checkpoint_path)
+                checkpoint_path = str(job.checkpoint_path) if job.checkpoint_path else None
                 wav_bytes, sr = await loop.run_in_executor(
                     None,  # Uses default ThreadPoolExecutor
                     partial(

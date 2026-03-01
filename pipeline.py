@@ -37,6 +37,7 @@ class JobStatus:
     PREPARING = "preparing"
     TRAINING = "training"
     LOADING = "loading"
+    RESTORING = "restoring"  # Downloading checkpoint from S3
     READY = "ready"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -60,6 +61,7 @@ class Job:
         character_id: Optional[str] = None,
         job_dir: Optional[str] = None,
         base_model_path: Optional[str] = None,
+        s3_model_key: Optional[str] = None,
     ):
         self.job_id = job_id
         self.speaker_name = speaker_name
@@ -74,6 +76,7 @@ class Job:
         self.character_id = character_id
         self.job_dir = job_dir
         self.base_model_path = base_model_path
+        self.s3_model_key = s3_model_key
 
         self.status = JobStatus.QUEUED
         self.progress: Dict[str, Any] = {}
@@ -95,6 +98,7 @@ class Job:
             "error": self.error,
             "created_at": self.created_at,
             "finished_at": self.finished_at,
+            "s3_model_key": self.s3_model_key,
             "config": {
                 "num_epochs": self.num_epochs,
                 "batch_size": self.batch_size,
@@ -147,6 +151,7 @@ class Job:
                 character_id=config.get("character_id"),
                 job_dir=job_dir,
                 base_model_path=config.get("base_model_path"),
+                s3_model_key=data.get("s3_model_key"),
             )
             job.status = data.get("status", JobStatus.QUEUED)
             job.progress = data.get("progress", {})
@@ -289,6 +294,11 @@ class Pipeline:
                 with self._lock:
                     self.jobs[job_id] = job
                 return job
+
+        # Try to restore from S3
+        job = self._restore_job_from_s3(job_id)
+        if job:
+            return job
                 
         return None
 
@@ -313,7 +323,12 @@ class Pipeline:
         return total
 
     def _cleanup_disk_lru(self, threshold_gb: float = 20.0):
-        """Delete oldest jobs if disk usage exceeds threshold."""
+        """Delete oldest jobs if disk usage exceeds threshold.
+        
+        For S3-backed jobs: only deletes the heavy checkpoint files, keeping
+        job.json locally. The checkpoint can be re-downloaded on demand.
+        For non-S3 jobs: deletes the entire job folder (legacy behavior).
+        """
         if not self.jobs_dir.exists():
             return
 
@@ -339,12 +354,29 @@ class Pipeline:
                 break
             
             job_dir = self.jobs_dir / job.job_id
-            if job_dir.exists():
+            if not job_dir.exists():
+                continue
+
+            if job.s3_model_key:
+                # S3-backed: only delete the heavy output/ and dataset/ dirs,
+                # keep job.json so get_job() still works without S3 round-trip
+                for subdir in ["output", "dataset"]:
+                    subdir_path = job_dir / subdir
+                    if subdir_path.exists():
+                        size = self._get_dir_size(subdir_path)
+                        try:
+                            shutil.rmtree(subdir_path)
+                            current_size -= size
+                            logger.info(f"LRU: Deleted {subdir}/ for S3-backed job {job.job_id} (freed {size / 1024**2:.1f}MB)")
+                        except Exception as e:
+                            logger.error(f"LRU: Failed to delete {subdir}/ for {job.job_id}: {e}")
+            else:
+                # Non-S3: delete the entire folder (unrecoverable)
                 size = self._get_dir_size(job_dir)
                 try:
                     shutil.rmtree(job_dir)
                     current_size -= size
-                    logger.info(f"LRU: Deleted job {job.job_id} (retrieved {size / 1024**2:.1f}MB)")
+                    logger.info(f"LRU: Deleted job {job.job_id} (freed {size / 1024**2:.1f}MB)")
                 except Exception as e:
                     logger.error(f"LRU: Failed to delete job {job.job_id}: {e}")
 
@@ -381,23 +413,85 @@ class Pipeline:
         return True
 
     def retry_job(self, job_id: str) -> Optional[Job]:
-        """Retry a failed or cancelled job."""
+        """Retry a failed or cancelled job.
+        
+        Smart retry: if training already completed (checkpoint exists locally
+        or can be restored from S3), skips straight to loading for inference
+        instead of re-running the entire pipeline.
+        """
         job = self.jobs.get(job_id)
         if not job:
             return None
             
         if job.status not in (JobStatus.FAILED, JobStatus.CANCELLED):
-            return None # Only allow retrying if it actually failed or died.
-            
-        # Reset the job state
-        job.status = JobStatus.QUEUED
-        job.error = None
-        job._cancel_requested = False
-        job.progress = {}
+            return None  # Only allow retrying if it actually failed or died.
+
+        # Check if training already completed (late-stage failure)
+        checkpoint_exists = job.checkpoint_path and os.path.exists(str(job.checkpoint_path))
+        has_s3_backup = bool(job.s3_model_key)
+
+        if checkpoint_exists or has_s3_backup:
+            # Training succeeded — skip to Stage 3 (load for inference)
+            job.status = JobStatus.LOADING
+            job.error = None
+            job._cancel_requested = False
+            job.progress = {"stage": "loading", "detail": "Retrying: loading model for inference (training already completed)..."}
+            job.save()
+
+            thread = threading.Thread(
+                target=self._retry_load_only, args=(job,), daemon=True
+            )
+            job._thread = thread
+            thread.start()
+        else:
+            # Training never completed — full restart
+            job.status = JobStatus.QUEUED
+            job.error = None
+            job._cancel_requested = False
+            job.progress = {}
+            self.start_job(job_id)
         
-        # Start execution
-        self.start_job(job_id)
         return job
+
+    def _retry_load_only(self, job: Job):
+        """Load a model for inference (skipping training), used by smart retry."""
+        op = ops_log.start("retry_load", job_id=job.job_id)
+        try:
+            cp = str(job.checkpoint_path) if job.checkpoint_path else None
+
+            # Restore checkpoint from S3 if not available locally
+            if not cp or not os.path.exists(cp):
+                if job.s3_model_key:
+                    cp = self._restore_checkpoint_from_s3(job)
+                else:
+                    raise ValueError("No checkpoint and no S3 backup")
+
+            # Free GPU memory before loading
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            job.status = JobStatus.LOADING
+            job.progress = {"stage": "loading", "detail": "Loading fine-tuned model for inference..."}
+            job.save()
+
+            self.inference.load(cp, job.speaker_name)
+
+            job.checkpoint_path = cp
+            job.status = JobStatus.READY
+            job.finished_at = datetime.now(timezone.utc).isoformat()
+            job.progress = {
+                "stage": "ready",
+                "detail": "Model loaded and ready for inference",
+                "inference_url": f"/infer/{job.job_id}",
+            }
+            job.save()
+            ops_log.end(op)
+        except Exception as e:
+            job.status = JobStatus.FAILED
+            job.error = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
+            job.save()
+            ops_log.fail(op, str(e))
 
     # -- Pipeline execution -------------------------------------------------
 
@@ -407,15 +501,43 @@ class Pipeline:
         if not job:
             raise ValueError(f"Job {job_id} not found")
 
-        thread = threading.Thread(target=self._run_pipeline, args=(job,), daemon=True)
+        thread = threading.Thread(target=self._run_pipeline, args=(job, 0), daemon=True)
         job._thread = thread
         thread.start()
 
-    def _run_pipeline(self, job: Job):
+    @staticmethod
+    def _is_corrupt_model_error(error: Exception) -> bool:
+        """Detect safetensors/model corruption errors."""
+        err_str = str(error)
+        markers = [
+            "deserializing header",
+            "incomplete metadata",
+            "file not fully covered",
+            "HeaderTooLarge",
+            "invalid header",
+        ]
+        return any(m in err_str for m in markers)
+
+    @staticmethod
+    def _clear_hf_cache(model_name: str):
+        """Clear the HuggingFace cache for a specific model."""
+        from pathlib import Path
+        cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
+        # HF cache folder format: models--Org--ModelName
+        folder_name = f"models--{model_name.replace('/', '--')}"
+        cache_path = cache_dir / folder_name
+        if cache_path.exists():
+            logger.warning(f"Clearing corrupted HF cache: {cache_path}")
+            shutil.rmtree(cache_path, ignore_errors=True)
+            return True
+        return False
+
+    def _run_pipeline(self, job: Job, attempt: int = 0):
         """Execute the 3-stage pipeline: prepare → train → serve."""
         pipeline_op = ops_log.start("pipeline_total", job_id=job.job_id, extra={
             "speaker_name": job.speaker_name,
             "num_epochs": job.num_epochs,
+            "attempt": attempt,
         })
         try:
             # Stage 1: Data preparation
@@ -455,6 +577,7 @@ class Pipeline:
             if job._cancel_requested:
                 job.status = JobStatus.CANCELLED
                 ops_log.fail(pipeline_op, "cancelled")
+                self._training_queue.release()
                 return
 
             # Free tokenizer GPU memory before training
@@ -510,6 +633,10 @@ class Pipeline:
                     offload_op = ops_log.start("model_offload", job_id=j.job_id)
                     try:
                         s3_k = self._upload_model_to_s3(j, Path(cp_path))
+                        j.s3_model_key = s3_k
+                        # Upload job.json to S3 for easy access / restoration
+                        self._upload_job_json_to_s3(j)
+                        j.save()  # Persist s3_model_key locally
                         ops_log.end(offload_op, extra={"s3_key": s3_k})
                     except Exception as err:
                         ops_log.fail(offload_op, f"Model upload failed: {err}")
@@ -542,6 +669,7 @@ class Pipeline:
             if job._cancel_requested:
                 job.status = JobStatus.CANCELLED
                 ops_log.fail(pipeline_op, "cancelled")
+                self._training_queue.release()
                 return
 
             job.checkpoint_path = checkpoint_path
@@ -567,14 +695,48 @@ class Pipeline:
             }
             job.save()
             ops_log.end(pipeline_op)
+            self._training_queue.release()
 
         except Exception as e:
+            # Auto-retry on corrupted model cache (safetensors deserialization errors)
+            if self._is_corrupt_model_error(e) and attempt < 1:
+                logger.warning(
+                    f"Job {job.job_id}: Detected corrupted model cache (attempt {attempt}). "
+                    f"Clearing cache and retrying..."
+                )
+                ops_log.fail(pipeline_op, f"Corrupt cache (auto-retrying): {e}")
+                
+                # Clear the HF cache for known base models
+                for model_name in ["Qwen/Qwen3-TTS-12Hz-1.7B-Base", "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"]:
+                    self._clear_hf_cache(model_name)
+                
+                # Also clear if using a custom base_model_path from HuggingFace
+                if job.base_model_path and "/" in job.base_model_path and not os.path.isabs(job.base_model_path):
+                    self._clear_hf_cache(job.base_model_path)
+                
+                # Free GPU and retry
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
+                # Release queue before recursive call (recursive call will re-acquire)
+                self._training_queue.release()
+                
+                job.status = JobStatus.QUEUED
+                job.error = None
+                job.progress = {"stage": "queued", "detail": "Auto-retrying after clearing corrupted model cache..."}
+                job.save()
+                
+                # Re-run pipeline with incremented attempt
+                # (recursive call manages its own queue acquire/release)
+                self._run_pipeline(job, attempt + 1)
+                return  # Skip the finally release — already released above
+            
             job.status = JobStatus.FAILED
             job.error = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
             job.finished_at = datetime.now(timezone.utc).isoformat()
             job.save()
             ops_log.fail(pipeline_op, str(e))
-        finally:
             self._training_queue.release()
 
     # -- Inference -----------------------------------------------------------
@@ -592,14 +754,18 @@ class Pipeline:
         job = self.jobs.get(job_id)
         if not job:
             raise ValueError(f"Job {job_id} not found")
-        if job.status != JobStatus.READY:
+        if job.status not in (JobStatus.READY, JobStatus.RESTORING):
             raise ValueError(f"Job {job_id} is not ready (status: {job.status})")
 
         cp = checkpoint_path or (str(job.checkpoint_path) if job.checkpoint_path else None)
         spk = speaker_name or job.speaker_name
         
-        if not cp:
-            raise ValueError(f"Job {job_id} has no checkpoint")
+        # If checkpoint is missing locally, try to restore from S3
+        if not cp or not os.path.exists(cp):
+            if job.s3_model_key:
+                cp = self._restore_checkpoint_from_s3(job)
+            else:
+                raise ValueError(f"Job {job_id} has no checkpoint and no S3 backup")
 
         return self.inference.generate(
             text=text,
@@ -636,3 +802,107 @@ class Pipeline:
             storage.upload_file(archive_path, s3_key, content_type="application/zip")
             
         return s3_key
+
+    def _upload_job_json_to_s3(self, job: Job):
+        """Upload job.json to S3 for easy access and restoration."""
+        from storage import storage
+        try:
+            s3_key = f"jobs/{job.job_id}/job.json"
+            job_data = json.dumps(job.to_dict(), indent=2)
+            storage.upload_text(job_data, s3_key)
+            logger.info(f"Uploaded job.json to S3: {s3_key}")
+        except Exception as e:
+            logger.error(f"Failed to upload job.json to S3 for {job.job_id}: {e}")
+
+    def _restore_job_from_s3(self, job_id: str) -> Optional[Job]:
+        """Try to restore a job's metadata from S3 (lightweight — no model download)."""
+        from storage import storage
+        if not storage.is_configured:
+            return None
+
+        s3_key = f"jobs/{job_id}/job.json"
+        try:
+            if not storage.object_exists(s3_key):
+                return None
+
+            data_bytes = storage.download_bytes(s3_key)
+            data = json.loads(data_bytes.decode("utf-8"))
+
+            # Recreate local job directory with just job.json
+            job_dir = self.jobs_dir / job_id
+            job_dir.mkdir(parents=True, exist_ok=True)
+            with open(job_dir / "job.json", "w") as f:
+                json.dump(data, f, indent=2)
+
+            job = Job.load(str(job_dir))
+            if job:
+                with self._lock:
+                    self.jobs[job_id] = job
+                logger.info(f"Restored job {job_id} metadata from S3")
+                return job
+        except Exception as e:
+            logger.error(f"Failed to restore job {job_id} from S3: {e}")
+        return None
+
+    def _restore_checkpoint_from_s3(self, job: Job) -> str:
+        """Download and extract the model checkpoint from S3.
+        
+        Returns the local checkpoint path.
+        Raises ValueError if restoration fails.
+        """
+        from storage import storage
+        import tempfile
+
+        if not job.s3_model_key:
+            raise ValueError(f"Job {job.job_id} has no S3 model key")
+        if not storage.is_configured:
+            raise ValueError("Storage not configured, cannot restore checkpoint")
+
+        prev_status = job.status
+        job.status = JobStatus.RESTORING
+        job.progress = {"stage": "restoring", "detail": "Downloading model from S3..."}
+        job.save()
+
+        restore_op = ops_log.start("checkpoint_restore", job_id=job.job_id, extra={
+            "s3_key": job.s3_model_key,
+        })
+        try:
+            # Ensure output directory exists
+            job_dir = self.jobs_dir / job.job_id
+            output_dir = job_dir / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            # Download the zip to a temp file
+            with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+                tmp_path = tmp.name
+            
+            storage.download_file(job.s3_model_key, tmp_path)
+
+            # Extract into the output directory
+            # The zip contains model files; extract into a named subfolder
+            checkpoint_dir = output_dir / f"checkpoint_{job.speaker_name}"
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+            import zipfile
+            with zipfile.ZipFile(tmp_path, "r") as zf:
+                zf.extractall(checkpoint_dir)
+
+            os.unlink(tmp_path)
+
+            checkpoint_path = str(checkpoint_dir)
+            job.checkpoint_path = checkpoint_path
+            job.status = JobStatus.READY
+            job.progress = {
+                "stage": "ready",
+                "detail": "Model restored from S3 and ready for inference",
+                "inference_url": f"/infer/{job.job_id}",
+            }
+            job.save()
+            ops_log.end(restore_op, extra={"checkpoint_path": checkpoint_path})
+            logger.info(f"Restored checkpoint for job {job.job_id} from S3 to {checkpoint_path}")
+            return checkpoint_path
+        except Exception as e:
+            job.status = prev_status
+            job.save()
+            ops_log.fail(restore_op, str(e))
+            raise ValueError(f"Failed to restore checkpoint from S3: {e}")
