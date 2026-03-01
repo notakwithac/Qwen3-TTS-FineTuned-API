@@ -56,6 +56,7 @@ USE_FLASH_ATTN = os.environ.get("USE_FLASH_ATTN", "1") == "1"
 GPU_IDLE_TIMEOUT = int(os.environ.get("GPU_IDLE_TIMEOUT", "600"))
 GPU_MAX_CONCURRENCY = int(os.environ.get("GPU_MAX_CONCURRENCY", "16"))
 GPU_MAX_MODELS = int(os.environ.get("GPU_MAX_MODELS", "4"))
+GPU_BATCH_SIZE = int(os.environ.get("GPU_BATCH_SIZE", "32"))
 USE_TORCH_COMPILE = os.environ.get("USE_TORCH_COMPILE", "1") == "1"
 
 logger.info(f"Loaded Configuration:")
@@ -64,6 +65,7 @@ logger.info(f"  - USE_FLASH_ATTN: {USE_FLASH_ATTN}")
 logger.info(f"  - GPU_IDLE_TIMEOUT: {GPU_IDLE_TIMEOUT}s")
 logger.info(f"  - GPU_MAX_CONCURRENCY: {GPU_MAX_CONCURRENCY}")
 logger.info(f"  - GPU_MAX_MODELS: {GPU_MAX_MODELS}")
+logger.info(f"  - GPU_BATCH_SIZE: {GPU_BATCH_SIZE}")
 logger.info(f"  - USE_TORCH_COMPILE: {USE_TORCH_COMPILE}")
 
 pipeline = Pipeline(
@@ -158,10 +160,10 @@ class DynamicBatcher:
 
 # Instantiate global batchers
 voice_design_batcher = DynamicBatcher(
-    batch_size=GPU_MAX_CONCURRENCY,
+    batch_size=GPU_BATCH_SIZE,
     timeout_ms=100,
     process_fn=pipeline.inference.generate_voice_design_batch,
-    max_workers=GPU_MAX_MODELS
+    max_workers=1  # Always 1 worker per model type to ensure thread-safety
 )
 
 custom_voice_batchers = {}  # Map job_id -> DynamicBatcher
@@ -177,10 +179,10 @@ def get_custom_voice_batcher(job_id: str, checkpoint_path: str, speaker_name: st
                 instructs=instructs
             )
         custom_voice_batchers[job_id] = DynamicBatcher(
-            batch_size=GPU_MAX_CONCURRENCY,
+            batch_size=GPU_BATCH_SIZE,
             timeout_ms=100,
             process_fn=process_fn,
-            max_workers=GPU_MAX_MODELS
+            max_workers=1  # Always 1 worker per job/model to ensure thread-safety
         )
     return custom_voice_batchers[job_id]
 
