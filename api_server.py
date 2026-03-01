@@ -584,6 +584,9 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
             filename = item.get("filename", f"audio_{index:04d}.wav")
             overwrite = item.get("overwrite", req.overwrite)
             
+            # Construct S3 prefix for the upload phase
+            s3_prefix = f"audio/segments/{req.book_id}/{req.chapter_id}" if req.book_id and req.chapter_id else f"audio/{job_id}"
+
             # Enhanced Fast-path check
             s3_key_found = None
             if not overwrite and storage.is_configured:
