@@ -351,7 +351,7 @@ def create_finetune_job(req: FinetuneRequest):
 
 
 @app.get("/gpu/cleanup", summary="Trigger Disk LRU cleanup manualy")
-async def trigger_cleanup(threshold_gb: float = 30.0):
+async def trigger_cleanup(threshold_gb: float = 40.0):
     """Manually trigger the Disk LRU cleanup process."""
     pipeline._cleanup_disk_lru(threshold_gb)
     return {"detail": "Cleanup triggered"}
@@ -423,7 +423,7 @@ async def infer(job_id: str, req: InferRequest):
             )
 
     pipeline.touch_job(job_id) # Update LRU timestamp
-    pipeline._cleanup_disk_lru(20.0) # Background check usage
+    pipeline._cleanup_disk_lru(30.0) # Background check usage
 
     # Fast-path check: Return existing S3 URL if overwrite=False and we have an exact target
     s3_prefix = f"audio/segments/{req.book_id}/{req.chapter_id}" if req.book_id and req.chapter_id else f"audio/{job_id}"
@@ -537,7 +537,7 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
             )
 
     pipeline.touch_job(job_id)
-    pipeline._cleanup_disk_lru(20.0)
+    pipeline._cleanup_disk_lru(30.0)
 
     import asyncio
     from functools import partial

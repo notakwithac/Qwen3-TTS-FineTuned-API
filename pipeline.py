@@ -322,7 +322,7 @@ class Pipeline:
             pass
         return total
 
-    def _cleanup_disk_lru(self, threshold_gb: float = 20.0):
+    def _cleanup_disk_lru(self, threshold_gb: float = 40.0):
         """Delete oldest jobs if disk usage exceeds threshold.
         
         For S3-backed jobs: only deletes the heavy checkpoint files, keeping
@@ -349,6 +349,8 @@ class Pipeline:
         # Oldest first
         candidates.sort(key=lambda x: x.last_accessed_at)
 
+        from storage import storage as _storage
+
         for job in candidates:
             if current_size <= threshold_bytes:
                 break
@@ -370,8 +372,12 @@ class Pipeline:
                             logger.info(f"LRU: Deleted {subdir}/ for S3-backed job {job.job_id} (freed {size / 1024**2:.1f}MB)")
                         except Exception as e:
                             logger.error(f"LRU: Failed to delete {subdir}/ for {job.job_id}: {e}")
+            elif _storage.is_configured:
+                # S3 is configured but this job hasn't been uploaded yet — skip it.
+                # It may still be uploading in the background, or the upload failed.
+                logger.warning(f"LRU: Skipping job {job.job_id} — not yet uploaded to S3. Cannot safely prune.")
             else:
-                # Non-S3: delete the entire folder (unrecoverable)
+                # No S3 configured: delete the entire folder (last resort)
                 size = self._get_dir_size(job_dir)
                 try:
                     shutil.rmtree(job_dir)
