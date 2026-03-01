@@ -29,6 +29,17 @@ logger = logging.getLogger(__name__)
 # App setup
 # ---------------------------------------------------------------------------
 
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def _lifespan(app):
+    yield  # Startup: nothing extra needed
+    # Shutdown: wait for any in-progress S3 uploads
+    logger.info("Server shutting down — waiting for pending S3 uploads...")
+    import asyncio
+    await asyncio.get_event_loop().run_in_executor(None, pipeline.shutdown)
+    logger.info("Shutdown complete.")
+
 app = FastAPI(
     title="Qwen3-TTS Fine-Tuning API",
     description=(
@@ -36,6 +47,7 @@ app = FastAPI(
         "and store results in E2E Object Storage (S3-compatible)."
     ),
     version="2.0.0",
+    lifespan=_lifespan,
 )
 
 # GPU configuration
@@ -425,21 +437,31 @@ async def infer(job_id: str, req: InferRequest):
     pipeline.touch_job(job_id) # Update LRU timestamp
     pipeline._cleanup_disk_lru(30.0) # Background check usage
 
-    # Fast-path check: Return existing S3 URL if overwrite=False and we have an exact target
-    s3_prefix = f"audio/segments/{req.book_id}/{req.chapter_id}" if req.book_id and req.chapter_id else f"audio/{job_id}"
-    s3_target_key = f"{s3_prefix}/{req.s3_filename}" if req.s3_filename else None
-    
-    if req.upload_to_s3 and s3_target_key and not req.overwrite and storage.is_configured:
-        if storage.object_exists(s3_target_key):
-            presigned_url = storage.get_presigned_url(s3_target_key, expires_in=86400)
-            return {
-                "s3_url": storage._object_url(s3_target_key),
-                "presigned_url": presigned_url,
-                "s3_key": s3_target_key,
-                "sample_rate": 24000,
-                "text": req.text,
-                "job_id": job_id,
-            }
+    # Enhanced Fast-path check: check segments path FIRST, then job path fallback
+    s3_key_found = None
+    if req.upload_to_s3 and not req.overwrite and req.s3_filename and storage.is_configured:
+        # 1. Primary path (segments)
+        if req.book_id and req.chapter_id:
+            primary_key = f"audio/segments/{req.book_id}/{req.chapter_id}/{req.s3_filename}"
+            if storage.object_exists(primary_key):
+                s3_key_found = primary_key
+        
+        # 2. Fallback path (job-level)
+        if not s3_key_found:
+            job_key = f"audio/{job_id}/{req.s3_filename}"
+            if storage.object_exists(job_key):
+                s3_key_found = job_key
+
+    if s3_key_found:
+        presigned_url = storage.get_presigned_url(s3_key_found, expires_in=86400)
+        return {
+            "s3_url": storage._object_url(s3_key_found),
+            "presigned_url": presigned_url,
+            "s3_key": s3_key_found,
+            "sample_rate": 24000,
+            "text": req.text,
+            "job_id": job_id,
+        }
 
     try:
         checkpoint_path = str(job.checkpoint_path) if job.checkpoint_path else None
@@ -554,24 +576,33 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
             filename = item.get("filename", f"audio_{index:04d}.wav")
             overwrite = item.get("overwrite", req.overwrite)
             
-            # Construct S3 prefix
-            s3_prefix = f"audio/segments/{req.book_id}/{req.chapter_id}" if req.book_id and req.chapter_id else f"audio/{job_id}"
-            s3_key = f"{s3_prefix}/{filename}"
-            
-            # Fast-path check
+            # Enhanced Fast-path check
+            s3_key_found = None
             if not overwrite and storage.is_configured:
                 # We must use thread executor since boto3 is blocking
                 loop = asyncio.get_running_loop()
-                exists = await loop.run_in_executor(None, storage.object_exists, s3_key)
-                if exists:
-                    return {
-                        "s3_url": storage._object_url(s3_key),
-                        "presigned_url": storage.get_presigned_url(s3_key, expires_in=86400),
-                        "s3_key": s3_key,
-                        "sample_rate": 24000,
-                        "text": text,
-                        "job_id": job_id,
-                    }
+                
+                # 1. Check primary path (segments)
+                if req.book_id and req.chapter_id:
+                    primary_key = f"audio/segments/{req.book_id}/{req.chapter_id}/{filename}"
+                    if await loop.run_in_executor(None, storage.object_exists, primary_key):
+                        s3_key_found = primary_key
+                
+                # 2. Check fallback path (job-level)
+                if not s3_key_found:
+                    job_key = f"audio/{job_id}/{filename}"
+                    if await loop.run_in_executor(None, storage.object_exists, job_key):
+                        s3_key_found = job_key
+
+            if s3_key_found:
+                return {
+                    "s3_url": storage._object_url(s3_key_found),
+                    "presigned_url": storage.get_presigned_url(s3_key_found, expires_in=86400),
+                    "s3_key": s3_key_found,
+                    "sample_rate": 24000,
+                    "text": text,
+                    "job_id": job_id,
+                }
 
             # Run generation in a thread pool (InferenceManager handles the GPU semaphore)
             loop = asyncio.get_running_loop()

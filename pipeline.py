@@ -199,6 +199,7 @@ class Pipeline:
         self.jobs: Dict[str, Job] = {}
         self._lock = threading.Lock()
         self._training_queue = threading.Semaphore(1)
+        self._upload_threads: list = []  # Track in-progress S3 upload threads
         self.inference = InferenceManager(
             device=device,
             use_flash_attn=use_flash_attn,
@@ -207,6 +208,77 @@ class Pipeline:
             max_models=max_models,
             compile=compile,
         )
+
+        # Background S3 sync: ensure all completed jobs are uploaded
+        self._stop_sync_event = threading.Event()
+        self._sync_thread = threading.Thread(
+            target=self._s3_sync_worker,
+            daemon=True,
+            name="s3-sync-monitor",
+        )
+        self._sync_thread.start()
+    # -- Lifecycle -----------------------------------------------------------
+
+    def shutdown(self, timeout_per_thread: float = 300.0):
+        """Wait for all in-progress S3 uploads to finish before shutdown.
+        
+        Called on graceful exit (Ctrl+C / SIGTERM) so no uploads are lost.
+        """
+        # Stop the background sync worker
+        self._stop_sync_event.set()
+
+        with self._lock:
+            pending = [t for t in self._upload_threads if t.is_alive()]
+        
+        if not pending:
+            logger.info("Shutdown: No pending S3 uploads.")
+            return
+        
+        logger.warning(
+            f"Shutdown: Waiting for {len(pending)} S3 upload(s) to complete "
+            f"(timeout {timeout_per_thread}s each). Press Ctrl+C again to force quit."
+        )
+        for thread in pending:
+            thread.join(timeout=timeout_per_thread)
+            if thread.is_alive():
+                logger.error(f"Shutdown: Thread {thread.name} did not finish in time — upload may be incomplete.")
+            else:
+                logger.info(f"Shutdown: Thread {thread.name} completed.")
+
+    def _s3_sync_worker(self, interval_seconds: float = 900.0):
+        """Background thread: every 15 min, upload any READY job that is missing from S3."""
+        from storage import storage
+        logger.info("S3 sync monitor started (interval: 15 min).")
+        while not self._stop_sync_event.wait(timeout=interval_seconds):
+            if not storage.is_configured:
+                continue
+            try:
+                with self._lock:
+                    jobs_snapshot = list(self.jobs.values())
+                
+                for job in jobs_snapshot:
+                    if self._stop_sync_event.is_set():
+                        break
+                    # Only target READY jobs with a local checkpoint but no S3 backup
+                    if job.status != JobStatus.READY:
+                        continue
+                    if job.s3_model_key:
+                        continue  # Already uploaded
+                    if not job.checkpoint_path or not os.path.exists(str(job.checkpoint_path)):
+                        continue  # No local checkpoint to upload
+                    
+                    logger.warning(f"S3 sync: Job {job.job_id} ({job.speaker_name}) has no S3 backup — uploading now.")
+                    try:
+                        s3_key = self._upload_model_to_s3(job, Path(str(job.checkpoint_path)))
+                        job.s3_model_key = s3_key
+                        self._upload_job_json_to_s3(job)
+                        job.save()
+                        logger.info(f"S3 sync: Job {job.job_id} uploaded successfully → {s3_key}")
+                    except Exception as e:
+                        logger.error(f"S3 sync: Failed to upload job {job.job_id}: {e}")
+            except Exception as e:
+                logger.error(f"S3 sync worker error: {e}")
+        logger.info("S3 sync monitor stopped.")
 
     # -- Job management -----------------------------------------------------
 
@@ -649,9 +721,12 @@ class Pipeline:
                 
                 upload_thread = threading.Thread(
                     target=run_s3_upload, 
-                    args=(job, str(checkpoint_path)), 
-                    daemon=True
+                    args=(job, str(checkpoint_path)),
+                    daemon=False,  # Non-daemon: survives Ctrl+C so upload completes
+                    name=f"s3-upload-{job.job_id[:8]}"
                 )
+                with self._lock:
+                    self._upload_threads.append(upload_thread)
                 upload_thread.start()
             
             # AGGRESSIVE CLEANUP: Remove intermediate runs and raw dataset
