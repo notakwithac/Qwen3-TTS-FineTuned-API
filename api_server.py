@@ -2,7 +2,7 @@
 """FastAPI server — Fine-tuning-as-a-Service for Qwen3-TTS with E2E Object Storage."""
 
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(override=True)
 
 import logging
 import os
