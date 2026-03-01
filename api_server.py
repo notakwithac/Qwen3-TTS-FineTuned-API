@@ -575,8 +575,8 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
     from functools import partial
 
     # Create a Semaphore to limit concurrent S3 checks and generation launching
-    # This matches the S3 connection pool size (50) to prevent urllib3 connection drops
-    concurrency_limit = asyncio.Semaphore(10)
+    # Allowing up to GPU_BATCH_SIZE concurrent submissions ensures we fill our fusion batches efficiently.
+    concurrency_limit = asyncio.Semaphore(GPU_BATCH_SIZE)
 
     async def process_item(item, index):
         async with concurrency_limit:
