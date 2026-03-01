@@ -58,6 +58,14 @@ GPU_MAX_CONCURRENCY = int(os.environ.get("GPU_MAX_CONCURRENCY", "16"))
 GPU_MAX_MODELS = int(os.environ.get("GPU_MAX_MODELS", "4"))
 USE_TORCH_COMPILE = os.environ.get("USE_TORCH_COMPILE", "1") == "1"
 
+logger.info(f"Loaded Configuration:")
+logger.info(f"  - DEVICE: {DEVICE}")
+logger.info(f"  - USE_FLASH_ATTN: {USE_FLASH_ATTN}")
+logger.info(f"  - GPU_IDLE_TIMEOUT: {GPU_IDLE_TIMEOUT}s")
+logger.info(f"  - GPU_MAX_CONCURRENCY: {GPU_MAX_CONCURRENCY}")
+logger.info(f"  - GPU_MAX_MODELS: {GPU_MAX_MODELS}")
+logger.info(f"  - USE_TORCH_COMPILE: {USE_TORCH_COMPILE}")
+
 pipeline = Pipeline(
     base_dir=".",
     jobs_dir="jobs",
