@@ -606,6 +606,7 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
                         s3_key_found = job_key
 
             if s3_key_found:
+                loop = asyncio.get_running_loop()
                 return {
                     "s3_url": storage._object_url(s3_key_found),
                     "presigned_url": storage.get_presigned_url(s3_key_found, expires_in=86400),
@@ -615,21 +616,16 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
                     "job_id": job_id,
                 }
 
-            # Run generation in a thread pool (InferenceManager handles the GPU semaphore)
-            loop = asyncio.get_running_loop()
+            # Run generation using the local batcher (fuses multiple requests into one GPU pass)
             try:
+                loop = asyncio.get_running_loop()
                 checkpoint_path = str(job.checkpoint_path) if job.checkpoint_path else None
-                wav_bytes, sr = await loop.run_in_executor(
-                    None,  # Uses default ThreadPoolExecutor
-                    partial(
-                        pipeline.generate,
-                        job_id=job_id,
-                        text=text,
-                        language=language,
-                        instruct=instruct,
-                        checkpoint_path=checkpoint_path,
-                        speaker_name=job.speaker_name,
-                    )
+                batcher = get_custom_voice_batcher(job_id, checkpoint_path, job.speaker_name)
+                
+                wav_bytes, sr = await batcher.submit(
+                    texts=text,
+                    languages=language,
+                    instructs=instruct
                 )
 
                 # Parallel S3 upload
