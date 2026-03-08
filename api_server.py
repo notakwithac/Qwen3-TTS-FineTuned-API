@@ -66,6 +66,7 @@ USE_TORCH_COMPILE = os.environ.get("USE_TORCH_COMPILE", "1") == "1"
 REPLICA_THRESHOLD = int(os.environ.get("REPLICA_THRESHOLD", "500"))
 MAX_REPLICAS_PER_MODEL = int(os.environ.get("MAX_REPLICAS_PER_MODEL", "4"))
 SESSION_TIMEOUT = int(os.environ.get("SESSION_TIMEOUT", "3600"))
+MAX_CONCURRENT_VOICE_DESIGNS = int(os.environ.get("MAX_CONCURRENT_VOICE_DESIGNS", "4"))
 
 logger.info(f"Loaded Configuration:")
 logger.info(f"  - DEVICE: {DEVICE}")
@@ -76,6 +77,7 @@ logger.info(f"  - GPU_MAX_MODELS: {GPU_MAX_MODELS}")
 logger.info(f"  - GPU_BATCH_SIZE: {GPU_BATCH_SIZE}")
 logger.info(f"  - USE_TORCH_COMPILE: {USE_TORCH_COMPILE}")
 logger.info(f"  - REPLICA_THRESHOLD: {REPLICA_THRESHOLD}")
+logger.info(f"  - MAX_CONCURRENT_VOICE_DESIGNS: {MAX_CONCURRENT_VOICE_DESIGNS}")
 logger.info(f"  - MAX_REPLICAS_PER_MODEL: {MAX_REPLICAS_PER_MODEL}")
 logger.info(f"  - SESSION_TIMEOUT: {SESSION_TIMEOUT}s")
 
@@ -271,6 +273,23 @@ class VoiceDesignRequest(BaseModel):
     character_name: Optional[str] = None
     character_uuid: Optional[str] = None
     overwrite: bool = False  # If false, skips generation if file already exists on S3
+
+
+class VoiceDesignBatchItem(BaseModel):
+    """A single item in a voice design batch request."""
+    text: str
+    instruct: str  # Voice description, e.g. "A warm male voice, middle-aged, calm"
+    language: str = "English"
+    character_name: Optional[str] = None
+    character_uuid: Optional[str] = None
+    s3_filename: Optional[str] = None
+
+
+class VoiceDesignBatchRequest(BaseModel):
+    """Generate multiple voice designs concurrently for rapid character voice iteration."""
+    items: list[VoiceDesignBatchItem]
+    upload_to_s3: bool = True
+    overwrite: bool = False
 
 
 class VoiceCloneBatchItem(BaseModel):
@@ -927,6 +946,158 @@ async def voice_design(req: VoiceDesignRequest):
             "X-Sample-Rate": str(sr),
         },
     )
+
+
+@app.post(
+    "/voice-design/batch",
+    summary="Batch generate multiple voice designs concurrently",
+)
+async def voice_design_batch(req: VoiceDesignBatchRequest):
+    """Generate multiple voice designs in parallel for rapid character voice iteration.
+
+    Submit up to MAX_CONCURRENT_VOICE_DESIGNS items at once. Each item gets a
+    different voice description (instruct) and text, and they are processed
+    concurrently through the GPU batcher for maximum throughput.
+
+    Example request:
+    ```json
+    {
+        "items": [
+            {"text": "Hello world", "instruct": "A warm male voice", "character_name": "Hero"},
+            {"text": "Hello world", "instruct": "A young female voice", "character_name": "Heroine"},
+            {"text": "Hello world", "instruct": "A deep gravelly voice", "character_name": "Villain"}
+        ],
+        "upload_to_s3": true
+    }
+    ```
+    """
+    if not req.items:
+        raise HTTPException(status_code=400, detail="No items provided.")
+
+    if len(req.items) > MAX_CONCURRENT_VOICE_DESIGNS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Too many items ({len(req.items)}). Maximum is {MAX_CONCURRENT_VOICE_DESIGNS}.",
+        )
+
+    if req.upload_to_s3 and not storage.is_configured:
+        raise HTTPException(status_code=503, detail="Storage not configured.")
+
+    import asyncio
+    from functools import partial
+
+    concurrency_limit = asyncio.Semaphore(MAX_CONCURRENT_VOICE_DESIGNS)
+
+    async def process_item(item: VoiceDesignBatchItem, index: int):
+        async with concurrency_limit:
+            # Build S3 filename with character prefix (same logic as single endpoint)
+            s3_filename = item.s3_filename
+            parts = []
+            if item.character_name:
+                safe_name = "".join(
+                    c for c in item.character_name if c.isalnum() or c in ("-", "_", " ")
+                ).strip().replace(" ", "_")
+                if safe_name:
+                    parts.append(safe_name)
+            if item.character_uuid:
+                parts.append(item.character_uuid)
+
+            if parts:
+                prefix = "_".join(parts)
+                if s3_filename:
+                    if not s3_filename.startswith(prefix):
+                        s3_filename = f"{prefix}_{s3_filename}"
+                else:
+                    s3_filename = f"{prefix}.wav"
+            elif not s3_filename:
+                import uuid as _uuid
+                s3_filename = f"voice_design_{_uuid.uuid4().hex[:8]}.wav"
+
+            # S3 fast-path: skip if file already exists
+            if req.upload_to_s3 and not req.overwrite and storage.is_configured:
+                s3_key = f"audio/voice_design/{s3_filename}"
+                loop = asyncio.get_running_loop()
+                exists = await loop.run_in_executor(None, storage.object_exists, s3_key)
+                if exists:
+                    presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
+                    return {
+                        "index": index,
+                        "status": "skipped",
+                        "s3_url": storage._object_url(s3_key),
+                        "presigned_url": presigned_url,
+                        "s3_key": s3_key,
+                        "sample_rate": 24000,
+                        "text": item.text,
+                        "instruct": item.instruct,
+                        "character_name": item.character_name,
+                    }
+
+            # Generate via the existing batcher
+            try:
+                wav_bytes, sr = await voice_design_batcher.submit(
+                    texts=item.text,
+                    instructs=item.instruct,
+                    languages=item.language,
+                )
+            except Exception as e:
+                logger.error(f"Voice design batch item {index} failed: {e}")
+                return {
+                    "index": index,
+                    "status": "failed",
+                    "error": str(e),
+                    "text": item.text,
+                    "instruct": item.instruct,
+                    "character_name": item.character_name,
+                }
+
+            # Upload to S3
+            if req.upload_to_s3:
+                loop = asyncio.get_running_loop()
+                with ops_log.operation("s3_upload", extra={"type": "voice_design_batch"}):
+                    s3_url = await loop.run_in_executor(
+                        None,
+                        partial(storage.upload_wav, wav_bytes, "voice_design", filename=s3_filename),
+                    )
+                s3_key = f"audio/voice_design/{s3_filename}"
+                presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
+                return {
+                    "index": index,
+                    "status": "success",
+                    "s3_url": s3_url,
+                    "presigned_url": presigned_url,
+                    "s3_key": s3_key,
+                    "sample_rate": sr,
+                    "text": item.text,
+                    "instruct": item.instruct,
+                    "character_name": item.character_name,
+                }
+
+            # No S3 upload — encode WAV bytes as base64 for JSON response
+            import base64
+            return {
+                "index": index,
+                "status": "success",
+                "audio_base64": base64.b64encode(wav_bytes).decode(),
+                "sample_rate": sr,
+                "text": item.text,
+                "instruct": item.instruct,
+                "character_name": item.character_name,
+            }
+
+    with ops_log.operation("voice_design_batch_api", extra={
+        "item_count": len(req.items),
+        "upload_to_s3": req.upload_to_s3,
+    }):
+        tasks = [process_item(item, i) for i, item in enumerate(req.items)]
+        results = await asyncio.gather(*tasks)
+
+    return {
+        "total": len(results),
+        "succeeded": sum(1 for r in results if r.get("status") == "success"),
+        "skipped": sum(1 for r in results if r.get("status") == "skipped"),
+        "failed": sum(1 for r in results if r.get("status") == "failed"),
+        "results": results,
+    }
 
 
 # ---------------------------------------------------------------------------

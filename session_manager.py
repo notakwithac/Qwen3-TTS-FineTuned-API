@@ -466,7 +466,7 @@ class SessionManager:
         if not torch.cuda.is_available():
             return 40.0  # Default assumption
 
-        total = torch.cuda.get_device_properties(0).total_mem / 1e9
+        total = torch.cuda.get_device_properties(0).total_memory / 1e9
         allocated = torch.cuda.memory_allocated(0) / 1e9
         # Leave 2GB headroom for activations/KV-cache during inference
         return max(0, total - allocated - 2.0)

@@ -123,11 +123,11 @@ class InferenceManager:
         if torch.cuda.is_available():
             gpu_info = {
                 "gpu_name": torch.cuda.get_device_name(0),
-                "gpu_memory_total_gb": round(torch.cuda.get_device_properties(0).total_mem / 1e9, 2),
+                "gpu_memory_total_gb": round(torch.cuda.get_device_properties(0).total_memory / 1e9, 2),
                 "gpu_memory_allocated_gb": round(torch.cuda.memory_allocated(0) / 1e9, 2),
                 "gpu_memory_reserved_gb": round(torch.cuda.memory_reserved(0) / 1e9, 2),
                 "gpu_memory_free_gb": round(
-                    (torch.cuda.get_device_properties(0).total_mem - torch.cuda.memory_allocated(0)) / 1e9, 2
+                    (torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated(0)) / 1e9, 2
                 ),
             }
 
@@ -426,7 +426,7 @@ class InferenceManager:
         """Return VRAM budget information."""
         if not torch.cuda.is_available():
             return {"total_gb": 0, "allocated_gb": 0, "free_gb": 0}
-        total = torch.cuda.get_device_properties(0).total_mem / 1e9
+        total = torch.cuda.get_device_properties(0).total_memory / 1e9
         allocated = torch.cuda.memory_allocated(0) / 1e9
         return {
             "total_gb": round(total, 2),
