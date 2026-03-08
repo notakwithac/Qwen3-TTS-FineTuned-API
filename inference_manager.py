@@ -53,12 +53,18 @@ class InferenceManager:
         self._attn_impl = "flash_attention_2" if use_flash_attn else "eager"
         self._compile = compile
         self._lock = threading.Lock()
-        self._inference_semaphore = threading.Semaphore(max_concurrency)
+        # Cap concurrent inference to max_models: each inference holds one
+        # model in VRAM, so we can never run more than max_models at once.
+        self._inference_semaphore = threading.Semaphore(max_models)
 
         # Model cache: Dict[path, (model, type, speaker_name)]
         # We use an OrderedDict to implement LRU
         self._models: Dict[str, tuple] = collections.OrderedDict()
         self._max_models = max_models
+
+        # Model-in-use tracking: prevents LRU eviction of models that are
+        # actively running inference.  Dict[cache_key, refcount].
+        self._models_in_use: Dict[str, int] = {}
 
         # Session pinning: models pinned by active sessions won't be LRU evicted
         # Dict[cache_key, set[session_id]]
@@ -271,13 +277,16 @@ class InferenceManager:
 
     def _enforce_cache_size(self, reserve: int = 0):
         """Internal: remove LRU models if over capacity (caller must hold lock).
-        Respects session-pinned models (won't evict them)."""
+        Respects session-pinned AND in-use models (won't evict them)."""
         while len(self._models) > (self._max_models - reserve) and self._models:
-            # Find the LRU model that is NOT session-pinned
             evicted = False
             for path in list(self._models.keys()):
+                # Skip models actively running inference
+                if self._models_in_use.get(path, 0) > 0:
+                    continue
+                # Skip session-pinned models
                 if path in self._session_pins and self._session_pins[path]:
-                    continue  # Skip pinned models
+                    continue
                 model_tuple = self._models.pop(path)
                 model, mtype, _ = model_tuple
                 logger.info(f"LRU Eviction: Unloading {mtype} model from {path}")
@@ -286,12 +295,24 @@ class InferenceManager:
                 evicted = True
                 break
             if not evicted:
-                # All models are session-pinned, can't evict
-                logger.warning("Cannot evict any models — all are session-pinned")
+                logger.warning("Cannot evict any models — all in-use or session-pinned")
                 break
         
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    def _mark_in_use(self, path: str):
+        """Mark a model as actively running inference (caller holds lock)."""
+        self._models_in_use[path] = self._models_in_use.get(path, 0) + 1
+
+    def _mark_released(self, path: str):
+        """Mark a model as no longer running inference (thread-safe)."""
+        with self._lock:
+            count = self._models_in_use.get(path, 0)
+            if count <= 1:
+                self._models_in_use.pop(path, None)
+            else:
+                self._models_in_use[path] = count - 1
 
     def load(self, checkpoint_path: str, speaker_name: str):
         """Load a fine-tuned CustomVoice checkpoint."""
@@ -476,39 +497,44 @@ class InferenceManager:
             languages = ["English"] * len(texts)
         if not instructs:
             instructs = [""] * len(texts)
-            
-        with self._lock:
-            model, spk = self._get_model(checkpoint_path, "custom_voice", speaker_name)
-            self._total_requests += len(texts)
 
-        with self._track_active(), self._inference_semaphore:
-            op = ops_log.start("inference_custom_voice_batch", extra={
-                "batch_size": len(texts),
-                "speaker": spk,
-            })
+        # Acquire semaphore FIRST to limit concurrent model usage to max_models
+        with self._inference_semaphore:
+            with self._lock:
+                model, spk = self._get_model(checkpoint_path, "custom_voice", speaker_name)
+                self._mark_in_use(checkpoint_path)
+                self._total_requests += len(texts)
+
             try:
-                # model.generate_custom_voice expects a single speaker duplicated if batched
-                speakers = [self._normalize_speaker_name(spk) if spk else spk] * len(texts)
-                
-                wavs_list, sr = model.generate_custom_voice(
-                    text=texts,
-                    language=languages,
-                    speaker=speakers,
-                    instruct=instructs,
-                )
+                with self._track_active():
+                    op = ops_log.start("inference_custom_voice_batch", extra={
+                        "batch_size": len(texts),
+                        "speaker": spk,
+                    })
+                    try:
+                        speakers = [self._normalize_speaker_name(spk) if spk else spk] * len(texts)
 
-                results = []
-                for wav in wavs_list:
-                    buf = io.BytesIO()
-                    sf.write(buf, wav, sr, format="WAV")
-                    buf.seek(0)
-                    results.append(buf.read())
-                    
-                ops_log.end(op, extra={"sample_rate": sr})
-                return results, sr
-            except Exception as e:
-                ops_log.fail(op, str(e))
-                raise
+                        wavs_list, sr = model.generate_custom_voice(
+                            text=texts,
+                            language=languages,
+                            speaker=speakers,
+                            instruct=instructs,
+                        )
+
+                        results = []
+                        for wav in wavs_list:
+                            buf = io.BytesIO()
+                            sf.write(buf, wav, sr, format="WAV")
+                            buf.seek(0)
+                            results.append(buf.read())
+
+                        ops_log.end(op, extra={"sample_rate": sr})
+                        return results, sr
+                    except Exception as e:
+                        ops_log.fail(op, str(e))
+                        raise
+            finally:
+                self._mark_released(checkpoint_path)
 
     def generate(
         self,
@@ -519,35 +545,38 @@ class InferenceManager:
         instruct: str = "",
     ) -> tuple[bytes, int]:
         """Generate speech using CustomVoice model. Auto-loads if not in cache."""
-        # 1. Ensure model is in cache (holds lock during load if needed)
-        with self._lock:
-            model, spk = self._get_model(checkpoint_path, "custom_voice", speaker_name)
-            self._total_requests += 1
+        with self._inference_semaphore:
+            with self._lock:
+                model, spk = self._get_model(checkpoint_path, "custom_voice", speaker_name)
+                self._mark_in_use(checkpoint_path)
+                self._total_requests += 1
 
-        # 2. Run inference (protected by semaphore)
-        with self._track_active(), self._inference_semaphore:
-            op = ops_log.start("inference_custom_voice", extra={
-                "text_length": len(text),
-                "language": language,
-                "speaker": spk,
-            })
             try:
-                wavs, sr = model.generate_custom_voice(
-                    text=text,
-                    language=language,
-                    speaker=self._normalize_speaker_name(spk) if spk else spk,
-                    instruct=instruct if instruct else None,
-                )
+                with self._track_active():
+                    op = ops_log.start("inference_custom_voice", extra={
+                        "text_length": len(text),
+                        "language": language,
+                        "speaker": spk,
+                    })
+                    try:
+                        wavs, sr = model.generate_custom_voice(
+                            text=text,
+                            language=language,
+                            speaker=self._normalize_speaker_name(spk) if spk else spk,
+                            instruct=instruct if instruct else None,
+                        )
 
-                buf = io.BytesIO()
-                sf.write(buf, wavs[0], sr, format="WAV")
-                buf.seek(0)
-                result = buf.read()
-                ops_log.end(op, extra={"audio_bytes": len(result), "sample_rate": sr})
-                return result, sr
-            except Exception as e:
-                ops_log.fail(op, str(e))
-                raise
+                        buf = io.BytesIO()
+                        sf.write(buf, wavs[0], sr, format="WAV")
+                        buf.seek(0)
+                        result = buf.read()
+                        ops_log.end(op, extra={"audio_bytes": len(result), "sample_rate": sr})
+                        return result, sr
+                    except Exception as e:
+                        ops_log.fail(op, str(e))
+                        raise
+            finally:
+                self._mark_released(checkpoint_path)
 
     # -- VoiceDesign inference ------------------------------------------------
 
@@ -560,34 +589,39 @@ class InferenceManager:
         """Generate speech for multiple texts using VoiceDesign model."""
         if not languages:
             languages = ["English"] * len(texts)
-            
-        with self._lock:
-            model, _ = self._get_model(VOICE_DESIGN_MODEL, "voice_design")
-            self._total_requests += len(texts)
 
-        with self._track_active(), self._inference_semaphore:
-            op = ops_log.start("inference_voice_design_batch", extra={
-                "batch_size": len(texts),
-            })
+        with self._inference_semaphore:
+            with self._lock:
+                model, _ = self._get_model(VOICE_DESIGN_MODEL, "voice_design")
+                self._mark_in_use(VOICE_DESIGN_MODEL)
+                self._total_requests += len(texts)
+
             try:
-                wavs_list, sr = model.generate_voice_design(
-                    text=texts,
-                    instruct=instructs,
-                    language=languages,
-                )
+                with self._track_active():
+                    op = ops_log.start("inference_voice_design_batch", extra={
+                        "batch_size": len(texts),
+                    })
+                    try:
+                        wavs_list, sr = model.generate_voice_design(
+                            text=texts,
+                            instruct=instructs,
+                            language=languages,
+                        )
 
-                results = []
-                for wav in wavs_list:
-                    buf = io.BytesIO()
-                    sf.write(buf, wav, sr, format="WAV")
-                    buf.seek(0)
-                    results.append(buf.read())
-                    
-                ops_log.end(op, extra={"sample_rate": sr})
-                return results, sr
-            except Exception as e:
-                ops_log.fail(op, str(e))
-                raise
+                        results = []
+                        for wav in wavs_list:
+                            buf = io.BytesIO()
+                            sf.write(buf, wav, sr, format="WAV")
+                            buf.seek(0)
+                            results.append(buf.read())
+
+                        ops_log.end(op, extra={"sample_rate": sr})
+                        return results, sr
+                    except Exception as e:
+                        ops_log.fail(op, str(e))
+                        raise
+            finally:
+                self._mark_released(VOICE_DESIGN_MODEL)
 
     def generate_voice_design(
         self,
@@ -596,34 +630,37 @@ class InferenceManager:
         language: str = "English",
     ) -> tuple[bytes, int]:
         """Generate speech using VoiceDesign model."""
-        # 1. Ensure model is loaded (holds lock during swap/load)
-        with self._lock:
-            model, _ = self._get_model(VOICE_DESIGN_MODEL, "voice_design")
-            self._total_requests += 1
+        with self._inference_semaphore:
+            with self._lock:
+                model, _ = self._get_model(VOICE_DESIGN_MODEL, "voice_design")
+                self._mark_in_use(VOICE_DESIGN_MODEL)
+                self._total_requests += 1
 
-        # 2. Run inference (protected by semaphore)
-        with self._track_active(), self._inference_semaphore:
-            op = ops_log.start("inference_voice_design", extra={
-                "text_length": len(text),
-                "instruct_length": len(instruct),
-                "language": language,
-            })
             try:
-                wavs, sr = model.generate_voice_design(
-                    text=text,
-                    instruct=instruct,
-                    language=language,
-                )
+                with self._track_active():
+                    op = ops_log.start("inference_voice_design", extra={
+                        "text_length": len(text),
+                        "instruct_length": len(instruct),
+                        "language": language,
+                    })
+                    try:
+                        wavs, sr = model.generate_voice_design(
+                            text=text,
+                            instruct=instruct,
+                            language=language,
+                        )
 
-                buf = io.BytesIO()
-                sf.write(buf, wavs[0], sr, format="WAV")
-                buf.seek(0)
-                result = buf.read()
-                ops_log.end(op, extra={"audio_bytes": len(result), "sample_rate": sr})
-                return result, sr
-            except Exception as e:
-                ops_log.fail(op, str(e))
-                raise
+                        buf = io.BytesIO()
+                        sf.write(buf, wavs[0], sr, format="WAV")
+                        buf.seek(0)
+                        result = buf.read()
+                        ops_log.end(op, extra={"audio_bytes": len(result), "sample_rate": sr})
+                        return result, sr
+                    except Exception as e:
+                        ops_log.fail(op, str(e))
+                        raise
+            finally:
+                self._mark_released(VOICE_DESIGN_MODEL)
 
     # -- VoiceClone inference -------------------------------------------------
 
@@ -638,37 +675,41 @@ class InferenceManager:
         """Generate speech for multiple texts using zero-shot VoiceClone Base model."""
         if not languages:
             languages = ["English"] * len(texts)
-            
-        with self._lock:
-            model, _ = self._get_model(VOICE_CLONE_MODEL, "voice_clone")
-            self._total_requests += len(texts)
 
-        with self._track_active(), self._inference_semaphore:
-            op = ops_log.start("inference_voice_clone_batch", extra={
-                "batch_size": len(texts),
-            })
+        with self._inference_semaphore:
+            with self._lock:
+                model, _ = self._get_model(VOICE_CLONE_MODEL, "voice_clone")
+                self._mark_in_use(VOICE_CLONE_MODEL)
+                self._total_requests += len(texts)
+
             try:
-                # Assuming all batches share the same reference audio and text for the API use case
-                wavs_list, sr = model.generate_voice_clone(
-                    text=texts,
-                    ref_audio=ref_audio,
-                    ref_text=ref_text,
-                    language=languages,
-                    x_vector_only_mode=x_vector_only_mode,
-                )
+                with self._track_active():
+                    op = ops_log.start("inference_voice_clone_batch", extra={
+                        "batch_size": len(texts),
+                    })
+                    try:
+                        wavs_list, sr = model.generate_voice_clone(
+                            text=texts,
+                            ref_audio=ref_audio,
+                            ref_text=ref_text,
+                            language=languages,
+                            x_vector_only_mode=x_vector_only_mode,
+                        )
 
-                results = []
-                for wav in wavs_list:
-                    buf = io.BytesIO()
-                    sf.write(buf, wav, sr, format="WAV")
-                    buf.seek(0)
-                    results.append(buf.read())
-                    
-                ops_log.end(op, extra={"sample_rate": sr})
-                return results, sr
-            except Exception as e:
-                ops_log.fail(op, str(e))
-                raise
+                        results = []
+                        for wav in wavs_list:
+                            buf = io.BytesIO()
+                            sf.write(buf, wav, sr, format="WAV")
+                            buf.seek(0)
+                            results.append(buf.read())
+
+                        ops_log.end(op, extra={"sample_rate": sr})
+                        return results, sr
+                    except Exception as e:
+                        ops_log.fail(op, str(e))
+                        raise
+            finally:
+                self._mark_released(VOICE_CLONE_MODEL)
 
     def generate_to_file(
         self,

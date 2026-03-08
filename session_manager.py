@@ -534,106 +534,52 @@ class SessionManager:
                 session.character_plans[job_id] = plan
                 session.total_lines += plan.line_count
 
-            # 2. Calculate replicas based on VRAM budget
-            available_vram = self._get_available_vram()
-            unique_jobs = set(c["job_id"] for c in characters)
-            total_models_weight = len(unique_jobs) * MODEL_VRAM_GB
-            # Reserve headroom for inference activations/KV-cache
-            inference_headroom_gb = 5.0
-            fits_in_vram = (total_models_weight + inference_headroom_gb) <= available_vram
-
-            if fits_in_vram:
-                # All models fit — use replica planning and pre-load everything
-                replica_map = self._calculate_replicas(characters, available_vram)
-                logger.info(
-                    f"Session {session_id}: {len(unique_jobs)} models fit in VRAM "
-                    f"({total_models_weight:.1f} GB), pre-loading with pinning"
-                )
-            else:
-                # Too many models — no replicas, rely on LRU swapping
-                replica_map = {c["job_id"]: 1 for c in characters}
-                logger.info(
-                    f"Session {session_id}: {len(unique_jobs)} models ({total_models_weight:.1f} GB) "
-                    f"exceed VRAM budget ({available_vram:.1f} GB). "
-                    f"Using LRU model swapping (no pre-loading)."
-                )
-
-            # 3. Set up model plans (assign cache keys and replica counts)
+            # 2. Set up model plans (one model per character, no replicas)
+            #    The InferenceManager's semaphore + in-use tracking handle VRAM.
             for job_id, plan in session.character_plans.items():
-                num_replicas = replica_map.get(job_id, 1)
-                plan.replicas = num_replicas
+                plan.replicas = 1
+                plan.replica_keys.append(plan.checkpoint_path)
 
-                for r in range(num_replicas):
-                    if r == 0:
-                        cache_key = plan.checkpoint_path
-                    else:
-                        cache_key = f"{plan.checkpoint_path}::replica-{r}"
-                    plan.replica_keys.append(cache_key)
-
-            # 4. Pre-load and pin models ONLY if they all fit in VRAM
-            if fits_in_vram:
-                total_model_slots = sum(replica_map.values())
-                original_max = self.inference.max_models
-                if total_model_slots > original_max:
-                    logger.info(
-                        f"Expanding model cache {original_max} → {total_model_slots} "
-                        f"for session {session_id}"
-                    )
-                    self.inference.max_models = total_model_slots
-                    session.original_max_models = original_max
-
-                loop = asyncio.get_running_loop()
-                for job_id, plan in session.character_plans.items():
-                    for cache_key in plan.replica_keys:
-                        await loop.run_in_executor(
-                            None,
-                            lambda ck=cache_key, cp=plan.checkpoint_path, sn=plan.character_name: (
-                                self.inference.load_for_session(
-                                    ck, cp, sn, session_id=session_id
-                                )
-                            ),
-                        )
-
-            # 5. Create per-character queues and progress trackers
+            # 3. Create per-character queues and progress trackers
             for job_id, plan in session.character_plans.items():
                 session.character_queues[job_id] = asyncio.Queue()
                 session.character_progress[job_id] = CharacterProgress(
                     total=plan.line_count
                 )
 
-            # 6. Start workers (one per replica)
+            # 4. Start workers (one per character)
+            #    Workers call generate_batch → semaphore limits concurrent
+            #    models in VRAM to max_models. No pre-loading needed.
             for job_id, plan in session.character_plans.items():
                 queue = session.character_queues[job_id]
                 progress = session.character_progress[job_id]
 
-                for i, cache_key in enumerate(plan.replica_keys):
-                    worker = CharacterWorker(
-                        worker_id=f"{session_id}/{plan.character_name}/w{i}",
-                        queue=queue,
-                        inference_manager=self.inference,
-                        cache_key=cache_key,
-                        speaker_name=plan.character_name,
-                        batch_size=self.batch_size,
-                        batch_timeout_ms=100,
-                        storage=self.storage,
-                        progress=progress,
-                    )
-                    worker.start()
-                    session.workers.append(worker)
+                worker = CharacterWorker(
+                    worker_id=f"{session_id}/{plan.character_name}/w0",
+                    queue=queue,
+                    inference_manager=self.inference,
+                    cache_key=plan.checkpoint_path,
+                    speaker_name=plan.character_name,
+                    batch_size=self.batch_size,
+                    batch_timeout_ms=100,
+                    storage=self.storage,
+                    progress=progress,
+                )
+                worker.start()
+                session.workers.append(worker)
 
             session.status = SessionStatus.READY
-            mode = "pre-loaded & pinned" if fits_in_vram else "LRU swapping"
             ops_log.end(op, extra={
-                "mode": mode,
-                "replicas": {jid: p.replicas for jid, p in session.character_plans.items()},
-                "total_vram_gb": round(total_models_weight, 1),
+                "characters": len(session.character_plans),
+                "total_lines": session.total_lines,
+                "max_concurrent_models": self.inference.max_models,
             })
 
             logger.info(
-                f"Session {session_id} prepared ({mode}): "
+                f"Session {session_id} prepared: "
                 f"{len(session.character_plans)} characters, "
-                f"{sum(p.replicas for p in session.character_plans.values())} total replicas, "
-                f"{session.total_lines} total lines"
+                f"{session.total_lines} total lines, "
+                f"max {self.inference.max_models} concurrent models"
             )
             return session
 
@@ -721,28 +667,9 @@ class SessionManager:
         for worker in session.workers:
             await worker.stop()
 
-        # 2. Unload replica models (but keep primary if other sessions use it)
-        for plan in session.character_plans.values():
-            for cache_key in plan.replica_keys:
-                if "::replica-" in cache_key:
-                    # It's a replica — always unload
-                    self.inference.unload_specific(cache_key)
-
-        # 3. Unpin primary models from session protection
+        # 2. Unpin models from session protection (LRU can now evict them)
         for plan in session.character_plans.values():
             self.inference.unpin_session(plan.checkpoint_path, session_id)
-
-        # 4. Restore original max_models if we expanded it for this session
-        if session.original_max_models is not None:
-            # Only shrink back if no other active sessions need the expanded limit
-            active_pins = sum(
-                1 for pins in self.inference._session_pins.values() if pins
-            )
-            if active_pins == 0:
-                logger.info(
-                    f"Restoring model cache limit to {session.original_max_models}"
-                )
-                self.inference.max_models = session.original_max_models
 
         session.status = SessionStatus.CANCELLED
         session.workers.clear()
