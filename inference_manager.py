@@ -8,6 +8,7 @@ Auto-unloads from VRAM after configurable idle timeout.
 import collections
 import io
 import logging
+import re
 import threading
 import time
 import asyncio
@@ -190,6 +191,19 @@ class InferenceManager:
             with self._lock:
                 self._active_requests -= 1
                 self._touch()
+
+    # -- Speaker name normalisation -------------------------------------------
+
+    @staticmethod
+    def _normalize_speaker_name(name: str) -> str:
+        """Normalize a human-readable speaker name to the format stored in model configs.
+
+        E.g. 'Mr. Justice Wargrave' → 'mr__justice_wargrave'
+        (dot and space each become '_', adjacent underscores are preserved)
+        """
+        if not name:
+            return name
+        return name.lower().replace(" ", "_").replace(".", "_").strip("_")
 
     # -- Load / Unload --------------------------------------------------------
 
@@ -474,7 +488,7 @@ class InferenceManager:
             })
             try:
                 # model.generate_custom_voice expects a single speaker duplicated if batched
-                speakers = [spk.lower() if spk else spk] * len(texts)
+                speakers = [self._normalize_speaker_name(spk) if spk else spk] * len(texts)
                 
                 wavs_list, sr = model.generate_custom_voice(
                     text=texts,
@@ -521,7 +535,7 @@ class InferenceManager:
                 wavs, sr = model.generate_custom_voice(
                     text=text,
                     language=language,
-                    speaker=spk.lower() if spk else spk,
+                    speaker=self._normalize_speaker_name(spk) if spk else spk,
                     instruct=instruct if instruct else None,
                 )
 
