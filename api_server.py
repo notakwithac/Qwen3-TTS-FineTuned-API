@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from pipeline import Pipeline, JobStatus
 from storage import storage
 from ops_logger import ops_log
+from session_manager import SessionManager, SessionStatus
 
 # Configure logging
 logging.basicConfig(
@@ -33,7 +34,9 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def _lifespan(app):
-    yield  # Startup: nothing extra needed
+    # Startup: start session cleanup loop
+    session_mgr.start_cleanup_loop()
+    yield
     # Shutdown: wait for any in-progress S3 uploads
     logger.info("Server shutting down — waiting for pending S3 uploads...")
     import asyncio
@@ -59,6 +62,11 @@ GPU_MAX_MODELS = int(os.environ.get("GPU_MAX_MODELS", "4"))
 GPU_BATCH_SIZE = int(os.environ.get("GPU_BATCH_SIZE", "32"))
 USE_TORCH_COMPILE = os.environ.get("USE_TORCH_COMPILE", "1") == "1"
 
+# Session configuration
+REPLICA_THRESHOLD = int(os.environ.get("REPLICA_THRESHOLD", "500"))
+MAX_REPLICAS_PER_MODEL = int(os.environ.get("MAX_REPLICAS_PER_MODEL", "4"))
+SESSION_TIMEOUT = int(os.environ.get("SESSION_TIMEOUT", "3600"))
+
 logger.info(f"Loaded Configuration:")
 logger.info(f"  - DEVICE: {DEVICE}")
 logger.info(f"  - USE_FLASH_ATTN: {USE_FLASH_ATTN}")
@@ -67,6 +75,9 @@ logger.info(f"  - GPU_MAX_CONCURRENCY: {GPU_MAX_CONCURRENCY}")
 logger.info(f"  - GPU_MAX_MODELS: {GPU_MAX_MODELS}")
 logger.info(f"  - GPU_BATCH_SIZE: {GPU_BATCH_SIZE}")
 logger.info(f"  - USE_TORCH_COMPILE: {USE_TORCH_COMPILE}")
+logger.info(f"  - REPLICA_THRESHOLD: {REPLICA_THRESHOLD}")
+logger.info(f"  - MAX_REPLICAS_PER_MODEL: {MAX_REPLICAS_PER_MODEL}")
+logger.info(f"  - SESSION_TIMEOUT: {SESSION_TIMEOUT}s")
 
 pipeline = Pipeline(
     base_dir=".",
@@ -77,6 +88,17 @@ pipeline = Pipeline(
     max_concurrency=GPU_MAX_CONCURRENCY,
     max_models=GPU_MAX_MODELS,
     compile=USE_TORCH_COMPILE,
+)
+
+# Session-based inference manager
+session_mgr = SessionManager(
+    inference_manager=pipeline.inference,
+    pipeline=pipeline,
+    storage=storage,
+    replica_threshold=REPLICA_THRESHOLD,
+    max_replicas=MAX_REPLICAS_PER_MODEL,
+    session_timeout=SESSION_TIMEOUT,
+    batch_size=GPU_BATCH_SIZE,
 )
 
 # ---------------------------------------------------------------------------
@@ -940,6 +962,169 @@ async def gpu_config(req: GpuConfigRequest):
         "idle_timeout_seconds": req.idle_timeout_seconds,
         "auto_unload_enabled": req.idle_timeout_seconds > 0,
     }
+
+
+# ---------------------------------------------------------------------------
+# Session-Based Inference (Event-Driven)
+# ---------------------------------------------------------------------------
+
+class SessionCharacterInfo(BaseModel):
+    job_id: str
+    character_name: str
+    line_count: int = 0
+    avg_word_count: int = 20
+
+class SessionPrepareRequest(BaseModel):
+    """Prepare a session: pre-load models, create per-character queues."""
+    session_id: Optional[str] = None  # Auto-generated if not provided
+    characters: list[SessionCharacterInfo]
+    book_id: Optional[str] = None
+    chapter_id: Optional[str] = None
+
+class SessionSubmitItem(BaseModel):
+    job_id: str
+    character_name: str
+    text: str
+    language: str = "English"
+    instruct: str = ""
+    s3_filename: str = ""
+
+class SessionSubmitBatchRequest(BaseModel):
+    """Submit multiple inference messages to session queues."""
+    items: list[SessionSubmitItem]
+
+
+@app.post("/session/prepare", summary="Prepare a session for event-driven inference")
+async def session_prepare(req: SessionPrepareRequest):
+    """Pre-load models into VRAM, create per-character queues, allocate replicas.
+
+    Call this BEFORE submitting any inference messages. The API will:
+    1. Calculate how many GPU replicas each character needs (based on line_count)
+    2. Pre-load all model checkpoints (restoring from S3 if needed)
+    3. Create per-character worker pools
+
+    Returns the session plan with replica allocations and estimated timing.
+    """
+    import uuid as _uuid
+    session_id = req.session_id or str(_uuid.uuid4())
+
+    try:
+        session = await session_mgr.prepare_session(
+            session_id=session_id,
+            characters=[c.model_dump() for c in req.characters],
+            book_id=req.book_id or "",
+            chapter_id=req.chapter_id or "",
+        )
+
+        model_plan = {}
+        for job_id, plan in session.character_plans.items():
+            model_plan[job_id] = {
+                "character_name": plan.character_name,
+                "replicas": plan.replicas,
+                "replica_keys": plan.replica_keys,
+                "status": "loaded",
+            }
+
+        return {
+            "session_id": session_id,
+            "status": session.status.value,
+            "model_plan": model_plan,
+            "total_lines": session.total_lines,
+            "workers_started": len(session.workers),
+            "vram": pipeline.inference.get_vram_budget(),
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Session prepare failed: {str(e)}")
+
+
+@app.post("/session/{session_id}/submit", summary="Submit a single inference message")
+async def session_submit_single(session_id: str, item: SessionSubmitItem):
+    """Submit a single inference message to the session's character queue."""
+    try:
+        enqueued = await session_mgr.submit_messages(
+            session_id, [item.model_dump()]
+        )
+        return {"enqueued": enqueued, "session_id": session_id}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post("/session/{session_id}/submit/batch", summary="Submit multiple inference messages")
+async def session_submit_batch(session_id: str, req: SessionSubmitBatchRequest):
+    """Submit multiple inference messages to the session's character queues.
+
+    Messages are automatically routed to the correct character's queue based on job_id.
+    Workers will batch them for GPU inference automatically.
+    """
+    try:
+        enqueued = await session_mgr.submit_messages(
+            session_id, [item.model_dump() for item in req.items]
+        )
+        session = session_mgr.get_session(session_id)
+        return {
+            "enqueued": enqueued,
+            "session_id": session_id,
+            "queue_depths": {
+                plan.character_name: session.character_queues[jid].qsize()
+                for jid, plan in session.character_plans.items()
+            } if session else {},
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get("/session/{session_id}/status", summary="Get session progress")
+async def session_status(session_id: str, include_results: bool = False):
+    """Poll session progress. Returns per-character completion stats.
+
+    Set include_results=true to also get the list of completed S3 URLs.
+    """
+    session = session_mgr.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+
+    response = session.to_dict()
+
+    if include_results:
+        response["results"] = session.get_all_results()
+
+    # Add queue depths
+    response["queue_depths"] = {
+        session.character_plans[jid].character_name: q.qsize()
+        for jid, q in session.character_queues.items()
+    }
+
+    return response
+
+
+@app.delete("/session/{session_id}", summary="Teardown a session")
+async def session_teardown(session_id: str):
+    """Stop workers, release GPU replicas, and clean up queues.
+
+    Primary models may remain cached (subject to normal LRU eviction)
+    but replicas are immediately freed.
+    """
+    success = await session_mgr.teardown_session(session_id)
+    if not success:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+    return {
+        "detail": f"Session {session_id} torn down",
+        "vram": pipeline.inference.get_vram_budget(),
+    }
+
+
+@app.get("/sessions", summary="List all sessions")
+async def list_sessions():
+    """List all sessions with basic progress info."""
+    return session_mgr.list_sessions()
+
+
+@app.get("/gpu/vram", summary="VRAM budget info")
+async def gpu_vram():
+    """Get detailed VRAM budget including session-pinned models."""
+    return pipeline.inference.get_vram_budget()
 
 
 # ---------------------------------------------------------------------------

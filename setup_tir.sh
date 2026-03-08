@@ -18,17 +18,7 @@ export GPU_IDLE_TIMEOUT="${GPU_IDLE_TIMEOUT:-300}"
 export GPU_MAX_MODELS="${GPU_MAX_MODELS:-4}"
 
 echo "=== [5/6] Installing flash-attn ==="
-# Search for any flash_attn linux wheel in the current directory
-FLASH_WHEEL=$(ls flash_attn-*.whl 2>/dev/null | grep -E "linux|manylinux" | head -n 1 || true)
-if [ -n "$FLASH_WHEEL" ]; then
-    echo "Found local flash-attn wheel: $FLASH_WHEEL. Installing..."
-    uv pip install "$FLASH_WHEEL"
-else
-    echo "No local Linux wheel found (checked for flash_attn-*.whl with 'linux' in name)."
-    echo "Attempting to install from PyPI (this may take a long time to compile)..."
-    # uv pip install flash-attn --no-build-isolation
-    echo "Skipping compilation to avoid OOM. Please provide a pre-built wheel."
-fi
+uv pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.5cxx11abiFALSE-cp311-cp311-linux_x86_64.whl
 
 echo "=== [6/6] Verifying GPU ==="
 python -c "import torch; print(f'PyTorch {torch.__version__} | CUDA: {torch.version.cuda} | GPU: {torch.cuda.get_device_name(0)}')"

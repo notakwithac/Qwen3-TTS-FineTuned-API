@@ -59,6 +59,10 @@ class InferenceManager:
         self._models: Dict[str, tuple] = collections.OrderedDict()
         self._max_models = max_models
 
+        # Session pinning: models pinned by active sessions won't be LRU evicted
+        # Dict[cache_key, set[session_id]]
+        self._session_pins: Dict[str, set] = {}
+
         # Tracking for properties (historical/last used)
         self._last_path: Optional[str] = None
         self._last_type: Optional[str] = None
@@ -252,12 +256,25 @@ class InferenceManager:
             raise
 
     def _enforce_cache_size(self, reserve: int = 0):
-        """Internal: remove LRU models if over capacity (caller must hold lock)."""
+        """Internal: remove LRU models if over capacity (caller must hold lock).
+        Respects session-pinned models (won't evict them)."""
         while len(self._models) > (self._max_models - reserve) and self._models:
-            path, (model, mtype, _) = self._models.popitem(last=False)
-            logger.info(f"LRU Eviction: Unloading {mtype} model from {path}")
-            del model
-            self._total_unloads += 1
+            # Find the LRU model that is NOT session-pinned
+            evicted = False
+            for path in list(self._models.keys()):
+                if path in self._session_pins and self._session_pins[path]:
+                    continue  # Skip pinned models
+                model_tuple = self._models.pop(path)
+                model, mtype, _ = model_tuple
+                logger.info(f"LRU Eviction: Unloading {mtype} model from {path}")
+                del model
+                self._total_unloads += 1
+                evicted = True
+                break
+            if not evicted:
+                # All models are session-pinned, can't evict
+                logger.warning("Cannot evict any models — all are session-pinned")
+                break
         
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -296,6 +313,128 @@ class InferenceManager:
     def unload(self):
         with self._lock:
             self._unload_all_unsafe()
+
+    # -- Session-aware loading ------------------------------------------------
+
+    def load_for_session(
+        self, cache_key: str, checkpoint_path: str, speaker_name: str,
+        session_id: str = "",
+    ):
+        """Load a model for a session, optionally as a replica.
+
+        For replicas, cache_key differs from checkpoint_path
+        (e.g. 'path/to/model::replica-1'). The actual weights are loaded
+        from checkpoint_path, but stored under cache_key in the cache.
+
+        Session-pinned models are protected from LRU eviction.
+        """
+        with self._lock:
+            if cache_key in self._models:
+                self._models.move_to_end(cache_key)
+                self._touch()
+                # Add session pin
+                if session_id:
+                    self._session_pins.setdefault(cache_key, set()).add(session_id)
+                return self._models[cache_key][0]
+
+            # For replicas, we load from the real checkpoint_path
+            # but store under the cache_key
+            self._enforce_cache_size(reserve=1)
+
+            op = ops_log.start("model_load_session", extra={
+                "cache_key": cache_key,
+                "checkpoint_path": checkpoint_path,
+                "speaker": speaker_name,
+            })
+            try:
+                from qwen_tts import Qwen3TTSModel
+                logger.info(f"Loading model from {checkpoint_path} as {cache_key}...")
+                try:
+                    model = Qwen3TTSModel.from_pretrained(
+                        checkpoint_path,
+                        device_map=self._device,
+                        dtype=torch.bfloat16,
+                        attn_implementation=self._attn_impl,
+                    )
+                except Exception as e:
+                    if self._attn_impl == "flash_attention_2":
+                        err_str = str(e)
+                        if any(x in err_str for x in ["FlashAttention2", "flash-attn", "flash_attn", "package f", "DLL load failed"]):
+                            logger.warning(f"Flash Attention fallback for {cache_key}: {err_str}")
+                            model = Qwen3TTSModel.from_pretrained(
+                                checkpoint_path,
+                                device_map=self._device,
+                                dtype=torch.bfloat16,
+                                attn_implementation="eager",
+                            )
+                        else:
+                            raise
+                    else:
+                        raise
+
+                if self._compile:
+                    logger.info(f"Compiling model {cache_key}...")
+                    model.model = torch.compile(model.model, mode="reduce-overhead")
+
+                self._models[cache_key] = (model, "custom_voice", speaker_name)
+                self._last_path = cache_key
+                self._last_type = "custom_voice"
+                self._last_speaker = speaker_name
+                self._total_loads += 1
+                self._touch()
+
+                # Pin to session
+                if session_id:
+                    self._session_pins.setdefault(cache_key, set()).add(session_id)
+
+                mem = torch.cuda.memory_allocated(0) / 1e9 if torch.cuda.is_available() else 0
+                logger.info(
+                    f"Session model loaded: {cache_key}. "
+                    f"Cache: {self.loaded_count}/{self._max_models}. GPU: {mem:.2f} GB"
+                )
+                ops_log.end(op, extra={"gpu_memory_gb": round(mem, 2)})
+                return model
+            except Exception as e:
+                ops_log.fail(op, str(e))
+                raise
+
+    def unload_specific(self, cache_key: str):
+        """Unload a specific model by its cache key."""
+        with self._lock:
+            if cache_key in self._models:
+                model, mtype, _ = self._models.pop(cache_key)
+                del model
+                self._total_unloads += 1
+                self._session_pins.pop(cache_key, None)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                logger.info(f"Unloaded specific model: {cache_key}")
+                return True
+        return False
+
+    def unpin_session(self, cache_key: str, session_id: str):
+        """Remove a session pin from a model. If no pins remain, the model
+        becomes eligible for LRU eviction again."""
+        with self._lock:
+            if cache_key in self._session_pins:
+                self._session_pins[cache_key].discard(session_id)
+                if not self._session_pins[cache_key]:
+                    del self._session_pins[cache_key]
+                    logger.info(f"Model {cache_key} fully unpinned")
+
+    def get_vram_budget(self) -> dict:
+        """Return VRAM budget information."""
+        if not torch.cuda.is_available():
+            return {"total_gb": 0, "allocated_gb": 0, "free_gb": 0}
+        total = torch.cuda.get_device_properties(0).total_mem / 1e9
+        allocated = torch.cuda.memory_allocated(0) / 1e9
+        return {
+            "total_gb": round(total, 2),
+            "allocated_gb": round(allocated, 2),
+            "free_gb": round(total - allocated, 2),
+            "models_loaded": self.loaded_count,
+            "session_pinned": len(self._session_pins),
+        }
 
     def _get_model(self, path: str, model_type: str, speaker_name: Optional[str] = None):
         """Get model from cache or load it (caller holds lock)."""
