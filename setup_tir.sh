@@ -7,7 +7,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 echo "=== [2/6] Creating Python 3.11 venv ==="
 uv venv --python 3.11 .venv
-source .venv/bin/activate
+. .venv/bin/activate
 
 echo "=== [3/6] Syncing stable CUDA 12.1 deps ==="
 uv sync --extra cu121

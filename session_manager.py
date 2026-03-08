@@ -182,7 +182,7 @@ class CharacterWorker:
             if batch:
                 await self._process_batch(batch, loop)
 
-    async def _process_batch(self, batch: List[InferenceMessage], loop: asyncio.EventLoop):
+    async def _process_batch(self, batch: List[InferenceMessage], loop: asyncio.AbstractEventLoop):
         """Run inference on a batch and upload results."""
         texts = [m.text for m in batch]
         languages = [m.language for m in batch]
@@ -234,7 +234,7 @@ class CharacterWorker:
             self.progress.failed += len(batch)
 
     async def _upload_single(
-        self, loop: asyncio.EventLoop, wav_bytes: bytes,
+        self, loop: asyncio.AbstractEventLoop, wav_bytes: bytes,
         msg: InferenceMessage, s3_prefix: str, sr: int,
     ):
         """Upload a single WAV to S3 and update progress."""

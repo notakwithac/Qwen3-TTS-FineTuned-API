@@ -3,7 +3,7 @@
 # Run this after setup_tir.sh has been executed.
 set -e
 
-source .venv/bin/activate 2>/dev/null || true
+. .venv/bin/activate 2>/dev/null || true
 
 # Optional: set env vars
 export DEVICE="${DEVICE:-cuda:0}"
@@ -19,4 +19,4 @@ echo ""
 echo "   API docs:  http://0.0.0.0:8000/docs"
 echo ""
 
-uvicorn api_server:app --host 0.0.0.0 --port 8000
+python -m uvicorn api_server:app --host 0.0.0.0 --port 8000
