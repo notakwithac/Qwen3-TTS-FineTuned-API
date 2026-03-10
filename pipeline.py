@@ -208,6 +208,7 @@ class Pipeline:
             max_models=max_models,
             compile=compile,
         )
+        self._restore_locks: Dict[str, threading.Lock] = {}
 
         # Background S3 sync: ensure all completed jobs are uploaded
         self._stop_sync_event = threading.Event()
@@ -946,51 +947,69 @@ class Pipeline:
         if not storage.is_configured:
             raise ValueError("Storage not configured, cannot restore checkpoint")
 
-        prev_status = job.status
-        job.status = JobStatus.RESTORING
-        job.progress = {"stage": "restoring", "detail": "Downloading model from S3..."}
-        job.save()
+        # Ensure output directory exists
+        job_dir = self.jobs_dir / job.job_id
+        output_dir = job_dir / "output"
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-        restore_op = ops_log.start("checkpoint_restore", job_id=job.job_id, extra={
-            "s3_key": job.s3_model_key,
-        })
-        try:
-            # Ensure output directory exists
-            job_dir = self.jobs_dir / job.job_id
-            output_dir = job_dir / "output"
-            output_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_dir = output_dir / f"checkpoint_{job.speaker_name}"
+        checkpoint_path = str(checkpoint_dir)
 
-            # Download the zip to a temp file
-            with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
-                tmp_path = tmp.name
-            
-            storage.download_file(job.s3_model_key, tmp_path)
-
-            # Extract into the output directory
-            # The zip contains model files; extract into a named subfolder
-            checkpoint_dir = output_dir / f"checkpoint_{job.speaker_name}"
-            checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-            import zipfile
-            with zipfile.ZipFile(tmp_path, "r") as zf:
-                zf.extractall(checkpoint_dir)
-
-            os.unlink(tmp_path)
-
-            checkpoint_path = str(checkpoint_dir)
+        # 1. Quick check: is it already there?
+        if checkpoint_dir.exists() and any(checkpoint_dir.iterdir()):
+            logger.info(f"Checkpoint for job {job.job_id} already exists, skipping restore.")
             job.checkpoint_path = checkpoint_path
-            job.status = JobStatus.READY
-            job.progress = {
-                "stage": "ready",
-                "detail": "Model restored from S3 and ready for inference",
-                "inference_url": f"/infer/{job.job_id}",
-            }
-            job.save()
-            ops_log.end(restore_op, extra={"checkpoint_path": checkpoint_path})
-            logger.info(f"Restored checkpoint for job {job.job_id} from S3 to {checkpoint_path}")
             return checkpoint_path
-        except Exception as e:
-            job.status = prev_status
+
+        # 2. Acquire a lock for this specific job to serialize restoration
+        with self._lock:
+            if job.job_id not in self._restore_locks:
+                self._restore_locks[job.job_id] = threading.Lock()
+            lock = self._restore_locks[job.job_id]
+
+        with lock:
+            # 3. Double-check: did another thread just finish it?
+            if checkpoint_dir.exists() and any(checkpoint_dir.iterdir()):
+                job.checkpoint_path = checkpoint_path
+                return checkpoint_path
+
+            prev_status = job.status
+            job.status = JobStatus.RESTORING
+            job.progress = {"stage": "restoring", "detail": "Downloading model from S3..."}
             job.save()
-            ops_log.fail(restore_op, str(e))
-            raise ValueError(f"Failed to restore checkpoint from S3: {e}")
+
+            restore_op = ops_log.start("checkpoint_restore", job_id=job.job_id, extra={
+                "s3_key": job.s3_model_key,
+            })
+            try:
+                # Download the zip to a temp file
+                with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+                    tmp_path = tmp.name
+                
+                storage.download_file(job.s3_model_key, tmp_path)
+
+                # Extract into the output directory
+                checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+                import zipfile
+                with zipfile.ZipFile(tmp_path, "r") as zf:
+                    zf.extractall(checkpoint_dir)
+
+                os.unlink(tmp_path)
+
+                job.checkpoint_path = checkpoint_path
+                job.status = JobStatus.READY
+                job.progress = {
+                    "stage": "ready",
+                    "detail": "Model restored from S3 and ready for inference",
+                    "inference_url": f"/infer/{job.job_id}",
+                }
+                job.save()
+                ops_log.end(restore_op, extra={"checkpoint_path": checkpoint_path})
+                logger.info(f"Restored checkpoint for job {job.job_id} from S3 to {checkpoint_path}")
+                return checkpoint_path
+            except Exception as e:
+                job.status = prev_status
+                job.save()
+                ops_log.fail(restore_op, str(e))
+                raise ValueError(f"Failed to restore checkpoint from S3: {e}")

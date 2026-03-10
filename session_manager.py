@@ -538,7 +538,14 @@ class SessionManager:
         try:
             loop = asyncio.get_running_loop()
 
-            async def _resolve_character(char_dict):
+            # 1. Resolve unique jobs in parallel
+            unique_jobs = {}
+            for c in characters:
+                jid = c["job_id"]
+                if jid not in unique_jobs:
+                    unique_jobs[jid] = c
+
+            async def _resolve_job(char_dict):
                 job_id = char_dict["job_id"]
                 # get_job can hit S3, run in executor
                 job = await loop.run_in_executor(None, self.pipeline.get_job, job_id)
@@ -557,32 +564,40 @@ class SessionManager:
                             f"Job {job_id} has no checkpoint and no S3 backup"
                         )
 
-                return CharacterPlan(
+                return job_id, checkpoint_path, job.character_id
+
+            # Resolve all unique jobs
+            results = await asyncio.gather(*[_resolve_job(c) for c in unique_jobs.values()])
+            job_info = {r[0]: (r[1], r[2]) for r in results}
+
+            # 2. Map all characters to their resolved plans
+            for char_dict in characters:
+                job_id = char_dict["job_id"]
+                checkpoint_path, character_id = job_info[job_id]
+                
+                plan = CharacterPlan(
                     job_id=job_id,
                     character_name=char_dict["character_name"],
                     checkpoint_path=checkpoint_path,
                     line_count=char_dict.get("line_count", 0),
                     avg_word_count=char_dict.get("avg_word_count", 20),
-                    character_id=job.character_id,
+                    character_id=character_id,
                 )
-
-            # 1. Resolve all characters in parallel
-            plans = await asyncio.gather(*[_resolve_character(c) for c in characters])
-            
-            for plan in plans:
+                plan.replicas = 1
+                plan.replica_keys = [checkpoint_path]
+                
+                # Note: If multiple character names share a job_id, we keep both in the session
+                # so the submission logic can find them, but they'll share a queue.
                 session.character_plans[plan.job_id] = plan
                 session.total_lines += plan.line_count
 
-            # 2. Set up model plans (one model per character, no replicas)
-            for job_id, plan in session.character_plans.items():
-                plan.replicas = 1
-                plan.replica_keys.append(plan.checkpoint_path)
-
-            # 3. Create per-character queues and progress trackers
-            for job_id, plan in session.character_plans.items():
+            # 3. Create per-job queues and progress trackers
+            # If multiple character names share the same job_id, they share ONE queue.
+            for job_id in job_info:
+                plan = session.character_plans[job_id]
                 session.character_queues[job_id] = asyncio.Queue()
                 session.character_progress[job_id] = CharacterProgress(
-                    total=plan.line_count
+                    total=sum(c.get("line_count", 0) for c in characters if c["job_id"] == job_id)
                 )
 
             # 4. Start workers (one per character)

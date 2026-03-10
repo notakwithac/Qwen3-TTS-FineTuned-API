@@ -511,6 +511,7 @@ class InferenceManager:
                         "batch_size": len(texts),
                         "speaker": spk,
                     })
+                    logger.info(f"Speaker '{spk}' started saying {len(texts)} texts.")
                     try:
                         speakers = [self._normalize_speaker_name(spk) if spk else spk] * len(texts)
 
@@ -529,6 +530,7 @@ class InferenceManager:
                             results.append(buf.read())
 
                         ops_log.end(op, extra={"sample_rate": sr})
+                        logger.info(f"Speaker '{spk}' finished saying {len(texts)} texts.")
                         return results, sr
                     except Exception as e:
                         ops_log.fail(op, str(e))
@@ -558,6 +560,7 @@ class InferenceManager:
                         "language": language,
                         "speaker": spk,
                     })
+                    logger.info(f"Speaker '{spk}' started saying text: '{text[:50]}...'")
                     try:
                         wavs, sr = model.generate_custom_voice(
                             text=text,
@@ -601,6 +604,7 @@ class InferenceManager:
                     op = ops_log.start("inference_voice_design_batch", extra={
                         "batch_size": len(texts),
                     })
+                    logger.info(f"VoiceDesign started for {len(texts)} texts.")
                     try:
                         wavs_list, sr = model.generate_voice_design(
                             text=texts,
@@ -616,6 +620,7 @@ class InferenceManager:
                             results.append(buf.read())
 
                         ops_log.end(op, extra={"sample_rate": sr})
+                        logger.info(f"VoiceDesign finished for {len(texts)} texts.")
                         return results, sr
                     except Exception as e:
                         ops_log.fail(op, str(e))
@@ -643,6 +648,7 @@ class InferenceManager:
                         "instruct_length": len(instruct),
                         "language": language,
                     })
+                    logger.info(f"VoiceDesign started for text: '{text[:50]}...'")
                     try:
                         wavs, sr = model.generate_voice_design(
                             text=text,
@@ -687,6 +693,7 @@ class InferenceManager:
                     op = ops_log.start("inference_voice_clone_batch", extra={
                         "batch_size": len(texts),
                     })
+                    logger.info(f"VoiceClone started for {len(texts)} texts.")
                     try:
                         wavs_list, sr = model.generate_voice_clone(
                             text=texts,
@@ -704,6 +711,7 @@ class InferenceManager:
                             results.append(buf.read())
 
                         ops_log.end(op, extra={"sample_rate": sr})
+                        logger.info(f"VoiceClone finished for {len(texts)} texts.")
                         return results, sr
                     except Exception as e:
                         ops_log.fail(op, str(e))

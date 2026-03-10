@@ -96,12 +96,17 @@ class StorageClient:
         Returns:
             Public URL of the uploaded object.
         """
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"Uploading {len(data)} bytes to S3: {self.bucket}/{key}")
+        
         self.client.put_object(
             Bucket=self.bucket,
             Key=key,
             Body=data,
             ContentType=content_type,
         )
+        logger.info(f"Upload complete: {self._object_url(key)}")
         return self._object_url(key)
 
     def upload_file(self, local_path: str, key: str, content_type: Optional[str] = None) -> str:

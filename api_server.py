@@ -26,6 +26,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Suppress noisy model initialization logs
+logging.getLogger("qwen_tts.core.models.configuration_qwen3_tts").setLevel(logging.WARNING)
+logging.getLogger("transformers").setLevel(logging.WARNING)
+logging.getLogger("transformers.modeling_utils").setLevel(logging.WARNING)
+
 # ---------------------------------------------------------------------------
 # App setup
 # ---------------------------------------------------------------------------
@@ -1208,6 +1213,8 @@ class SessionSubmitItem(BaseModel):
     language: str = "English"
     instruct: str = ""
     s3_filename: str = ""
+    book_id: Optional[str] = None
+    chapter_id: Optional[str] = None
 
 class SessionSubmitBatchRequest(BaseModel):
     """Submit multiple inference messages to session queues."""

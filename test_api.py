@@ -18,6 +18,7 @@ import time
 import zipfile
 
 import requests
+from storage import storage
 
 
 def create_test_dataset_zip(
