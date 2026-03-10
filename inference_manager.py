@@ -258,7 +258,7 @@ class InferenceManager:
             if self._compile:
                 logger.info("Compiling model for faster inference (this may take a few minutes)...")
                 # We compile the underlying Qwen3TTSForConditionalGeneration model
-                model.model = torch.compile(model.model, mode="reduce-overhead")
+                model.model = torch.compile(model.model, mode="default")
             
             self._models[path] = (model, model_type, speaker_name)
             self._last_path = path
@@ -409,7 +409,7 @@ class InferenceManager:
 
                 if self._compile:
                     logger.info(f"Compiling model {cache_key}...")
-                    model.model = torch.compile(model.model, mode="reduce-overhead")
+                    model.model = torch.compile(model.model, mode="default")
 
                 self._models[cache_key] = (model, "custom_voice", speaker_name)
                 self._last_path = cache_key
