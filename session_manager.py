@@ -112,6 +112,7 @@ class CharacterWorker:
         worker_id: str,
         queue: asyncio.Queue,
         inference_manager,  # InferenceManager instance
+        worker_semaphore: asyncio.Semaphore,
         cache_key: str,     # The model cache key to use
         speaker_name: str,
         batch_size: int = 32,
@@ -122,6 +123,7 @@ class CharacterWorker:
         self.worker_id = worker_id
         self.queue = queue
         self.inference = inference_manager
+        self.worker_semaphore = worker_semaphore
         self.cache_key = cache_key
         self.speaker_name = speaker_name
         self.batch_size = batch_size
@@ -156,7 +158,7 @@ class CharacterWorker:
             batch: List[InferenceMessage] = []
 
             try:
-                # Block until at least one item is available
+                # 1. Block until at least one item is available
                 msg = await asyncio.wait_for(self.queue.get(), timeout=5.0)
                 batch.append(msg)
             except asyncio.TimeoutError:
@@ -164,23 +166,37 @@ class CharacterWorker:
             except asyncio.CancelledError:
                 return
 
-            # Try to fill the batch up to batch_size, with a short timeout
-            deadline = time.monotonic() + self.batch_timeout
-            while len(batch) < self.batch_size:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                try:
-                    msg = await asyncio.wait_for(self.queue.get(), timeout=remaining)
-                    batch.append(msg)
-                except asyncio.TimeoutError:
-                    break
-                except asyncio.CancelledError:
-                    # Process what we have before dying
-                    break
+            # 2. Acquire a worker slot. This limits actively processing workers
+            #    to max_models, preventing VRAM cache thrashing.
+            async with self.worker_semaphore:
+                # 3. Drain the queue as much as possible while holding the slot
+                while self._running:
+                    # Fill the batch up to batch_size
+                    deadline = time.monotonic() + self.batch_timeout
+                    while len(batch) < self.batch_size:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        try:
+                            msg = await asyncio.wait_for(self.queue.get(), timeout=remaining)
+                            batch.append(msg)
+                        except asyncio.TimeoutError:
+                            break
+                        except asyncio.CancelledError:
+                            break
 
-            if batch:
-                await self._process_batch(batch, loop)
+                    if batch:
+                        await self._process_batch(batch, loop)
+                        batch.clear()
+
+                    # Check if more items are queued
+                    # Use a tiny timeout to briefly wait in case orchestrator is slightly behind,
+                    # but yield the slot quickly if genuinely empty.
+                    try:
+                        msg = await asyncio.wait_for(self.queue.get(), timeout=0.1)
+                        batch.append(msg)
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        break  # Queue is empty, yield the semaphore slot
 
     async def _process_batch(self, batch: List[InferenceMessage], loop: asyncio.AbstractEventLoop):
         """Run inference on a batch and upload results."""
@@ -382,6 +398,10 @@ class SessionManager:
         self.batch_size = batch_size
         self.sessions: Dict[str, Session] = {}
 
+        # Limit active workers to max_models to prevent cache thrashing
+        # Allows a worker to hold its model in VRAM while it drains its queue
+        self.worker_semaphore = asyncio.Semaphore(inference_manager.max_models)
+
         # Start cleanup timer
         self._cleanup_task: Optional[asyncio.Task] = None
 
@@ -558,6 +578,7 @@ class SessionManager:
                     worker_id=f"{session_id}/{plan.character_name}/w0",
                     queue=queue,
                     inference_manager=self.inference,
+                    worker_semaphore=self.worker_semaphore,
                     cache_key=plan.checkpoint_path,
                     speaker_name=plan.character_name,
                     batch_size=self.batch_size,
