@@ -535,35 +535,44 @@ class SessionManager:
         })
 
         try:
-            # 1. Resolve checkpoint paths for each character
-            for char in characters:
-                job_id = char["job_id"]
-                job = self.pipeline.get_job(job_id)
+            loop = asyncio.get_running_loop()
+
+            async def _resolve_character(char_dict):
+                job_id = char_dict["job_id"]
+                # get_job can hit S3, run in executor
+                job = await loop.run_in_executor(None, self.pipeline.get_job, job_id)
                 if not job:
                     raise ValueError(f"Job {job_id} not found")
 
                 checkpoint_path = str(job.checkpoint_path) if job.checkpoint_path else None
-                if not checkpoint_path or not __import__("os").path.exists(checkpoint_path):
+                if not checkpoint_path or not os.path.exists(checkpoint_path):
                     if job.s3_model_key:
-                        checkpoint_path = self.pipeline._restore_checkpoint_from_s3(job)
+                        # Large S3 download, must run in executor
+                        checkpoint_path = await loop.run_in_executor(
+                            None, self.pipeline._restore_checkpoint_from_s3, job
+                        )
                     else:
                         raise ValueError(
                             f"Job {job_id} has no checkpoint and no S3 backup"
                         )
 
-                plan = CharacterPlan(
+                return CharacterPlan(
                     job_id=job_id,
-                    character_name=char["character_name"],
+                    character_name=char_dict["character_name"],
                     checkpoint_path=checkpoint_path,
-                    line_count=char.get("line_count", 0),
-                    avg_word_count=char.get("avg_word_count", 20),
+                    line_count=char_dict.get("line_count", 0),
+                    avg_word_count=char_dict.get("avg_word_count", 20),
                     character_id=job.character_id,
                 )
-                session.character_plans[job_id] = plan
+
+            # 1. Resolve all characters in parallel
+            plans = await asyncio.gather(*[_resolve_character(c) for c in characters])
+            
+            for plan in plans:
+                session.character_plans[plan.job_id] = plan
                 session.total_lines += plan.line_count
 
             # 2. Set up model plans (one model per character, no replicas)
-            #    The InferenceManager's semaphore + in-use tracking handle VRAM.
             for job_id, plan in session.character_plans.items():
                 plan.replicas = 1
                 plan.replica_keys.append(plan.checkpoint_path)
@@ -576,8 +585,6 @@ class SessionManager:
                 )
 
             # 4. Start workers (one per character)
-            #    Workers call generate_batch → semaphore limits concurrent
-            #    models in VRAM to max_models. No pre-loading needed.
             for job_id, plan in session.character_plans.items():
                 queue = session.character_queues[job_id]
                 progress = session.character_progress[job_id]

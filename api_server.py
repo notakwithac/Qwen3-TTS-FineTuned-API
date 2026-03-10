@@ -431,7 +431,8 @@ async def list_jobs():
 @app.get("/jobs/{job_id}", summary="Get job status", response_model=JobSummary)
 async def get_job(job_id: str):
     """Get the current status and progress of a fine-tuning job."""
-    job = pipeline.get_job(job_id)
+    loop = asyncio.get_running_loop()
+    job = await loop.run_in_executor(None, pipeline.get_job, job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
     return job.to_dict()
@@ -470,7 +471,8 @@ async def infer(job_id: str, req: InferRequest):
     Set `upload_to_s3: true` to upload the audio to E2E Object Storage
     and receive a JSON response with the S3 URL instead of the raw audio.
     """
-    job = pipeline.get_job(job_id)
+    loop = asyncio.get_running_loop()
+    job = await loop.run_in_executor(None, pipeline.get_job, job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
 
@@ -621,7 +623,8 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
             detail="Storage not configured. Set E2E_ACCESS_KEY and E2E_SECRET_KEY.",
         )
 
-    job = pipeline.get_job(job_id)
+    loop = asyncio.get_running_loop()
+    job = await loop.run_in_executor(None, pipeline.get_job, job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
     if job.status not in (JobStatus.READY, JobStatus.RESTORING):
