@@ -177,6 +177,16 @@ class StorageClient:
         """Delete an object."""
         self.client.delete_object(Bucket=self.bucket, Key=key)
 
+    def copy_object(self, source_key: str, dest_key: str):
+        """Copy an object within the bucket."""
+        copy_source = {'Bucket': self.bucket, 'Key': source_key}
+        self.client.copy(copy_source, self.bucket, dest_key)
+
+    def move_object(self, source_key: str, dest_key: str):
+        """Move an object by copying it and then deleting the source."""
+        self.copy_object(source_key, dest_key)
+        self.delete_object(source_key)
+
     def get_presigned_url(self, key: str, expires_in: int = 3600) -> str:
         """Generate a presigned URL for temporary access.
 

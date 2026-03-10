@@ -54,6 +54,7 @@ class CharacterPlan:
     line_count: int = 0
     avg_word_count: int = 20
     replicas: int = 1
+    character_id: Optional[str] = None
     replica_keys: list = field(default_factory=list)  # Cache keys in InferenceManager
 
 
@@ -78,6 +79,7 @@ class InferenceMessage:
     s3_filename: str = ""
     book_id: str = ""
     chapter_id: str = ""
+    character_id: str = ""
     speaker_name: str = ""
 
     def to_dict(self) -> dict:
@@ -91,6 +93,7 @@ class InferenceMessage:
             "s3_filename": self.s3_filename,
             "book_id": self.book_id,
             "chapter_id": self.chapter_id,
+            "character_id": self.character_id,
             "speaker_name": self.speaker_name,
         }
 
@@ -228,9 +231,13 @@ class CharacterWorker:
             for i, msg in enumerate(batch):
                 if self.storage and self.storage.is_configured and msg.s3_filename:
                     s3_prefix = (
-                        f"audio/segments/{msg.book_id}/{msg.chapter_id}"
-                        if msg.book_id and msg.chapter_id
-                        else f"audio/{msg.job_id}"
+                        f"audio/segments/{msg.book_id}/{msg.chapter_id}/{msg.character_id}"
+                        if msg.book_id and msg.chapter_id and msg.character_id
+                        else (
+                            f"audio/segments/{msg.book_id}/{msg.chapter_id}"
+                            if msg.book_id and msg.chapter_id
+                            else f"audio/{msg.job_id}"
+                        )
                     )
                     upload_tasks.append(
                         self._upload_single(loop, wav_bytes_list[i], msg, s3_prefix, sr)
@@ -550,6 +557,7 @@ class SessionManager:
                     checkpoint_path=checkpoint_path,
                     line_count=char.get("line_count", 0),
                     avg_word_count=char.get("avg_word_count", 20),
+                    character_id=job.character_id,
                 )
                 session.character_plans[job_id] = plan
                 session.total_lines += plan.line_count
@@ -650,6 +658,7 @@ class SessionManager:
                 s3_filename=msg_dict.get("s3_filename", ""),
                 book_id=msg_dict.get("book_id", session.book_id),
                 chapter_id=msg_dict.get("chapter_id", session.chapter_id),
+                character_id=session.character_plans[job_id].character_id or "",
                 speaker_name=session.character_plans[job_id].character_name,
             )
             await session.character_queues[job_id].put(msg)

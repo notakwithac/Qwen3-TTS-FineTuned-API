@@ -354,8 +354,10 @@ class Pipeline:
         return job
 
     def get_job(self, job_id: str) -> Optional[Job]:
+        logger.info(f"Lookup job {job_id}")
         job = self.jobs.get(job_id)
         if job:
+            logger.info(f"Job {job_id} found in memory")
             return job
             
         # Try to load from disk if not in memory
@@ -363,15 +365,18 @@ class Pipeline:
         if job_dir.exists():
             job = Job.load(str(job_dir))
             if job:
+                logger.info(f"Job {job_id} found on disk at {job_dir}")
                 with self._lock:
                     self.jobs[job_id] = job
                 return job
 
         # Try to restore from S3
+        logger.info(f"Job {job_id} not found locally, checking S3...")
         job = self._restore_job_from_s3(job_id)
         if job:
             return job
                 
+        logger.warning(f"Job {job_id} not found anywhere (memory, disk, S3)")
         return None
 
     def list_jobs(self) -> list:
@@ -899,11 +904,13 @@ class Pipeline:
         """Try to restore a job's metadata from S3 (lightweight — no model download)."""
         from storage import storage
         if not storage.is_configured:
+            logger.warning(f"S3 restoration skipped for {job_id}: Storage not configured")
             return None
 
         s3_key = f"jobs/{job_id}/job.json"
         try:
             if not storage.object_exists(s3_key):
+                logger.warning(f"Job metadata not found on S3 at {s3_key}")
                 return None
 
             data_bytes = storage.download_bytes(s3_key)
