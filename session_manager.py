@@ -429,6 +429,7 @@ class SessionManager:
                 and s.status not in (SessionStatus.PREPARING, SessionStatus.PROCESSING)
             ]
             for sid in expired:
+                ops_log.log_event("session_auto_cleanup", extra={"session_id": sid})
                 logger.info(f"Auto-cleaning expired session {sid}")
                 await self.teardown_session(sid)
 

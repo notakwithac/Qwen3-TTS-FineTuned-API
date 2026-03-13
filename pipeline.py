@@ -269,14 +269,16 @@ class Pipeline:
                         continue  # No local checkpoint to upload
                     
                     logger.warning(f"S3 sync: Job {job.job_id} ({job.speaker_name}) has no S3 backup — uploading now.")
-                    try:
-                        s3_key = self._upload_model_to_s3(job, Path(str(job.checkpoint_path)))
-                        job.s3_model_key = s3_key
-                        self._upload_job_json_to_s3(job)
-                        job.save()
-                        logger.info(f"S3 sync: Job {job.job_id} uploaded successfully → {s3_key}")
-                    except Exception as e:
-                        logger.error(f"S3 sync: Failed to upload job {job.job_id}: {e}")
+                    with ops_log.operation("s3_sync_upload", job_id=job.job_id):
+                        try:
+                            s3_key = self._upload_model_to_s3(job, Path(str(job.checkpoint_path)))
+                            job.s3_model_key = s3_key
+                            self._upload_job_json_to_s3(job)
+                            job.save()
+                            logger.info(f"S3 sync: Job {job.job_id} uploaded successfully → {s3_key}")
+                        except Exception as e:
+                            logger.error(f"S3 sync: Failed to upload job {job.job_id}: {e}")
+                            raise # Let ops_log.operation catch it
             except Exception as e:
                 logger.error(f"S3 sync worker error: {e}")
         logger.info("S3 sync monitor stopped.")

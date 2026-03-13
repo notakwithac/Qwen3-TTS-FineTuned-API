@@ -17,6 +17,7 @@ from urllib.parse import urljoin
 
 import boto3
 from botocore.config import Config as BotoConfig
+from ops_logger import ops_log
 
 
 def _get_env(key: str, default: str = "") -> str:
@@ -100,12 +101,13 @@ class StorageClient:
         logger = logging.getLogger(__name__)
         logger.info(f"Uploading {len(data)} bytes to S3: {self.bucket}/{key}")
         
-        self.client.put_object(
-            Bucket=self.bucket,
-            Key=key,
-            Body=data,
-            ContentType=content_type,
-        )
+        with ops_log.operation("s3_put_object", extra={"key": key, "size": len(data), "bucket": self.bucket}):
+            self.client.put_object(
+                Bucket=self.bucket,
+                Key=key,
+                Body=data,
+                ContentType=content_type,
+            )
         logger.info(f"Upload complete: {self._object_url(key)}")
         return self._object_url(key)
 
@@ -123,7 +125,8 @@ class StorageClient:
         extra_args = {}
         if content_type:
             extra_args["ContentType"] = content_type
-        self.client.upload_file(local_path, self.bucket, key, ExtraArgs=extra_args or None)
+        with ops_log.operation("s3_upload_file", extra={"key": key, "local_path": local_path}):
+            self.client.upload_file(local_path, self.bucket, key, ExtraArgs=extra_args or None)
         return self._object_url(key)
 
     def upload_wav(self, wav_bytes: bytes, job_id: str, filename: Optional[str] = None, prefix: Optional[str] = None) -> str:
@@ -156,12 +159,14 @@ class StorageClient:
 
     def download_bytes(self, key: str) -> bytes:
         """Download an object as bytes."""
-        response = self.client.get_object(Bucket=self.bucket, Key=key)
-        return response["Body"].read()
+        with ops_log.operation("s3_get_object", extra={"key": key}):
+            response = self.client.get_object(Bucket=self.bucket, Key=key)
+            return response["Body"].read()
 
     def download_file(self, key: str, local_path: str):
         """Download an object to a local file."""
-        self.client.download_file(self.bucket, key, local_path)
+        with ops_log.operation("s3_download_file", extra={"key": key, "local_path": local_path}):
+            self.client.download_file(self.bucket, key, local_path)
 
     # -- List / Delete --------------------------------------------------------
 
@@ -180,7 +185,8 @@ class StorageClient:
 
     def delete_object(self, key: str):
         """Delete an object."""
-        self.client.delete_object(Bucket=self.bucket, Key=key)
+        with ops_log.operation("s3_delete_object", extra={"key": key}):
+            self.client.delete_object(Bucket=self.bucket, Key=key)
 
     def copy_object(self, source_key: str, dest_key: str):
         """Copy an object within the bucket."""

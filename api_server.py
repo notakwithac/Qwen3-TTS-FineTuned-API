@@ -8,9 +8,11 @@ import logging
 import os
 import re
 import tempfile
+import time
+import uuid
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
@@ -57,6 +59,43 @@ app = FastAPI(
     version="2.0.0",
     lifespan=_lifespan,
 )
+
+# ---------------------------------------------------------------------------
+# Middleware: Request Logging
+# ---------------------------------------------------------------------------
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log every incoming request and its response status/duration."""
+    request_id = uuid.uuid4().hex[:8]
+    method = request.method
+    url = str(request.url)
+    client_host = request.client.host if request.client else "unknown"
+    
+    # We use ops_log to track the API call duration
+    op = ops_log.start("api_request", extra={
+        "req_id": request_id,
+        "method": method,
+        "url": url,
+        "client": client_host,
+    })
+    
+    start_time = time.time()
+    try:
+        response = await call_next(request)
+        duration = time.time() - start_time
+        
+        ops_log.end(op, extra={
+            "status_code": response.status_code,
+            "duration": round(duration, 3)
+        })
+        return response
+    except Exception as e:
+        duration = time.time() - start_time
+        ops_log.fail(op, str(e), extra={
+            "duration": round(duration, 3)
+        })
+        raise
 
 # GPU configuration
 DEVICE = os.environ.get("DEVICE", "cuda:0")

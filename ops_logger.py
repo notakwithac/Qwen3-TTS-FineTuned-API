@@ -157,6 +157,21 @@ class OpsLogger:
 
         logger.error(record._log_line("FAIL"))
 
+    def log_event(
+        self,
+        event_name: str,
+        job_id: Optional[str] = None,
+        extra: Optional[Dict[str, Any]] = None,
+        level: int = logging.INFO,
+    ):
+        """Log a structured one-off event (no duration)."""
+        op_id = uuid.uuid4().hex[:8]
+        # We reuse OperationRecord primarily for its _log_line formatting
+        record = OperationRecord(event_name, op_id, job_id, extra)
+        record.status = "event"
+        line = record._log_line("EVENT")
+        logger.log(level, line)
+
     @contextmanager
     def operation(
         self,

@@ -105,6 +105,7 @@ class InferenceManager:
     def max_models(self, value: int):
         with self._lock:
             self._max_models = value
+            ops_log.log_event("max_models_updated", extra={"new_value": value})
             self._enforce_cache_size()
 
     @property
@@ -181,6 +182,7 @@ class InferenceManager:
                         f"GPU idle for {elapsed:.0f}s (timeout={self._idle_timeout}s). "
                         f"Unloading all {self.loaded_count} models."
                     )
+                    ops_log.log_event("gpu_idle_timeout", extra={"elapsed": round(elapsed, 1), "loaded_count": self.loaded_count})
                     self._unload_all_unsafe()
 
     def _touch(self):
@@ -256,9 +258,10 @@ class InferenceManager:
             
             # Speed up inference using torch.compile (requires Torch 2.0+)
             if self._compile:
-                logger.info("Compiling model for faster inference (this may take a few minutes)...")
-                # We compile the underlying Qwen3TTSForConditionalGeneration model
-                model.model = torch.compile(model.model, mode="default")
+                with ops_log.operation("model_compile", extra={"path": path}):
+                    logger.info("Compiling model for faster inference (this may take a few minutes)...")
+                    # We compile the underlying Qwen3TTSForConditionalGeneration model
+                    model.model = torch.compile(model.model, mode="default")
             
             self._models[path] = (model, model_type, speaker_name)
             self._last_path = path
@@ -290,6 +293,7 @@ class InferenceManager:
                 model_tuple = self._models.pop(path)
                 model, mtype, _ = model_tuple
                 logger.info(f"LRU Eviction: Unloading {mtype} model from {path}")
+                ops_log.log_event("model_eviction", extra={"path": path, "type": mtype})
                 del model
                 self._total_unloads += 1
                 evicted = True
@@ -499,11 +503,12 @@ class InferenceManager:
             instructs = [""] * len(texts)
 
         # Acquire semaphore FIRST to limit concurrent model usage to max_models
-        with self._inference_semaphore:
-            with self._lock:
-                model, spk = self._get_model(checkpoint_path, "custom_voice", speaker_name)
-                self._mark_in_use(checkpoint_path)
-                self._total_requests += len(texts)
+        with ops_log.operation("gpu_semaphore_wait", extra={"checkpoint": checkpoint_path}):
+            with self._inference_semaphore:
+                with self._lock:
+                    model, spk = self._get_model(checkpoint_path, "custom_voice", speaker_name)
+                    self._mark_in_use(checkpoint_path)
+                    self._total_requests += len(texts)
 
             try:
                 with self._track_active():
@@ -547,11 +552,12 @@ class InferenceManager:
         instruct: str = "",
     ) -> tuple[bytes, int]:
         """Generate speech using CustomVoice model. Auto-loads if not in cache."""
-        with self._inference_semaphore:
-            with self._lock:
-                model, spk = self._get_model(checkpoint_path, "custom_voice", speaker_name)
-                self._mark_in_use(checkpoint_path)
-                self._total_requests += 1
+        with ops_log.operation("gpu_semaphore_wait", extra={"checkpoint": checkpoint_path}):
+            with self._inference_semaphore:
+                with self._lock:
+                    model, spk = self._get_model(checkpoint_path, "custom_voice", speaker_name)
+                    self._mark_in_use(checkpoint_path)
+                    self._total_requests += 1
 
             try:
                 with self._track_active():
@@ -593,11 +599,12 @@ class InferenceManager:
         if not languages:
             languages = ["English"] * len(texts)
 
-        with self._inference_semaphore:
-            with self._lock:
-                model, _ = self._get_model(VOICE_DESIGN_MODEL, "voice_design")
-                self._mark_in_use(VOICE_DESIGN_MODEL)
-                self._total_requests += len(texts)
+        with ops_log.operation("gpu_semaphore_wait", extra={"model": "voice_design"}):
+            with self._inference_semaphore:
+                with self._lock:
+                    model, _ = self._get_model(VOICE_DESIGN_MODEL, "voice_design")
+                    self._mark_in_use(VOICE_DESIGN_MODEL)
+                    self._total_requests += len(texts)
 
             try:
                 with self._track_active():
@@ -635,11 +642,12 @@ class InferenceManager:
         language: str = "English",
     ) -> tuple[bytes, int]:
         """Generate speech using VoiceDesign model."""
-        with self._inference_semaphore:
-            with self._lock:
-                model, _ = self._get_model(VOICE_DESIGN_MODEL, "voice_design")
-                self._mark_in_use(VOICE_DESIGN_MODEL)
-                self._total_requests += 1
+        with ops_log.operation("gpu_semaphore_wait", extra={"model": "voice_design"}):
+            with self._inference_semaphore:
+                with self._lock:
+                    model, _ = self._get_model(VOICE_DESIGN_MODEL, "voice_design")
+                    self._mark_in_use(VOICE_DESIGN_MODEL)
+                    self._total_requests += 1
 
             try:
                 with self._track_active():
@@ -682,11 +690,12 @@ class InferenceManager:
         if not languages:
             languages = ["English"] * len(texts)
 
-        with self._inference_semaphore:
-            with self._lock:
-                model, _ = self._get_model(VOICE_CLONE_MODEL, "voice_clone")
-                self._mark_in_use(VOICE_CLONE_MODEL)
-                self._total_requests += len(texts)
+        with ops_log.operation("gpu_semaphore_wait", extra={"model": "voice_clone"}):
+            with self._inference_semaphore:
+                with self._lock:
+                    model, _ = self._get_model(VOICE_CLONE_MODEL, "voice_clone")
+                    self._mark_in_use(VOICE_CLONE_MODEL)
+                    self._total_requests += len(texts)
 
             try:
                 with self._track_active():
