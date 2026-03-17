@@ -2018,7 +2018,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 text_embed = torch.cat([text_embed] + [tts_pad_embed] * (codec_lens - text_lens), dim=1)
                 return text_embed + codec_embed, tts_pad_embed
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def generate(
         self,
         input_ids: Optional[list[torch.Tensor]] = None,

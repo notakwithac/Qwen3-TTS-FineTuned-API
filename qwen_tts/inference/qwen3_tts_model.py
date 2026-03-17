@@ -466,7 +466,7 @@ class Qwen3TTSModel:
         )
 
     # voice clone model
-    @torch.no_grad()
+    @torch.inference_mode()
     def generate_voice_clone(
         self,
         text: Union[str, List[str]],
@@ -633,7 +633,7 @@ class Qwen3TTSModel:
         return wavs_out, fs
 
     # voice design model
-    @torch.no_grad()
+    @torch.inference_mode()
     def generate_voice_design(
         self,
         text: Union[str, List[str]],
@@ -728,7 +728,7 @@ class Qwen3TTSModel:
         return wavs, fs
 
     # custom voice model
-    @torch.no_grad()
+    @torch.inference_mode()
     def generate_custom_voice(
         self,
         text: Union[str, List[str]],

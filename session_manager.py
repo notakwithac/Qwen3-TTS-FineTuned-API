@@ -204,6 +204,8 @@ class CharacterWorker:
 
     async def _process_batch(self, batch: List[InferenceMessage], loop: asyncio.AbstractEventLoop):
         """Run inference on a batch and upload results."""
+        # Sort by text length to minimize padding waste in left-padded batching
+        batch.sort(key=lambda m: len(m.text))
         texts = [m.text for m in batch]
         languages = [m.language for m in batch]
         instructs = [m.instruct for m in batch]

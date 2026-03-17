@@ -13,6 +13,7 @@ import threading
 import time
 import asyncio
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Dict
 
 import soundfile as sf
@@ -261,7 +262,7 @@ class InferenceManager:
                 with ops_log.operation("model_compile", extra={"path": path}):
                     logger.info("Compiling model for faster inference (this may take a few minutes)...")
                     # We compile the underlying Qwen3TTSForConditionalGeneration model
-                    model.model = torch.compile(model.model, mode="default")
+                    model.model = torch.compile(model.model, mode="reduce-overhead")
             
             self._models[path] = (model, model_type, speaker_name)
             self._last_path = path
@@ -413,7 +414,7 @@ class InferenceManager:
 
                 if self._compile:
                     logger.info(f"Compiling model {cache_key}...")
-                    model.model = torch.compile(model.model, mode="default")
+                    model.model = torch.compile(model.model, mode="reduce-overhead")
 
                 self._models[cache_key] = (model, "custom_voice", speaker_name)
                 self._last_path = cache_key
@@ -488,6 +489,17 @@ class InferenceManager:
 
     # -- CustomVoice inference ------------------------------------------------
 
+    # Thread pool for CPU-bound WAV encoding (shared across all generate methods)
+    _wav_pool = ThreadPoolExecutor(max_workers=4)
+
+    @staticmethod
+    def _encode_wav(wav, sr) -> bytes:
+        """Encode a numpy waveform to WAV bytes (CPU-bound, off GPU thread)."""
+        buf = io.BytesIO()
+        sf.write(buf, wav, sr, format="WAV")
+        buf.seek(0)
+        return buf.read()
+
     def generate_batch(
         self,
         texts: list[str],
@@ -528,12 +540,10 @@ class InferenceManager:
                             instruct=instructs,
                         )
 
-                        results = []
-                        for wav in wavs_list:
-                            buf = io.BytesIO()
-                            sf.write(buf, wav, sr, format="WAV")
-                            buf.seek(0)
-                            results.append(buf.read())
+                        # Encode WAVs in parallel on CPU threads (frees GPU thread)
+                        results = list(self._wav_pool.map(
+                            lambda w: self._encode_wav(w, sr), wavs_list
+                        ))
 
                         ops_log.end(op, extra={"sample_rate": sr})
                         logger.info(f"Speaker '{spk}' finished saying {len(texts)} texts.")
@@ -579,10 +589,7 @@ class InferenceManager:
                             instruct=instruct if instruct else None,
                         )
 
-                        buf = io.BytesIO()
-                        sf.write(buf, wavs[0], sr, format="WAV")
-                        buf.seek(0)
-                        result = buf.read()
+                        result = self._encode_wav(wavs[0], sr)
                         ops_log.end(op, extra={"audio_bytes": len(result), "sample_rate": sr})
                         return result, sr
                     except Exception as e:
@@ -626,12 +633,10 @@ class InferenceManager:
                             language=languages,
                         )
 
-                        results = []
-                        for wav in wavs_list:
-                            buf = io.BytesIO()
-                            sf.write(buf, wav, sr, format="WAV")
-                            buf.seek(0)
-                            results.append(buf.read())
+                        # Encode WAVs in parallel on CPU threads (frees GPU thread)
+                        results = list(self._wav_pool.map(
+                            lambda w: self._encode_wav(w, sr), wavs_list
+                        ))
 
                         ops_log.end(op, extra={"sample_rate": sr})
                         logger.info(f"VoiceDesign finished for {len(texts)} texts.")
@@ -674,10 +679,7 @@ class InferenceManager:
                             language=language,
                         )
 
-                        buf = io.BytesIO()
-                        sf.write(buf, wavs[0], sr, format="WAV")
-                        buf.seek(0)
-                        result = buf.read()
+                        result = self._encode_wav(wavs[0], sr)
                         ops_log.end(op, extra={"audio_bytes": len(result), "sample_rate": sr})
                         return result, sr
                     except Exception as e:
@@ -725,12 +727,10 @@ class InferenceManager:
                             x_vector_only_mode=x_vector_only_mode,
                         )
 
-                        results = []
-                        for wav in wavs_list:
-                            buf = io.BytesIO()
-                            sf.write(buf, wav, sr, format="WAV")
-                            buf.seek(0)
-                            results.append(buf.read())
+                        # Encode WAVs in parallel on CPU threads (frees GPU thread)
+                        results = list(self._wav_pool.map(
+                            lambda w: self._encode_wav(w, sr), wavs_list
+                        ))
 
                         ops_log.end(op, extra={"sample_rate": sr})
                         logger.info(f"VoiceClone finished for {len(texts)} texts.")

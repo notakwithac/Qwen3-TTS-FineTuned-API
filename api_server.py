@@ -29,9 +29,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Suppress noisy model initialization logs
-logging.getLogger("qwen_tts.core.models.configuration_qwen3_tts").setLevel(logging.WARNING)
-logging.getLogger("transformers").setLevel(logging.WARNING)
-logging.getLogger("transformers.modeling_utils").setLevel(logging.WARNING)
+logging.getLogger("qwen_tts.core.models.configuration_qwen3_tts").setLevel(logging.ERROR)
+logging.getLogger("qwen_tts.core.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2").setLevel(logging.ERROR)
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("transformers.modeling_utils").setLevel(logging.ERROR)
+logging.getLogger("transformers.generation.utils").setLevel(logging.ERROR)
 
 # ---------------------------------------------------------------------------
 # App setup
