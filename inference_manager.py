@@ -504,11 +504,12 @@ class InferenceManager:
 
         # Acquire semaphore FIRST to limit concurrent model usage to max_models
         with ops_log.operation("gpu_semaphore_wait", extra={"checkpoint": checkpoint_path}):
-            with self._inference_semaphore:
-                with self._lock:
-                    model, spk = self._get_model(checkpoint_path, "custom_voice", speaker_name)
-                    self._mark_in_use(checkpoint_path)
-                    self._total_requests += len(texts)
+            self._inference_semaphore.acquire()
+        try:
+            with self._lock:
+                model, spk = self._get_model(checkpoint_path, "custom_voice", speaker_name)
+                self._mark_in_use(checkpoint_path)
+                self._total_requests += len(texts)
 
             try:
                 with self._track_active():
@@ -542,6 +543,8 @@ class InferenceManager:
                         raise
             finally:
                 self._mark_released(checkpoint_path)
+        finally:
+            self._inference_semaphore.release()
 
     def generate(
         self,
@@ -553,11 +556,12 @@ class InferenceManager:
     ) -> tuple[bytes, int]:
         """Generate speech using CustomVoice model. Auto-loads if not in cache."""
         with ops_log.operation("gpu_semaphore_wait", extra={"checkpoint": checkpoint_path}):
-            with self._inference_semaphore:
-                with self._lock:
-                    model, spk = self._get_model(checkpoint_path, "custom_voice", speaker_name)
-                    self._mark_in_use(checkpoint_path)
-                    self._total_requests += 1
+            self._inference_semaphore.acquire()
+        try:
+            with self._lock:
+                model, spk = self._get_model(checkpoint_path, "custom_voice", speaker_name)
+                self._mark_in_use(checkpoint_path)
+                self._total_requests += 1
 
             try:
                 with self._track_active():
@@ -586,6 +590,8 @@ class InferenceManager:
                         raise
             finally:
                 self._mark_released(checkpoint_path)
+        finally:
+            self._inference_semaphore.release()
 
     # -- VoiceDesign inference ------------------------------------------------
 
@@ -600,11 +606,12 @@ class InferenceManager:
             languages = ["English"] * len(texts)
 
         with ops_log.operation("gpu_semaphore_wait", extra={"model": "voice_design"}):
-            with self._inference_semaphore:
-                with self._lock:
-                    model, _ = self._get_model(VOICE_DESIGN_MODEL, "voice_design")
-                    self._mark_in_use(VOICE_DESIGN_MODEL)
-                    self._total_requests += len(texts)
+            self._inference_semaphore.acquire()
+        try:
+            with self._lock:
+                model, _ = self._get_model(VOICE_DESIGN_MODEL, "voice_design")
+                self._mark_in_use(VOICE_DESIGN_MODEL)
+                self._total_requests += len(texts)
 
             try:
                 with self._track_active():
@@ -634,6 +641,8 @@ class InferenceManager:
                         raise
             finally:
                 self._mark_released(VOICE_DESIGN_MODEL)
+        finally:
+            self._inference_semaphore.release()
 
     def generate_voice_design(
         self,
@@ -643,11 +652,12 @@ class InferenceManager:
     ) -> tuple[bytes, int]:
         """Generate speech using VoiceDesign model."""
         with ops_log.operation("gpu_semaphore_wait", extra={"model": "voice_design"}):
-            with self._inference_semaphore:
-                with self._lock:
-                    model, _ = self._get_model(VOICE_DESIGN_MODEL, "voice_design")
-                    self._mark_in_use(VOICE_DESIGN_MODEL)
-                    self._total_requests += 1
+            self._inference_semaphore.acquire()
+        try:
+            with self._lock:
+                model, _ = self._get_model(VOICE_DESIGN_MODEL, "voice_design")
+                self._mark_in_use(VOICE_DESIGN_MODEL)
+                self._total_requests += 1
 
             try:
                 with self._track_active():
@@ -675,6 +685,8 @@ class InferenceManager:
                         raise
             finally:
                 self._mark_released(VOICE_DESIGN_MODEL)
+        finally:
+            self._inference_semaphore.release()
 
     # -- VoiceClone inference -------------------------------------------------
 
@@ -691,11 +703,12 @@ class InferenceManager:
             languages = ["English"] * len(texts)
 
         with ops_log.operation("gpu_semaphore_wait", extra={"model": "voice_clone"}):
-            with self._inference_semaphore:
-                with self._lock:
-                    model, _ = self._get_model(VOICE_CLONE_MODEL, "voice_clone")
-                    self._mark_in_use(VOICE_CLONE_MODEL)
-                    self._total_requests += len(texts)
+            self._inference_semaphore.acquire()
+        try:
+            with self._lock:
+                model, _ = self._get_model(VOICE_CLONE_MODEL, "voice_clone")
+                self._mark_in_use(VOICE_CLONE_MODEL)
+                self._total_requests += len(texts)
 
             try:
                 with self._track_active():
@@ -727,6 +740,8 @@ class InferenceManager:
                         raise
             finally:
                 self._mark_released(VOICE_CLONE_MODEL)
+        finally:
+            self._inference_semaphore.release()
 
     def generate_to_file(
         self,

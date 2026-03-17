@@ -536,42 +536,17 @@ async def infer(job_id: str, req: InferRequest):
     pipeline.touch_job(job_id) # Update LRU timestamp
     pipeline._cleanup_disk_lru(30.0) # Background check usage
 
-    # Enhanced Fast-path check: check primary path FIRST, then migration path fallback
+    # Enhanced Fast-path check
     s3_key_found = None
     if req.upload_to_s3 and not req.overwrite and req.s3_filename and storage.is_configured:
-        char_id = req.character_id or job.character_id
-        
-        # 1. Proper path (character-specific)
-        if req.book_id and req.chapter_id and char_id:
-            proper_key = f"audio/segments/{req.book_id}/{req.chapter_id}/{char_id}/{req.s3_filename}"
+        if req.book_id and req.chapter_id:
+            proper_key = f"audio/segments/{req.book_id}/{req.chapter_id}/{req.s3_filename}"
             if storage.object_exists(proper_key):
                 s3_key_found = proper_key
-        
-        # 2. Legacy segment path (no character_id)
-        if not s3_key_found and req.book_id and req.chapter_id:
-            legacy_segment_key = f"audio/segments/{req.book_id}/{req.chapter_id}/{req.s3_filename}"
-            if storage.object_exists(legacy_segment_key):
-                if char_id:
-                    # Migrate!
-                    proper_key = f"audio/segments/{req.book_id}/{req.chapter_id}/{char_id}/{req.s3_filename}"
-                    logger.info(f"Migrating {legacy_segment_key} -> {proper_key}")
-                    storage.move_object(legacy_segment_key, proper_key)
-                    s3_key_found = proper_key
-                else:
-                    s3_key_found = legacy_segment_key
-        
-        # 3. Fallback path (job-level)
-        if not s3_key_found:
-            job_key = f"audio/{job_id}/{req.s3_filename}"
-            if storage.object_exists(job_key):
-                if req.book_id and req.chapter_id and char_id:
-                    # Migrate!
-                    proper_key = f"audio/segments/{req.book_id}/{req.chapter_id}/{char_id}/{req.s3_filename}"
-                    logger.info(f"Migrating {job_key} -> {proper_key}")
-                    storage.move_object(job_key, proper_key)
-                    s3_key_found = proper_key
-                else:
-                    s3_key_found = job_key
+        else:
+            legacy_key = f"audio/{job_id}/{req.s3_filename}"
+            if storage.object_exists(legacy_key):
+                s3_key_found = legacy_key
 
     if s3_key_found:
         presigned_url = storage.get_presigned_url(s3_key_found, expires_in=86400)
@@ -608,8 +583,8 @@ async def infer(job_id: str, req: InferRequest):
     # If upload_to_s3 is True (default), return JSON URL
     if req.upload_to_s3:
         # Construct S3 prefix based on user's structure decision
-        char_id = req.character_id or job.character_id
-        s3_prefix = f"audio/segments/{req.book_id}/{req.chapter_id}/{char_id}" if (req.book_id and req.chapter_id and char_id) else (f"audio/segments/{req.book_id}/{req.chapter_id}" if req.book_id and req.chapter_id else f"audio/{job_id}")
+        session_code = uuid.uuid4().hex[:8]
+        s3_prefix = f"audio/segments/{req.book_id}/{req.chapter_id}" if (req.book_id and req.chapter_id) else f"audio/{session_code}/{job_id}"
         
         with ops_log.operation("s3_upload", job_id=job_id):
             s3_url = storage.upload_wav(wav_bytes, job_id, filename=req.s3_filename, prefix=s3_prefix)
@@ -700,8 +675,8 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
             overwrite = item.get("overwrite", req.overwrite)
             
             # Construct S3 prefix for the upload phase
-            char_id = item.get("character_id", req.character_id or job.character_id)
-            s3_prefix = f"audio/segments/{req.book_id}/{req.chapter_id}/{char_id}" if (req.book_id and req.chapter_id and char_id) else (f"audio/segments/{req.book_id}/{req.chapter_id}" if req.book_id and req.chapter_id else f"audio/{job_id}")
+            session_code = uuid.uuid4().hex[:8]
+            s3_prefix = f"audio/segments/{req.book_id}/{req.chapter_id}" if (req.book_id and req.chapter_id) else f"audio/{session_code}/{job_id}"
 
             # Enhanced Fast-path check
             s3_key_found = None
@@ -709,37 +684,14 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
                 # We must use thread executor since boto3 is blocking
                 loop = asyncio.get_running_loop()
                 
-                # 1. Proper path (character-specific)
-                if req.book_id and req.chapter_id and char_id:
-                    proper_key = f"audio/segments/{req.book_id}/{req.chapter_id}/{char_id}/{filename}"
+                if req.book_id and req.chapter_id:
+                    proper_key = f"audio/segments/{req.book_id}/{req.chapter_id}/{filename}"
                     if await loop.run_in_executor(None, storage.object_exists, proper_key):
                         s3_key_found = proper_key
-
-                # 2. Legacy segment path (no character_id)
-                if not s3_key_found and req.book_id and req.chapter_id:
-                    legacy_segment_key = f"audio/segments/{req.book_id}/{req.chapter_id}/{filename}"
-                    if await loop.run_in_executor(None, storage.object_exists, legacy_segment_key):
-                        if char_id:
-                            # Migrate!
-                            proper_key = f"audio/segments/{req.book_id}/{req.chapter_id}/{char_id}/{filename}"
-                            logger.info(f"Migrating {legacy_segment_key} -> {proper_key}")
-                            await loop.run_in_executor(None, storage.move_object, legacy_segment_key, proper_key)
-                            s3_key_found = proper_key
-                        else:
-                            s3_key_found = legacy_segment_key
-                
-                # 3. Fallback path (job-level)
-                if not s3_key_found:
-                    job_key = f"audio/{job_id}/{filename}"
-                    if await loop.run_in_executor(None, storage.object_exists, job_key):
-                        if req.book_id and req.chapter_id and char_id:
-                            # Migrate!
-                            proper_key = f"audio/segments/{req.book_id}/{req.chapter_id}/{char_id}/{filename}"
-                            logger.info(f"Migrating {job_key} -> {proper_key}")
-                            await loop.run_in_executor(None, storage.move_object, job_key, proper_key)
-                            s3_key_found = proper_key
-                        else:
-                            s3_key_found = job_key
+                else:
+                    legacy_key = f"audio/{job_id}/{filename}"
+                    if await loop.run_in_executor(None, storage.object_exists, legacy_key):
+                        s3_key_found = legacy_key
 
             if s3_key_found:
                 loop = asyncio.get_running_loop()
