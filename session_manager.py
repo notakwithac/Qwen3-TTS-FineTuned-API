@@ -136,6 +136,7 @@ class CharacterWorker:
         self.progress = progress or CharacterProgress()
         self._task: Optional[asyncio.Task] = None
         self._running = False
+        self._in_batch = False
 
     def start(self):
         """Start the worker coroutine."""
@@ -146,12 +147,25 @@ class CharacterWorker:
     async def stop(self):
         """Gracefully stop the worker."""
         self._running = False
-        if self._task and not self._task.done():
-            self._task.cancel()
+        
+        # Empty the queue so we don't process any more items
+        while not self.queue.empty():
             try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+                self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+                
+        if self._task and not self._task.done():
+            # Only cancel if it's polling the queue and NOT in the middle of a GPU generation.
+            # Cancelling mid-generation drops the results and aborts the S3 upload.
+            if getattr(self, '_in_batch', False):
+                logger.info(f"Worker {self.worker_id} detaching to finish active batch in background")
+            else:
+                self._task.cancel()
+                try:
+                    await self._task
+                except asyncio.CancelledError:
+                    pass
         logger.info(f"Worker {self.worker_id} stopped")
 
     async def _run(self):
@@ -204,60 +218,64 @@ class CharacterWorker:
 
     async def _process_batch(self, batch: List[InferenceMessage], loop: asyncio.AbstractEventLoop):
         """Run inference on a batch and upload results."""
-        # Sort by text length to minimize padding waste in left-padded batching
-        batch.sort(key=lambda m: len(m.text))
-        texts = [m.text for m in batch]
-        languages = [m.language for m in batch]
-        instructs = [m.instruct for m in batch]
-
-        op = ops_log.start("session_worker_batch", extra={
-            "worker_id": self.worker_id,
-            "batch_size": len(batch),
-            "cache_key": self.cache_key,
-        })
-
+        self._in_batch = True
         try:
-            # Run blocking inference in executor
-            wav_bytes_list, sr = await loop.run_in_executor(
-                None,
-                lambda: self.inference.generate_batch(
-                    texts=texts,
-                    checkpoint_path=self.cache_key,
-                    speaker_name=self.speaker_name,
-                    languages=languages,
-                    instructs=instructs,
+            # Sort by text length to minimize padding waste in left-padded batching
+            batch.sort(key=lambda m: len(m.text))
+            texts = [m.text for m in batch]
+            languages = [m.language for m in batch]
+            instructs = [m.instruct for m in batch]
+
+            op = ops_log.start("session_worker_batch", extra={
+                "worker_id": self.worker_id,
+                "batch_size": len(batch),
+                "cache_key": self.cache_key,
+            })
+
+            try:
+                # Run blocking inference in executor
+                wav_bytes_list, sr = await loop.run_in_executor(
+                    None,
+                    lambda: self.inference.generate_batch(
+                        texts=texts,
+                        checkpoint_path=self.cache_key,
+                        speaker_name=self.speaker_name,
+                        languages=languages,
+                        instructs=instructs,
+                    )
                 )
-            )
 
-            # Upload results to S3 (parallel)
-            upload_tasks = []
-            for i, msg in enumerate(batch):
-                if self.storage and self.storage.is_configured and msg.s3_filename:
-                    s3_prefix = (
-                        f"audio/segments/{msg.book_id}/{msg.chapter_id}/{msg.character_id}"
-                        if msg.book_id and msg.chapter_id and msg.character_id
-                        else (
-                            f"audio/segments/{msg.book_id}/{msg.chapter_id}"
-                            if msg.book_id and msg.chapter_id
-                            else f"audio/{msg.job_id}"
+                # Upload results to S3 (parallel)
+                upload_tasks = []
+                for i, msg in enumerate(batch):
+                    if self.storage and self.storage.is_configured and msg.s3_filename:
+                        s3_prefix = (
+                            f"audio/segments/{msg.book_id}/{msg.chapter_id}/{msg.character_id}"
+                            if msg.book_id and msg.chapter_id and msg.character_id
+                            else (
+                                f"audio/segments/{msg.book_id}/{msg.chapter_id}"
+                                if msg.book_id and msg.chapter_id
+                                else f"audio/{msg.job_id}"
+                            )
                         )
-                    )
-                    upload_tasks.append(
-                        self._upload_single(loop, wav_bytes_list[i], msg, s3_prefix, sr)
-                    )
-                else:
-                    # No S3 upload — just record completion
-                    self.progress.completed += 1
+                        upload_tasks.append(
+                            self._upload_single(loop, wav_bytes_list[i], msg, s3_prefix, sr)
+                        )
+                    else:
+                        # No S3 upload — just record completion
+                        self.progress.completed += 1
 
-            if upload_tasks:
-                await asyncio.gather(*upload_tasks)
+                if upload_tasks:
+                    await asyncio.gather(*upload_tasks)
 
-            ops_log.end(op, extra={"completed": len(batch)})
+                ops_log.end(op, extra={"completed": len(batch)})
 
-        except Exception as e:
-            logger.error(f"Worker {self.worker_id} batch failed: {e}")
-            ops_log.fail(op, str(e))
-            self.progress.failed += len(batch)
+            except Exception as e:
+                logger.error(f"Worker {self.worker_id} batch failed: {e}")
+                ops_log.fail(op, str(e))
+                self.progress.failed += len(batch)
+        finally:
+            self._in_batch = False
 
     async def _upload_single(
         self, loop: asyncio.AbstractEventLoop, wav_bytes: bytes,
