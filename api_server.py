@@ -10,6 +10,7 @@ import re
 import tempfile
 import time
 import uuid
+import asyncio
 from typing import Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, Request
@@ -661,7 +662,6 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
     pipeline.touch_job(job_id)
     pipeline._cleanup_disk_lru(30.0)
 
-    import asyncio
     from functools import partial
 
     # Create a Semaphore to limit concurrent S3 checks and generation launching
@@ -804,7 +804,6 @@ async def voice_clone_batch(req: VoiceCloneBatchRequest):
     
     s3_prefix = "audio/voice_clone"
     
-    import asyncio
     loop = asyncio.get_running_loop()
 
     if not req.overwrite and req.upload_to_s3 and storage.is_configured:
@@ -1030,7 +1029,6 @@ async def voice_design_batch(req: VoiceDesignBatchRequest):
     if req.upload_to_s3 and not storage.is_configured:
         raise HTTPException(status_code=503, detail="Storage not configured.")
 
-    import asyncio
     from functools import partial
 
     concurrency_limit = asyncio.Semaphore(MAX_CONCURRENT_VOICE_DESIGNS)

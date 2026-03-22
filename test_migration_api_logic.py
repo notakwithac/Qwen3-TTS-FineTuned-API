@@ -23,7 +23,7 @@ async def test_migration_logic():
     
     # 1. Test migration from job path to proper path
     job_key = f"audio/{job_id}/{filename}"
-    proper_key = f"audio/segments/{book_id}/{chapter_id}/{char_id}/{filename}"
+    proper_key = f"audio/segments/{book_id}/{chapter_id}/{filename}"
     
     print(f"Uploading to legacy job path: {job_key}")
     storage.upload_bytes(test_content, job_key)
@@ -52,31 +52,26 @@ async def test_migration_logic():
     if req.upload_to_s3 and not req.overwrite and req.s3_filename and storage.is_configured:
         current_char_id = req.character_id or job.character_id
         
-        # 1. Proper path (character-specific)
-        if req.book_id and req.chapter_id and current_char_id:
-            pk = f"audio/segments/{req.book_id}/{req.chapter_id}/{current_char_id}/{req.s3_filename}"
+        # 1. Proper path (No character-specific)
+        if req.book_id and req.chapter_id:
+            pk = f"audio/segments/{req.book_id}/{req.chapter_id}/{req.s3_filename}"
             if storage.object_exists(pk):
                 print(f"Found at proper path: {pk}")
                 s3_key_found = pk
         
-        # 2. Legacy segment path (no character_id)
+        # 2. Legacy segment path (no migration needed now)
+        # (This section is kept for backwards compatibility if needed, but simplified)
         if not s3_key_found and req.book_id and req.chapter_id:
             lsk = f"audio/segments/{req.book_id}/{req.chapter_id}/{req.s3_filename}"
             if storage.object_exists(lsk):
-                if current_char_id:
-                    pk = f"audio/segments/{req.book_id}/{req.chapter_id}/{current_char_id}/{req.s3_filename}"
-                    print(f"Migrating {lsk} -> {pk}")
-                    storage.move_object(lsk, pk)
-                    s3_key_found = pk
-                else:
-                    s3_key_found = lsk
+                s3_key_found = lsk
         
         # 3. Fallback path (job-level)
         if not s3_key_found:
             jk = f"audio/{job_id}/{req.s3_filename}"
             if storage.object_exists(jk):
-                if req.book_id and req.chapter_id and current_char_id:
-                    pk = f"audio/segments/{req.book_id}/{req.chapter_id}/{current_char_id}/{req.s3_filename}"
+                if req.book_id and req.chapter_id:
+                    pk = f"audio/segments/{req.book_id}/{req.chapter_id}/{req.s3_filename}"
                     print(f"Migrating {jk} -> {pk}")
                     storage.move_object(jk, pk)
                     s3_key_found = pk

@@ -2083,105 +2083,128 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         trailing_text_hiddens = []
         if speakers is None:
             speakers = [None] * len(input_ids)
-        for index, (input_id, language, speaker) in enumerate(zip(input_ids, languages, speakers)):
-            if voice_clone_spk_embeds is None:
-                if speaker == "" or speaker == None: # Instruct create speaker
-                    speaker_embed = None
-                else:
-                    if speaker.lower() not in self.config.talker_config.spk_id:
-                        raise NotImplementedError(f"Speaker {speaker} not implemented")
-                    else:
-                        spk_id = self.config.talker_config.spk_id[speaker.lower()]
-                        speaker_embed = self.talker.get_input_embeddings()(
-                                            torch.tensor(
-                                                spk_id,
-                                                device=self.talker.device,
-                                                dtype=input_id.dtype,
-                                            )
-                                        )
-            else:
-                if voice_clone_prompt["x_vector_only_mode"][index] or voice_clone_prompt["icl_mode"][index]:
-                    speaker_embed = voice_clone_spk_embeds[index]
-                else:
-                    speaker_embed = None
-
-            assert language is not None
-
-            if language.lower() == "auto":
-                language_id = None
-            else:
-                if language.lower() not in self.config.talker_config.codec_language_id:
-                    raise NotImplementedError(f"Language {language} not implemented")
-                else:
-                    language_id = self.config.talker_config.codec_language_id[language.lower()]
             
-            if (language.lower() in ["chinese", "auto"] and \
-                   speaker != "" and speaker is not None and \
-                     self.config.talker_config.spk_is_dialect[speaker.lower()] != False):
-                dialect = self.config.talker_config.spk_is_dialect[speaker.lower()]
-                language_id = self.config.talker_config.codec_language_id[dialect]
-            
-            tts_bos_embed, tts_eos_embed, tts_pad_embed = self.talker.text_projection(
-                self.talker.get_text_embeddings()(
-                    torch.tensor(
-                        [[self.config.tts_bos_token_id, self.config.tts_eos_token_id, self.config.tts_pad_token_id]],
-                        device=self.talker.device,
-                        dtype=input_id.dtype,
-                    )
+        # Hoist constant embeddings (Optimization #7)
+        first_dtype = input_ids[0].dtype if input_ids else torch.float32
+        tts_bos_embed, tts_eos_embed, tts_pad_embed = self.talker.text_projection(
+            self.talker.get_text_embeddings()(
+                torch.tensor(
+                    [[self.config.tts_bos_token_id, self.config.tts_eos_token_id, self.config.tts_pad_token_id]],
+                    device=self.talker.device,
+                    dtype=first_dtype,
                 )
-            ).chunk(3, dim=1)  # 3 * [1 1 d]
-            
-            # codec: tag and speaker
-            if language_id is None:
-                codec_prefill_list = [[
-                                        self.config.talker_config.codec_nothink_id,
-                                        self.config.talker_config.codec_think_bos_id,
-                                        self.config.talker_config.codec_think_eos_id,
-                                    ]]
-            else:
-                codec_prefill_list = [[
-                                        self.config.talker_config.codec_think_id,
-                                        self.config.talker_config.codec_think_bos_id,
-                                        language_id,
-                                        self.config.talker_config.codec_think_eos_id,
-                                    ]]
+            )
+        ).chunk(3, dim=1)  # 3 * [1 1 d]
 
-            codec_input_emebdding_0 = self.talker.get_input_embeddings()(
-                                                    torch.tensor(
-                                                        codec_prefill_list,
-                                                        device=self.talker.device,
-                                                        dtype=input_id.dtype,
-                                                    )
-                                                )
-            codec_input_emebdding_1 = self.talker.get_input_embeddings()(
-                                                    torch.tensor(
-                                                        [[
-                                                            self.config.talker_config.codec_pad_id,
-                                                            self.config.talker_config.codec_bos_id,
-                                                        ]],
-                                                        device=self.talker.device,
-                                                        dtype=input_id.dtype,
-                                                    )
-                                                )
-            if speaker_embed is None:
-                codec_input_emebdding = torch.cat([codec_input_emebdding_0,
-                                                   codec_input_emebdding_1], dim=1)
+        # Batched text embedding precomputation (Optimization #7)
+        if input_ids:
+            all_lens = [x.shape[1] for x in input_ids]
+            flat_input = torch.cat(input_ids, dim=1)
+            flat_embed = self.talker.text_projection(self.talker.get_text_embeddings()(flat_input))
+            batched_input_embeds = torch.split(flat_embed, all_lens, dim=1)
+        else:
+            batched_input_embeds = []
+
+        # Prefix cache for same-speaker prompts (Optimization #5)
+        prefix_cache = {}
+
+        for index, (input_id, language, speaker) in enumerate(zip(input_ids, languages, speakers)):
+            cache_key = (speaker, language) if speaker else None
+            
+            # Use cached prefix if available
+            if cache_key and cache_key in prefix_cache and voice_clone_spk_embeds is None:
+                codec_input_emebdding, _talker_input_embed = prefix_cache[cache_key]
             else:
-                codec_input_emebdding = torch.cat([codec_input_emebdding_0,
-                                                   speaker_embed.view(1, 1, -1),
-                                                   codec_input_emebdding_1], dim=1)
+                if voice_clone_spk_embeds is None:
+                    if speaker == "" or speaker == None: # Instruct create speaker
+                        speaker_embed = None
+                    else:
+                        if speaker.lower() not in self.config.talker_config.spk_id:
+                            raise NotImplementedError(f"Speaker {speaker} not implemented")
+                        else:
+                            spk_id = self.config.talker_config.spk_id[speaker.lower()]
+                            speaker_embed = self.talker.get_input_embeddings()(
+                                                torch.tensor(
+                                                    spk_id,
+                                                    device=self.talker.device,
+                                                    dtype=input_id.dtype,
+                                                )
+                                            )
+                else:
+                    if voice_clone_prompt["x_vector_only_mode"][index] or voice_clone_prompt["icl_mode"][index]:
+                        speaker_embed = voice_clone_spk_embeds[index]
+                    else:
+                        speaker_embed = None
+
+                assert language is not None
+
+                if language.lower() == "auto":
+                    language_id = None
+                else:
+                    if language.lower() not in self.config.talker_config.codec_language_id:
+                        raise NotImplementedError(f"Language {language} not implemented")
+                    else:
+                        language_id = self.config.talker_config.codec_language_id[language.lower()]
+                
+                if (language.lower() in ["chinese", "auto"] and \
+                    speaker != "" and speaker is not None and \
+                        self.config.talker_config.spk_is_dialect[speaker.lower()] != False):
+                    dialect = self.config.talker_config.spk_is_dialect[speaker.lower()]
+                    language_id = self.config.talker_config.codec_language_id[dialect]
+                
+                # codec: tag and speaker
+                if language_id is None:
+                    codec_prefill_list = [[
+                                            self.config.talker_config.codec_nothink_id,
+                                            self.config.talker_config.codec_think_bos_id,
+                                            self.config.talker_config.codec_think_eos_id,
+                                        ]]
+                else:
+                    codec_prefill_list = [[
+                                            self.config.talker_config.codec_think_id,
+                                            self.config.talker_config.codec_think_bos_id,
+                                            language_id,
+                                            self.config.talker_config.codec_think_eos_id,
+                                        ]]
+
+                codec_input_emebdding_0 = self.talker.get_input_embeddings()(
+                                                        torch.tensor(
+                                                            codec_prefill_list,
+                                                            device=self.talker.device,
+                                                            dtype=input_id.dtype,
+                                                        )
+                                                    )
+                codec_input_emebdding_1 = self.talker.get_input_embeddings()(
+                                                        torch.tensor(
+                                                            [[
+                                                                self.config.talker_config.codec_pad_id,
+                                                                self.config.talker_config.codec_bos_id,
+                                                            ]],
+                                                            device=self.talker.device,
+                                                            dtype=input_id.dtype,
+                                                        )
+                                                    )
+                if speaker_embed is None:
+                    codec_input_emebdding = torch.cat([codec_input_emebdding_0,
+                                                    codec_input_emebdding_1], dim=1)
+                else:
+                    codec_input_emebdding = torch.cat([codec_input_emebdding_0,
+                                                    speaker_embed.view(1, 1, -1),
+                                                    codec_input_emebdding_1], dim=1)
+
+                # tts_pad * 4 + tts_bos
+                _talker_input_embed = torch.cat((tts_pad_embed.expand(-1, codec_input_emebdding.shape[1] - 2, -1),
+                                                tts_bos_embed,
+                                                ), dim=1) + codec_input_emebdding[:, :-1]
+
+                # Cache the results for this speaker/language combination
+                if cache_key and voice_clone_spk_embeds is None:
+                    prefix_cache[cache_key] = (codec_input_emebdding, _talker_input_embed)
 
             # '<|im_start|>assistant\n我叫通义千问，是阿里云的开源大模型。<|im_end|>\n<|im_start|>assistant\n'
 
-            # <|im_start|>assistant\n
-            _talker_input_embed_role = self.talker.text_projection(
-                                        self.talker.get_text_embeddings()(input_id[:, :3])
-                                        )
-
-            # tts_pad * 4 + tts_bos
-            _talker_input_embed = torch.cat((tts_pad_embed.expand(-1, codec_input_emebdding.shape[1] - 2, -1),
-                                            tts_bos_embed,
-                                            ), dim=1) + codec_input_emebdding[:, :-1]
+            # <|im_start|>assistant\n (Batched lookup)
+            _talker_input_embed_role = batched_input_embeds[index][:, :3]
 
             talker_input_embed = torch.cat((_talker_input_embed_role, _talker_input_embed), dim=1)
 
@@ -2196,16 +2219,14 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 )
                 talker_input_embed = torch.cat([talker_input_embed, icl_input_embed], dim=1)
             else:
-                #  tts_text_first_token
+                #  tts_text_first_token directly from batched embeddings
                 talker_input_embed = torch.cat([talker_input_embed, 
-                                                self.talker.text_projection(self.talker.get_text_embeddings()(input_id[:, 3:4])) + codec_input_emebdding[:, -1:]], 
+                                                batched_input_embeds[index][:, 3:4] + codec_input_emebdding[:, -1:]], 
                                                 dim=1)
                 if non_streaming_mode:
                     talker_input_embed = talker_input_embed[:, :-1] # 去掉原本放进去的text
                     talker_input_embed = torch.cat([talker_input_embed,
-                                                    torch.cat((self.talker.text_projection(
-                                                        self.talker.get_text_embeddings()(input_id[:, 3:-5])
-                                                    ), tts_eos_embed), dim=1) + self.talker.get_input_embeddings()(
+                                                    torch.cat((batched_input_embeds[index][:, 3:-5], tts_eos_embed), dim=1) + self.talker.get_input_embeddings()(
                                                         torch.tensor(
                                                             [[
                                                                 self.config.talker_config.codec_pad_id,
@@ -2227,9 +2248,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                     trailing_text_hidden = tts_pad_embed
                 else:
                     # 叫通义千问，是阿里云的开源大模型。
-                    trailing_text_hidden = torch.cat((self.talker.text_projection(
-                                                        self.talker.get_text_embeddings()(input_id[:, 4:-5])
-                                                    ), tts_eos_embed), dim=1)
+                    trailing_text_hidden = torch.cat((batched_input_embeds[index][:, 4:-5], tts_eos_embed), dim=1)
             talker_input_embeds[index].append(talker_input_embed)
             trailing_text_hiddens.append(trailing_text_hidden)
         

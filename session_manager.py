@@ -211,7 +211,7 @@ class CharacterWorker:
                     # Use a tiny timeout to briefly wait in case orchestrator is slightly behind,
                     # but yield the slot quickly if genuinely empty.
                     try:
-                        msg = await asyncio.wait_for(self.queue.get(), timeout=0.1)
+                        msg = await asyncio.wait_for(self.queue.get(), timeout=0.25)
                         batch.append(msg)
                     except (asyncio.TimeoutError, asyncio.CancelledError):
                         break  # Queue is empty, yield the semaphore slot
@@ -250,13 +250,9 @@ class CharacterWorker:
                 for i, msg in enumerate(batch):
                     if self.storage and self.storage.is_configured and msg.s3_filename:
                         s3_prefix = (
-                            f"audio/segments/{msg.book_id}/{msg.chapter_id}/{msg.character_id}"
-                            if msg.book_id and msg.chapter_id and msg.character_id
-                            else (
-                                f"audio/segments/{msg.book_id}/{msg.chapter_id}"
-                                if msg.book_id and msg.chapter_id
-                                else f"audio/{msg.job_id}"
-                            )
+                            f"audio/segments/{msg.book_id}/{msg.chapter_id}"
+                            if msg.book_id and msg.chapter_id
+                            else f"audio/{msg.job_id}"
                         )
                         upload_tasks.append(
                             self._upload_single(loop, wav_bytes_list[i], msg, s3_prefix, sr)
