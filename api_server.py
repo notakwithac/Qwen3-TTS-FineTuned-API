@@ -1180,6 +1180,27 @@ async def gpu_config(req: GpuConfigRequest):
     }
 
 
+@app.post("/gpu/terminate", summary="Request instance termination")
+async def gpu_terminate():
+    """Request that the instance be terminated once all background tasks are done.
+    
+    This creates a signal file that the GPU watchdog monitors. The watchdog will
+    trigger a full instance termination via the Massed Compute API as soon as 
+    all active operations (S3 uploads, etc.) are finished.
+    """
+    signal_file = "terminate_signal.tmp"
+    with open(signal_file, "w") as f:
+        f.write(str(time.time()))
+    
+    ops_log.log_event("termination_requested")
+    logger.warning("Instance termination requested via API — signal file created.")
+    
+    return {
+        "status": "termination_scheduled",
+        "detail": "Instance will terminate as soon as all background tasks are complete.",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Session-Based Inference (Event-Driven)
 # ---------------------------------------------------------------------------

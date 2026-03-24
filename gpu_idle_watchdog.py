@@ -1,22 +1,7 @@
 #!/usr/bin/env python3
 """
 GPU Idle Watchdog — auto-terminates the Massed Compute VM after sustained GPU
-inactivity to avoid burning money on an idle instance.
-
-Usage:
-    python gpu_idle_watchdog.py              # production mode
-    python gpu_idle_watchdog.py --dry-run    # logs only, no termination
-
-Environment variables (all optional except the API token):
-    MASSED_COMPUTE_API_TOKEN       – Required.  Bearer token for the MC API.
-    MASSED_COMPUTE_INSTANCE_UUID   – If set, skips auto-detection of the
-                                     instance UUID via IP matching.
-    GPU_IDLE_THRESHOLD             – Utilization % below which the GPU is
-                                     considered idle (default: 5).
-    GPU_IDLE_TERMINATE_MINUTES     – Minutes of continuous idle before
-                                     termination (default: 20).
-    GPU_POLL_INTERVAL              – Seconds between nvidia-smi polls
-                                     (default: 60).
+inactivity and API idle to avoid burning money on an idle instance.
 """
 
 import argparse
@@ -26,6 +11,8 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.request
+import json
 
 from massed_compute_client import MassedComputeClient
 
@@ -51,6 +38,24 @@ POLL_INTERVAL = int(os.getenv("GPU_POLL_INTERVAL", "60"))
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def is_api_busy() -> bool:
+    """Check if the API server has active background operations."""
+    try:
+        # We check localhost since the watchdog runs on the same VM
+        with urllib.request.urlopen("http://localhost:8000/ops/running", timeout=5) as response:
+            if response.status == 200:
+                data = json.loads(response.read().decode())
+                # If the list is not empty, there are operations in progress
+                if isinstance(data, list) and len(data) > 0:
+                    logger.info("API is BUSY with %d active operations (e.g., %s)", 
+                                len(data), data[0].get("op", "unknown"))
+                    return True
+    except Exception:
+        # If API is down or not responding, we assume it's NOT busy
+        pass
+    return False
+
+
 def get_gpu_utilization() -> int:
     """Return current GPU utilization % via nvidia-smi, or 0 on failure."""
     try:
@@ -63,7 +68,6 @@ def get_gpu_utilization() -> int:
             logger.warning("nvidia-smi exited with code %d: %s",
                            result.returncode, result.stderr.strip())
             return 0
-        # Multi-GPU: take the max utilization across all GPUs
         values = [int(v.strip()) for v in result.stdout.strip().split("\n") if v.strip()]
         return max(values) if values else 0
     except FileNotFoundError:
@@ -82,8 +86,6 @@ def get_local_ips() -> list[str]:
         ips = list({addr[4][0] for addr in socket.getaddrinfo(hostname, None)})
     except Exception:
         pass
-
-    # Also try the outbound-route trick
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -91,40 +93,24 @@ def get_local_ips() -> list[str]:
         s.close()
     except Exception:
         pass
-
     return list(set(ips))
 
 
 def resolve_instance_uuid(client: MassedComputeClient) -> str | None:
-    """Resolve the current VM's Massed Compute instance UUID.
-
-    Priority:
-      1. MASSED_COMPUTE_INSTANCE_UUID env var
-      2. Match local IP against running instances from the API
-    """
+    """Resolve the current VM's Massed Compute instance UUID."""
     uuid_env = os.getenv("MASSED_COMPUTE_INSTANCE_UUID", "").strip()
     if uuid_env:
-        logger.info("Instance UUID from env: %s", uuid_env)
         return uuid_env
-
-    logger.info("MASSED_COMPUTE_INSTANCE_UUID not set — resolving via IP match…")
     local_ips = get_local_ips()
-    logger.info("Local IPs: %s", local_ips)
-
     try:
         instances = client.list_instances()
-        # The API may return a list directly or nested under a key
         if isinstance(instances, dict):
             instances = instances.get("runningInstances", instances.get("instances", []))
         for inst in instances:
             if inst.get("ip") in local_ips:
-                logger.info("Matched instance '%s' (uuid=%s, ip=%s)",
-                            inst.get("name"), inst["uuid"], inst["ip"])
                 return inst["uuid"]
     except Exception as exc:
         logger.error("Failed to list instances for IP matching: %s", exc)
-
-    logger.error("Could not resolve instance UUID — no IP match found")
     return None
 
 
@@ -145,7 +131,6 @@ def main():
     logger.info("  Dry-run          : %s", args.dry_run)
     logger.info("=" * 60)
 
-    # Validate token early so we fail fast
     client = MassedComputeClient()
     if not client.authenticate():
         logger.error("API token validation failed — exiting")
@@ -154,65 +139,58 @@ def main():
 
     idle_seconds = 0
     terminate_after = TERMINATE_MINUTES * 60
+    signal_file = "terminate_signal.tmp"
 
     while True:
         util = get_gpu_utilization()
+        api_busy = is_api_busy()
 
-        if util < IDLE_THRESHOLD:
+        # Check for immediate termination signal from API
+        termination_requested = os.path.exists(signal_file)
+
+        if termination_requested and not api_busy:
+            logger.warning("🚀 Immediate termination requested via signal file — triggering now")
+            idle_seconds = terminate_after  # Force termination trigger
+        elif util < IDLE_THRESHOLD and not api_busy:
             idle_seconds += POLL_INTERVAL
             logger.info(
-                "GPU utilization: %d%% (idle) — idle for %d/%d min",
+                "System IDLE: GPU %d%%, API idle — idle for %d/%d min",
                 util, idle_seconds // 60, TERMINATE_MINUTES,
             )
         else:
             if idle_seconds > 0:
+                reason = "API BUSY" if api_busy else f"GPU active ({util}%)"
                 logger.info(
-                    "GPU utilization: %d%% (active) — idle counter reset "
-                    "(was %d min)",
-                    util, idle_seconds // 60,
+                    "System ACTIVE: %s — idle counter reset (was %d min)",
+                    reason, idle_seconds // 60,
                 )
             else:
-                logger.info("GPU utilization: %d%% (active)", util)
+                if api_busy:
+                    logger.info("System status: API BUSY, GPU %d%%", util)
+                else:
+                    logger.info("System status: GPU active (%d%%)", util)
             idle_seconds = 0
 
-        # --- Termination trigger ---
         if idle_seconds >= terminate_after:
-            logger.warning(
-                "🛑  GPU idle for %d minutes — triggering instance termination",
-                idle_seconds // 60,
-            )
-
+            logger.warning("🛑 Sustained idle — triggering instance termination")
             uuid = resolve_instance_uuid(client)
             if not uuid:
-                logger.error(
-                    "Cannot terminate: instance UUID unknown. "
-                    "Set MASSED_COMPUTE_INSTANCE_UUID and restart."
-                )
-                # Reset and keep trying — don't exit, in case the API
-                # recovers or user sets the env var.
+                logger.error("Cannot resolve instance UUID — skipping termination")
                 idle_seconds = 0
                 time.sleep(POLL_INTERVAL)
                 continue
 
             if args.dry_run:
-                logger.warning(
-                    "DRY RUN: Would terminate instance %s — skipping", uuid
-                )
+                logger.warning("DRY RUN: Would terminate instance %s", uuid)
                 idle_seconds = 0
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            # Flush logs before the VM disappears
             logger.warning("Terminating instance %s NOW", uuid)
-            sys.stdout.flush()
-            sys.stderr.flush()
-
             try:
-                result = client.terminate_instance([uuid])
-                logger.info("Terminate API response: %s", result)
+                client.terminate_instance([uuid])
             except Exception as exc:
                 logger.error("Terminate API call failed: %s", exc)
-                # The VM may already be going down; exit cleanly
             finally:
                 sys.stdout.flush()
                 sys.stderr.flush()
