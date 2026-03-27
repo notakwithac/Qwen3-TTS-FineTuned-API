@@ -442,7 +442,7 @@ class SessionManager:
             expired = [
                 sid for sid, s in self.sessions.items()
                 if (now - s.last_active) > self.session_timeout
-                and s.status not in (SessionStatus.PREPARING, SessionStatus.PROCESSING)
+                and s.status not in (SessionStatus.PREPARING, SessionStatus.PROCESSING, SessionStatus.CANCELLED)
             ]
             for sid in expired:
                 ops_log.log_event("session_auto_cleanup", extra={"session_id": sid})

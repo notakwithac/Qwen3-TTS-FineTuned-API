@@ -68,8 +68,12 @@ def is_api_busy() -> bool:
                                 "/gpu/vram" in url or
                                 "/ops/averages" in url or
                                 "/ops/history" in url or
-                                "/storage/status" in url
+                                "/storage/status" in url or
+                                "/session/" in url or
+                                "/sessions" in url
                             )
+                        ) or (
+                            op_name in ("session_teardown", "session_auto_cleanup")
                         )
                         
                         if not is_status_check:
