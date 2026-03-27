@@ -700,9 +700,28 @@ class InferenceManager:
         languages: list[str] = None,
         x_vector_only_mode: bool = False,
     ) -> tuple[list[bytes], int]:
-        """Generate speech for multiple texts using zero-shot VoiceClone Base model."""
+        """Generate speech for multiple texts using zero-shot VoiceClone Base model (single reference)."""
+        return self.generate_voice_clone_flexible_batch(
+            texts=texts,
+            ref_audios=[ref_audio] * len(texts),
+            ref_texts=[ref_text] * len(texts),
+            languages=languages,
+            x_vector_only_modes=[x_vector_only_mode] * len(texts)
+        )
+
+    def generate_voice_clone_flexible_batch(
+        self,
+        texts: list[str],
+        ref_audios: list[str],
+        ref_texts: list[str],
+        languages: list[str] = None,
+        x_vector_only_modes: list[bool] = None,
+    ) -> tuple[list[bytes], int]:
+        """Generate speech for multiple texts using zero-shot VoiceClone Base model (flexible references)."""
         if not languages:
             languages = ["English"] * len(texts)
+        if not x_vector_only_modes:
+            x_vector_only_modes = [False] * len(texts)
 
         with ops_log.operation("gpu_semaphore_wait", extra={"model": "voice_clone"}):
             self._inference_semaphore.acquire()
@@ -714,17 +733,17 @@ class InferenceManager:
 
             try:
                 with self._track_active():
-                    op = ops_log.start("inference_voice_clone_batch", extra={
+                    op = ops_log.start("inference_voice_clone_flexible_batch", extra={
                         "batch_size": len(texts),
                     })
-                    logger.info(f"VoiceClone started for {len(texts)} texts.")
+                    logger.info(f"VoiceClone flexible started for {len(texts)} texts.")
                     try:
                         wavs_list, sr = model.generate_voice_clone(
                             text=texts,
-                            ref_audio=ref_audio,
-                            ref_text=ref_text,
+                            ref_audio=ref_audios,
+                            ref_text=ref_texts,
                             language=languages,
-                            x_vector_only_mode=x_vector_only_mode,
+                            x_vector_only_mode=x_vector_only_modes,
                         )
 
                         # Encode WAVs in parallel on CPU threads (frees GPU thread)
@@ -733,7 +752,7 @@ class InferenceManager:
                         ))
 
                         ops_log.end(op, extra={"sample_rate": sr})
-                        logger.info(f"VoiceClone finished for {len(texts)} texts.")
+                        logger.info(f"VoiceClone flexible finished for {len(texts)} texts.")
                         return results, sr
                     except Exception as e:
                         ops_log.fail(op, str(e))

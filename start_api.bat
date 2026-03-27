@@ -14,6 +14,9 @@ set GPU_MAX_MODELS=1
 :: set E2E_BUCKET=qwen3-tts
 :: set E2E_ENDPOINT_URL=https://objectstore.e2enetworks.net
 
+echo 🚀 Starting GPU Idle Watchdog...
+start "GPU Watchdog" uv run python gpu_idle_watchdog.py
+
 echo 🚀 Starting Qwen3-TTS Production API (Local Mode)...
 echo VRAM Optimized: 10GB limit detected.
 echo Max Concurrent Jobs: %GPU_MAX_CONCURRENCY%

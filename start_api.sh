@@ -12,6 +12,10 @@ export GPU_IDLE_TIMEOUT="${GPU_IDLE_TIMEOUT:-300}"    # 5 min idle unload
 export GPU_MAX_CONCURRENCY="${GPU_MAX_CONCURRENCY:-4}" # Concurrent tasks
 export GPU_MAX_MODELS="${GPU_MAX_MODELS:-4}"           # LRU Cache size (4 characters)
 
+echo "🚀 Starting GPU Idle Watchdog..."
+mkdir -p logs
+nohup python gpu_idle_watchdog.py >> logs/watchdog.log 2>&1 &
+
 echo "🚀 Starting Qwen3-TTS Fine-Tuning API on port 8000..."
 echo "   Device: $DEVICE"
 echo "   Flash Attention: $USE_FLASH_ATTN"

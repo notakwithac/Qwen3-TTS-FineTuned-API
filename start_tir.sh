@@ -41,6 +41,9 @@ export GPU_IDLE_TIMEOUT="${GPU_IDLE_TIMEOUT:-300}"
 export GPU_MAX_MODELS="${GPU_MAX_MODELS:-4}"
 
 # --- 4. EXECUTION ---
+echo "[INFO] Starting GPU Idle Watchdog..." | tee -a "${LOG_DIR}/startup.log"
+nohup python gpu_idle_watchdog.py >> "${LOG_DIR}/watchdog.log" 2>&1 &
+
 echo "[INFO] Starting Uvicorn API server on 0.0.0.0:8000..." | tee -a "${LOG_DIR}/startup.log"
 
 # Use exec to ensure the process replaces the shell (better for systemd)
