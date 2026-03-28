@@ -86,6 +86,7 @@ class StorageClient:
         data: bytes,
         key: str,
         content_type: str = "application/octet-stream",
+        metadata: Optional[dict] = None,
     ) -> str:
         """Upload bytes to S3 and return the object URL.
 
@@ -93,6 +94,7 @@ class StorageClient:
             data: Raw bytes to upload.
             key: S3 object key (path within bucket).
             content_type: MIME type of the content.
+            metadata: Custom metadata (x-amz-meta-).
 
         Returns:
             Public URL of the uploaded object.
@@ -107,17 +109,19 @@ class StorageClient:
                 Key=key,
                 Body=data,
                 ContentType=content_type,
+                Metadata=metadata or {},
             )
         logger.info(f"Upload complete: {self._object_url(key)}")
         return self._object_url(key)
 
-    def upload_file(self, local_path: str, key: str, content_type: Optional[str] = None) -> str:
+    def upload_file(self, local_path: str, key: str, content_type: Optional[str] = None, metadata: Optional[dict] = None) -> str:
         """Upload a local file to S3.
 
         Args:
             local_path: Path to the local file.
             key: S3 object key.
             content_type: MIME type (auto-detected if omitted).
+            metadata: Custom metadata (x-amz-meta-).
 
         Returns:
             URL of the uploaded object.
@@ -125,11 +129,13 @@ class StorageClient:
         extra_args = {}
         if content_type:
             extra_args["ContentType"] = content_type
+        if metadata:
+            extra_args["Metadata"] = metadata
         with ops_log.operation("s3_upload_file", extra={"key": key, "local_path": local_path}):
             self.client.upload_file(local_path, self.bucket, key, ExtraArgs=extra_args or None)
         return self._object_url(key)
 
-    def upload_wav(self, wav_bytes: bytes, job_id: str, filename: Optional[str] = None, prefix: Optional[str] = None) -> str:
+    def upload_wav(self, wav_bytes: bytes, job_id: str, filename: Optional[str] = None, prefix: Optional[str] = None, model_id: Optional[str] = None) -> str:
         """Upload a WAV file with a structured key.
 
         Key format: {prefix or f'audio/{job_id}'}/{filename}
@@ -139,6 +145,7 @@ class StorageClient:
             job_id: Job ID for the directory structure (fallback if prefix not provided).
             filename: Custom filename (default: timestamped).
             prefix: Custom S3 prefix (folder path).
+            model_id: Model ID for metadata (x-amz-meta-model-id).
 
         Returns:
             URL of the uploaded WAV file.
@@ -149,7 +156,12 @@ class StorageClient:
         
         base_prefix = prefix or f"audio/{job_id}"
         key = f"{base_prefix}/{filename}"
-        return self.upload_bytes(wav_bytes, key, content_type="audio/wav")
+        
+        metadata = None
+        if model_id:
+            metadata = {"model-id": model_id}
+            
+        return self.upload_bytes(wav_bytes, key, content_type="audio/wav", metadata=metadata)
 
     def upload_text(self, text: str, key: str) -> str:
         """Upload a text file to S3."""

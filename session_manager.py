@@ -287,6 +287,7 @@ class CharacterWorker:
                     wav_bytes, msg.job_id,
                     filename=msg.s3_filename,
                     prefix=s3_prefix,
+                    model_id=msg.job_id,
                 )
             )
             s3_key = f"{s3_prefix}/{msg.s3_filename}"

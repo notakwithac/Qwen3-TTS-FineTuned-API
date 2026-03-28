@@ -622,7 +622,7 @@ async def infer(job_id: str, req: InferRequest):
         s3_prefix = f"audio/segments/{req.book_id}/{req.chapter_id}" if (req.book_id and req.chapter_id) else f"audio/{session_code}/{job_id}"
         
         with ops_log.operation("s3_upload", job_id=job_id):
-            s3_url = storage.upload_wav(wav_bytes, job_id, filename=req.s3_filename, prefix=s3_prefix)
+            s3_url = storage.upload_wav(wav_bytes, job_id, filename=req.s3_filename, prefix=s3_prefix, model_id=job_id)
         
         s3_key = f"{s3_prefix}/{req.s3_filename}" if req.s3_filename else s3_url.split(f"{storage.bucket}/")[-1]
         
@@ -753,7 +753,7 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
                 # Parallel S3 upload
                 s3_url = await loop.run_in_executor(
                     None,
-                    partial(storage.upload_wav, wav_bytes, job_id, filename=filename, prefix=s3_prefix)
+                    partial(storage.upload_wav, wav_bytes, job_id, filename=filename, prefix=s3_prefix, model_id=job_id)
                 )
                 
                 s3_key = f"{s3_prefix}/{filename}"
@@ -862,7 +862,7 @@ async def voice_clone(req: VoiceCloneRequest):
         from functools import partial
         s3_url = await loop.run_in_executor(
             None,
-            partial(storage.upload_wav, wav_bytes, "voice_clone", filename=filename, prefix=s3_prefix)
+            partial(storage.upload_wav, wav_bytes, "voice_clone", filename=filename, prefix=s3_prefix, model_id="voice_clone_qwen")
         )
         presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
         return {
@@ -941,7 +941,7 @@ async def voice_clone_batch(req: VoiceCloneBatchRequest):
                 from functools import partial
                 s3_url = await loop.run_in_executor(
                     None,
-                    partial(storage.upload_wav, wav_bytes, "voice_clone", filename=filename, prefix=s3_prefix)
+                    partial(storage.upload_wav, wav_bytes, "voice_clone", filename=filename, prefix=s3_prefix, model_id="voice_clone_qwen")
                 )
                 presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
                 return {
@@ -1038,7 +1038,7 @@ async def voice_design(req: VoiceDesignRequest):
         if not storage.is_configured:
             raise HTTPException(status_code=503, detail="Storage not configured.")
         with ops_log.operation("s3_upload", extra={"type": "voice_design"}):
-            s3_url = storage.upload_wav(wav_bytes, "voice_design", filename=req.s3_filename)
+            s3_url = storage.upload_wav(wav_bytes, "voice_design", filename=req.s3_filename, model_id="voice_design_qwen")
         s3_key = f"audio/voice_design/{req.s3_filename}" if req.s3_filename else s3_url.split(f"{storage.bucket}/")[-1]
         
         presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
@@ -1169,7 +1169,7 @@ async def voice_design_batch(req: VoiceDesignBatchRequest):
                 with ops_log.operation("s3_upload", extra={"type": "voice_design_batch"}):
                     s3_url = await loop.run_in_executor(
                         None,
-                        partial(storage.upload_wav, wav_bytes, "voice_design", filename=s3_filename),
+                        partial(storage.upload_wav, wav_bytes, "voice_design", filename=s3_filename, model_id="voice_design_qwen"),
                     )
                 s3_key = f"audio/voice_design/{s3_filename}"
                 presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
