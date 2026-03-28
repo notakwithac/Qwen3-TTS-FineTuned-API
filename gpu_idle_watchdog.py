@@ -70,7 +70,8 @@ def is_api_busy() -> bool:
                                 "/ops/history" in url or
                                 "/storage/status" in url or
                                 "/session/" in url or
-                                "/sessions" in url
+                                "/sessions" in url or
+                                "/gpu/terminate" in url
                             )
                         ) or (
                             op_name in ("session_teardown", "session_auto_cleanup")
@@ -177,7 +178,11 @@ def resolve_instance_uuid(client: MassedComputeClient) -> str | None:
     1. GPU_INSTANCE_ID environment variable
     2. Matching local IPs against Massed Compute API 'instance' list
     """
-    uuid_env = os.getenv("GPU_INSTANCE_ID", "").strip()
+    uuid_env = (
+        os.getenv("GPU_INSTANCE_ID", "").strip() or 
+        os.getenv("MASSED_COMPUTE_INSTANCE_UUID", "").strip() or
+        os.getenv("GPU_INSTANCE_UUID", "").strip()
+    )
     if uuid_env:
         logger.debug("Using instance UUID from environment: %s", uuid_env)
         return uuid_env

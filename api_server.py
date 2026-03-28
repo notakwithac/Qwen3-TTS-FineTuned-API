@@ -1270,7 +1270,12 @@ async def gpu_terminate():
         "status": "termination_scheduled",
         "detail": "Server is now DRAINING. New work will be rejected. Instance will terminate once current tasks complete.",
         "signal_file": signal_file,
-        "instance_uuid": os.getenv("GPU_INSTANCE_ID", "not_set_in_env"),
+        "instance_uuid": (
+            os.getenv("GPU_INSTANCE_ID", "").strip() or 
+            os.getenv("MASSED_COMPUTE_INSTANCE_UUID", "").strip() or 
+            os.getenv("GPU_INSTANCE_UUID", "").strip() or 
+            "not_set_in_env"
+        ),
     }
 
 
