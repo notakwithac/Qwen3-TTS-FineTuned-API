@@ -81,8 +81,9 @@ def is_api_busy() -> bool:
                             active_ops.append(op)
 
                     if active_ops:
-                        logger.info("API is BUSY with %d active operations (e.g., %s)", 
-                                    len(active_ops), active_ops[0].get("op_name", "unknown"))
+                        op_names = [o.get("op_name", "unknown") for o in active_ops]
+                        logger.info("API is BUSY with %d active operations: %s", 
+                                    len(active_ops), ", ".join(op_names))
                         return True
     except Exception:
         # If API is down or not responding, we assume it's NOT busy
