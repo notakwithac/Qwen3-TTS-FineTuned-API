@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-GPU Idle Watchdog — auto-terminates the Massed Compute VM after sustained GPU
-inactivity and API idle to avoid burning money on an idle instance.
+GPU Idle Watchdog (Simplified) — auto-terminates the Massed Compute VM after 
+sustained pipeline inactivity (S3 uploads, training, inference).
 """
 
 import argparse
 import logging
 import os
 import socket
-import subprocess
 import sys
 import time
 import urllib.request
@@ -36,29 +35,38 @@ logger = logging.getLogger("gpu-watchdog")
 # ---------------------------------------------------------------------------
 # Config from env
 # ---------------------------------------------------------------------------
-IDLE_THRESHOLD = int(os.getenv("GPU_IDLE_THRESHOLD", "5"))
 TERMINATE_MINUTES = int(os.getenv("GPU_IDLE_TERMINATE_MINUTES", "20"))
 POLL_INTERVAL = int(os.getenv("GPU_POLL_INTERVAL", "60"))
-
+# Grace period after /gpu/terminate signal: wait this long for in-flight ops to drain,
+# then force-terminate even if the API still reports busy.
+SIGNAL_GRACE_MINUTES = int(os.getenv("GPU_SIGNAL_GRACE_MINUTES", "5"))
+# How long to wait for the API server to come up before starting idle countdown.
+# During this window, Connection refused is normal (uvicorn still loading models).
+API_STARTUP_WAIT_MINUTES = int(os.getenv("GPU_API_STARTUP_WAIT_MINUTES", "5"))
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 def is_api_busy() -> bool:
-    """Check if the API server has active background operations."""
+    """Check if the API server has active background operations (S3 uploads, training, etc)."""
     try:
         # We check localhost since the watchdog runs on the same VM
         with urllib.request.urlopen("http://localhost:8000/ops/running", timeout=5) as response:
             if response.status == 200:
-                data = json.loads(response.read().decode())
+                raw = response.read().decode()
+                data = json.loads(raw)
+                logger.debug("Raw /ops/running response (%d ops): %s", 
+                             len(data) if isinstance(data, list) else -1, raw[:2000])
                 # If the list is not empty, check if any operation is actually heavy
                 if isinstance(data, list) and len(data) > 0:
                     # Filter out purely status-related API requests
                     active_ops = []
                     for op in data:
                         op_name = op.get("op_name", "")
+                        op_id = op.get("op_id", "?")
                         extra = op.get("extra", {})
                         url = extra.get("url", "")
+                        start_ts = op.get("start_ts", "?")
                         
                         # We ignore these specific status/ops requests
                         is_status_check = (
@@ -71,87 +79,45 @@ def is_api_busy() -> bool:
                                 "/storage/status" in url or
                                 "/session/" in url or
                                 "/sessions" in url or
-                                "/gpu/terminate" in url
+                                "/gpu/terminate" in url or
+                                "/docs" in url or
+                                "/redoc" in url or
+                                "/openapi.json" in url or
+                                "/favicon.ico" in url or
+                                url.endswith("/")
                             )
                         ) or (
                             op_name in ("session_teardown", "session_auto_cleanup")
                         )
                         
-                        if not is_status_check:
+                        if is_status_check:
+                            logger.debug("  IGNORED op: name=%s id=%s url=%s", op_name, op_id, url)
+                        else:
+                            logger.info("  KEEPING op: name=%s id=%s url=%s started=%s", 
+                                        op_name, op_id, url, start_ts)
                             active_ops.append(op)
 
                     if active_ops:
-                        op_names = [o.get("op_name", "unknown") for o in active_ops]
+                        op_summaries = [
+                            f"{o.get('op_name','?')}(id={o.get('op_id','?')}, started={o.get('start_ts','?')})"
+                            for o in active_ops
+                        ]
                         logger.info("API is BUSY with %d active operations: %s", 
-                                    len(active_ops), ", ".join(op_names))
+                                    len(active_ops), ", ".join(op_summaries))
                         return True
-    except Exception:
-        # If API is down or not responding, we assume it's NOT busy
-        pass
-    return False
-
-
-def has_other_python_processes() -> bool:
-    """Check if any other python processes are running besides the watchdog and API."""
-    try:
-        # Get pids of all python processes
-        result = subprocess.run(["pgrep", "-f", "python"], capture_output=True, text=True)
-        if result.returncode != 0:
-            # If pgrep fails, maybe we aren't on a system with it, or no python found
-            return False
-            
-        pids = result.stdout.strip().split("\n")
-        my_pid = str(os.getpid())
-        
-        for pid in pids:
-            pid = pid.strip()
-            if not pid or pid == my_pid:
-                continue
-            
-            # Check what's running in this pid
-            try:
-                # cmdline uses \x00 as separator
-                cmd_path = f"/proc/{pid}/cmdline"
-                if not os.path.exists(cmd_path):
-                    continue
-                    
-                with open(cmd_path, "r") as f:
-                    cmd = f.read().replace("\x00", " ").strip()
-                    
-                    # Ignore the API server and its uvicorn wrapper
-                    if "api_server.py" in cmd or "uvicorn" in cmd:
-                        continue
-                        
-                    # Ignore other innocent background stuff if needed, but for now
-                    # anything else is considered a "background process"
-                    if cmd:
-                        logger.info("Found other active python process: PID %s -> %s", pid, cmd[:100])
-                        return True
-            except (IOError, OSError):
-                continue
-    except Exception as e:
-        logger.debug("Failed to check for other python processes: %s", e)
-    return False
-def get_gpu_utilization() -> int:
-    """Return current GPU utilization % via nvidia-smi, or 0 on failure."""
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=utilization.gpu",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode != 0:
-            logger.warning("nvidia-smi exited with code %d: %s",
-                           result.returncode, result.stderr.strip())
-            return 0
-        values = [int(v.strip()) for v in result.stdout.strip().split("\n") if v.strip()]
-        return max(values) if values else 0
-    except FileNotFoundError:
-        logger.warning("nvidia-smi not found — assuming 0% utilization")
-        return 0
+                else:
+                    logger.debug("/ops/running returned empty list — server is idle")
+            else:
+                logger.warning("/ops/running returned status %d", response.status)
     except Exception as exc:
-        logger.warning("Failed to read GPU utilization: %s", exc)
-        return 0
+        # If API is down or not responding, we assume it's NOT busy.
+        # Connection refused is normal during API startup — log at DEBUG level.
+        err_str = str(exc)
+        if "Connection refused" in err_str or "Connection reset" in err_str:
+            logger.debug("is_api_busy(): API not reachable yet (Connection refused) — treating as NOT busy")
+        else:
+            logger.warning("is_api_busy() check failed (treating as NOT busy): %s", exc)
+    return False
 
 
 def get_local_ips() -> list[str]:
@@ -173,39 +139,38 @@ def get_local_ips() -> list[str]:
 
 
 def resolve_instance_uuid(client: MassedComputeClient) -> str | None:
-    """Resolve the current VM's Massed Compute instance UUID.
+    """Resolve the current VM's Massed Compute instance UUID."""
+    env_gpu_id = os.getenv("GPU_INSTANCE_ID", "").strip()
+    env_mc_uuid = os.getenv("MASSED_COMPUTE_INSTANCE_UUID", "").strip()
+    env_gpu_uuid = os.getenv("GPU_INSTANCE_UUID", "").strip()
+    logger.info("Env vars: GPU_INSTANCE_ID='%s', MASSED_COMPUTE_INSTANCE_UUID='%s', GPU_INSTANCE_UUID='%s'",
+                env_gpu_id, env_mc_uuid, env_gpu_uuid)
     
-    Tries (in order):
-    1. GPU_INSTANCE_ID environment variable
-    2. Matching local IPs against Massed Compute API 'instance' list
-    """
-    uuid_env = (
-        os.getenv("GPU_INSTANCE_ID", "").strip() or 
-        os.getenv("MASSED_COMPUTE_INSTANCE_UUID", "").strip() or
-        os.getenv("GPU_INSTANCE_UUID", "").strip()
-    )
+    uuid_env = env_gpu_id or env_mc_uuid or env_gpu_uuid
     if uuid_env:
-        logger.debug("Using instance UUID from environment: %s", uuid_env)
+        logger.info("Using instance UUID from env: %s", uuid_env)
         return uuid_env
     
-    logger.info("GPU_INSTANCE_ID not set in environment. Attempting IP resolution...")
+    logger.info("Instance ID not set in env. Attempting IP resolution...")
     local_ips = get_local_ips()
+    logger.info("Local IPs detected: %s", local_ips)
     try:
-        # If we are in skip_auth mode, client.list_instances() might fail or return nothing
-        # We only try if authenticated or if skip_auth is NOT specifically for this call
         instances = client.list_instances()
+        logger.info("list_instances raw response type=%s: %s", type(instances).__name__, str(instances)[:500])
         if isinstance(instances, dict):
             instances = instances.get("runningInstances", instances.get("instances", []))
         
+        logger.info("Found %d instances to check for IP match", len(instances) if isinstance(instances, list) else -1)
         for inst in instances:
-            # Check both internal and external IP if available in the API response
             ip = inst.get("ip")
+            inst_uuid = inst.get("uuid", "?")
+            logger.info("  Instance: uuid=%s ip=%s (match=%s)", inst_uuid, ip, ip in local_ips)
             if ip in local_ips:
-                logger.info("Auto-resolved instance UUID via IP match (%s): %s", ip, inst["uuid"])
-                return inst["uuid"]
-            
+                logger.info("Auto-resolved instance UUID via IP match (%s): %s", ip, inst_uuid)
+                return inst_uuid
+        logger.warning("No IP match found among %d instances", len(instances) if isinstance(instances, list) else 0)
     except Exception as exc:
-        logger.error("Failed to list instances for IP matching: %s", exc)
+        logger.error("Failed to list instances for IP matching: %s", exc, exc_info=True)
     
     return None
 
@@ -214,106 +179,142 @@ def resolve_instance_uuid(client: MassedComputeClient) -> str | None:
 # Main loop
 # ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="GPU Idle Watchdog")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Log actions without actually terminating")
-    parser.add_argument("--skip-auth", action="store_true",
-                        help="Skip API token validation (for testing)")
+    parser = argparse.ArgumentParser(description="GPU Idle Watchdog (Simplified)")
+    parser.add_argument("--dry-run", action="store_true", help="Log only")
+    parser.add_argument("--skip-auth", action="store_true", help="Testing only")
     args = parser.parse_args()
 
     logger.info("=" * 60)
-    logger.info("GPU Idle Watchdog starting")
-    logger.info("  Idle threshold   : <%d%% utilization", IDLE_THRESHOLD)
-    logger.info("  Terminate after  : %d min of sustained idle", TERMINATE_MINUTES)
+    logger.info("GPU Simplified Watchdog starting")
+    logger.info("  Terminate after  : %d min of API idle", TERMINATE_MINUTES)
     logger.info("  Poll interval    : %ds", POLL_INTERVAL)
+    logger.info("  Signal grace     : %d min (max wait after /gpu/terminate signal)", SIGNAL_GRACE_MINUTES)
     logger.info("  Dry-run          : %s", args.dry_run)
     logger.info("=" * 60)
 
     client = MassedComputeClient()
     if not args.skip_auth:
-        if not client.authenticate():
-            logger.error("API token validation failed — exiting")
-            sys.exit(1)
-        logger.info("API token validated ✓")
-    else:
-        logger.warning("Skipping API authentication (test mode)")
+        logger.info("Validating Massed Compute API token...")
+        if client.authenticate():
+            logger.info("API token validation: OK")
+        else:
+            # Check if we already know the UUID — if so, we can still attempt termination
+            # even if the token validation endpoint returns 4xx (it might be a different
+            # endpoint auth scheme, or the validation endpoint itself has issues).
+            uuid_from_env = (
+                os.getenv("GPU_INSTANCE_ID", "").strip() or
+                os.getenv("MASSED_COMPUTE_INSTANCE_UUID", "").strip() or
+                os.getenv("GPU_INSTANCE_UUID", "").strip()
+            )
+            if uuid_from_env:
+                logger.warning(
+                    "API token validation FAILED (status 4xx) — but GPU_INSTANCE_UUID is set (%s). "
+                    "Continuing anyway. The terminate call will fail if the token is truly invalid.",
+                    uuid_from_env
+                )
+            else:
+                logger.error("API token validation FAILED and no instance UUID found in env — cannot terminate safely. Exiting.")
+                sys.exit(1)
 
-    # Initial check for UUID
     initial_uuid = resolve_instance_uuid(client)
     if not initial_uuid:
-        logger.warning("Could not resolve instance UUID. Auto-termination will fail until it's set.")
-        logger.warning("    Please set GPU_INSTANCE_ID in your .env file.")
+        logger.warning("Could not resolve instance UUID. Termination will fail.")
     else:
-        logger.info("Termination ready for Instance: %s", initial_uuid)
+        logger.info("Termination target: %s", initial_uuid)
 
     idle_seconds = 0
     terminate_after = TERMINATE_MINUTES * 60
+    signal_grace_seconds = SIGNAL_GRACE_MINUTES * 60
     signal_file = "terminate_signal.tmp"
+    start_time = time.time()
+    api_startup_wait_seconds = API_STARTUP_WAIT_MINUTES * 60
+
+    # Track when the signal file was first detected (for grace period)
+    signal_first_seen_at: float = 0.0
+
+    logger.info("  Signal grace period  : %d min (force-terminate after this even if API reports busy)",
+                SIGNAL_GRACE_MINUTES)
+    logger.info("  API startup window   : %d min (Connection refused suppressed + idle timer paused)",
+                API_STARTUP_WAIT_MINUTES)
 
     while True:
-        util = get_gpu_utilization()
         api_busy = is_api_busy()
-
-        # Check for immediate termination signal from API
         termination_requested = os.path.exists(signal_file)
-        other_py = has_other_python_processes()
+        uptime_seconds = time.time() - start_time
+        in_startup_window = uptime_seconds < api_startup_wait_seconds
 
-        if termination_requested and not api_busy and not other_py:
-            logger.warning("Immediate termination requested via signal file — triggering now")
-            idle_seconds = terminate_after  # Force termination trigger
-        elif util < IDLE_THRESHOLD and not api_busy and not other_py:
-            idle_seconds += POLL_INTERVAL
-            logger.info(
-                "System IDLE: GPU %d%%, API idle — idle for %d/%d min",
-                util, idle_seconds // 60, TERMINATE_MINUTES,
-            )
+        if termination_requested:
+            now = time.time()
+            if signal_first_seen_at == 0.0:
+                signal_first_seen_at = now
+                logger.warning("!!! TERMINATION SIGNAL FILE DETECTED — starting %d-min drain grace period !!!",
+                               SIGNAL_GRACE_MINUTES)
+
+            elapsed_since_signal = now - signal_first_seen_at
+            remaining = max(0.0, signal_grace_seconds - elapsed_since_signal)
+
+            if api_busy and remaining > 0:
+                logger.warning("Termination signal active — API still busy, waiting for ops to drain. "
+                               "%.1f/%.0f min elapsed (%.1f min remaining in grace period).",
+                               elapsed_since_signal / 60, SIGNAL_GRACE_MINUTES, remaining / 60)
+            elif api_busy and remaining <= 0:
+                logger.warning("!!! GRACE PERIOD EXPIRED — forcing termination despite API busy state !!!")
+                logger.warning("A stuck operation is blocking shutdown. Force-terminating now.")
+                idle_seconds = terminate_after
+            else:
+                logger.warning("!!! Termination signal active + API is IDLE — triggering termination !!!")
+                idle_seconds = terminate_after
+        elif not api_busy:
+            if in_startup_window:
+                logger.info("API not reachable yet — startup window active (%.0f/%.0f min). Idle timer paused.",
+                            uptime_seconds / 60, API_STARTUP_WAIT_MINUTES)
+            else:
+                signal_first_seen_at = 0.0  # Reset if signal file disappears
+                idle_seconds += POLL_INTERVAL
+                logger.info("System IDLE (No active S3/inference/training) — %d/%d min until termination",
+                            idle_seconds // 60, TERMINATE_MINUTES)
         else:
             if idle_seconds > 0:
-                if api_busy:
-                    reason = "API BUSY"
-                elif other_py:
-                    reason = "BACKGROUND PYTHON PROCESSES"
-                else:
-                    reason = f"GPU active ({util}%)"
-                logger.info(
-                    "System ACTIVE: %s — idle counter reset (was %d min)",
-                    reason, idle_seconds // 60,
-                )
-            else:
-                if api_busy:
-                    logger.info("System status: API BUSY, GPU %d%%", util)
-                elif other_py:
-                    logger.info("System status: BACKGROUND PROCESSES, GPU %d%%", util)
-                else:
-                    logger.info("System status: GPU active (%d%%)", util)
+                logger.info("System ACTIVE — Activity detected in API. Resetting idle timer (was %d min)",
+                            idle_seconds // 60)
+            signal_first_seen_at = 0.0
             idle_seconds = 0
 
         if idle_seconds >= terminate_after:
-            logger.warning("Sustained idle — triggering instance termination")
+            logger.error("=" * 60)
+            logger.error("TERMINATION TRIGGERED")
+            logger.error("=" * 60)
+
+            logger.info("Resolving instance UUID for termination...")
             uuid = resolve_instance_uuid(client)
             if not uuid:
-                logger.error("Cannot resolve instance UUID — skipping termination")
+                logger.error("FATAL: Cannot terminate — No instance UUID found. Will retry next cycle.")
+                logger.error("  Check that GPU_INSTANCE_ID, MASSED_COMPUTE_INSTANCE_UUID, or GPU_INSTANCE_UUID is set in .env")
                 idle_seconds = 0
                 time.sleep(POLL_INTERVAL)
                 continue
 
             if args.dry_run:
-                logger.warning("DRY RUN: Would terminate instance %s", uuid)
+                logger.warning("[DRY RUN] Would call Massed Compute API to terminate %s", uuid)
                 idle_seconds = 0
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            logger.warning("Terminating instance %s NOW", uuid)
+            logger.error(">>> PRE-TERMINATE: uuid=%s, api_token=%s..., base_url=%s <<<",
+                         uuid, client.api_token[:12] if client.api_token else "NONE", client.BASE_URL)
+            logger.error(">>> CALLING client.terminate_instance([%s]) NOW <<<", uuid)
             try:
-                client.terminate_instance([uuid])
+                result = client.terminate_instance([uuid])
+                logger.error(">>> POST-TERMINATE: API returned: %s <<<", result)
+                logger.info("Termination request sent successfully. Goodbye. 👋")
+                sys.exit(0)
             except Exception as exc:
-                logger.error("Terminate API call failed: %s", exc)
-            finally:
-                sys.stdout.flush()
-                sys.stderr.flush()
-
-            logger.info("Goodbye 👋")
-            sys.exit(0)
+                logger.error("FAILED TO TERMINATE INSTANCE: %s", exc, exc_info=True)
+                # Log the full HTTP response if it's a requests exception
+                if hasattr(exc, 'response') and exc.response is not None:
+                    logger.error("  HTTP status: %s", exc.response.status_code)
+                    logger.error("  Response body: %s", exc.response.text[:1000])
+                idle_seconds = 0
 
         time.sleep(POLL_INTERVAL)
 

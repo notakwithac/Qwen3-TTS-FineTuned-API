@@ -14,8 +14,14 @@ fi
 
 echo "🚀 Starting fresh GPU Idle Watchdog..."
 mkdir -p logs
-nohup python gpu_idle_watchdog.py >> logs/watchdog.log 2>&1 &
+nohup python gpu_idle_watchdog.py 2>&1 | tee -a logs/watchdog.log &
+sleep 3
 
 NEW_PID=$(pgrep -f "gpu_idle_watchdog.py")
-echo "✅ Watchdog started successfully with PID: $NEW_PID"
-echo "📄 Logs available at: logs/watchdog.log"
+if [ -n "$NEW_PID" ]; then
+    echo "✅ Watchdog started successfully with PID: $NEW_PID"
+    echo "📄 Logs mirrored to stdout AND logs/watchdog.log"
+else
+    echo "❌ ERROR: Watchdog failed to start! Check logs/watchdog.log:"
+    tail -20 logs/watchdog.log
+fi

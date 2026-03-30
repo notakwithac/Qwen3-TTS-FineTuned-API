@@ -457,10 +457,10 @@ def create_finetune_job(req: FinetuneRequest):
         if req.resume_job_id:
             previous_job = pipeline.get_job(req.resume_job_id)
             if not previous_job:
-                ops_log.start("resume_job_fallback", extra={"reason": "job_not_found", "resume_job_id": req.resume_job_id})
+                ops_log.log_event("resume_job_fallback", extra={"reason": "job_not_found", "resume_job_id": req.resume_job_id})
                 logger.warning(f"Job to resume ({req.resume_job_id}) not found. Falling back to default base model.")
             elif not previous_job.checkpoint_path or not os.path.exists(previous_job.checkpoint_path):
-                ops_log.start("resume_job_fallback", extra={"reason": "checkpoint_not_found", "resume_job_id": req.resume_job_id})
+                ops_log.log_event("resume_job_fallback", extra={"reason": "checkpoint_not_found", "resume_job_id": req.resume_job_id})
                 logger.warning(f"Job to resume ({req.resume_job_id}) does not have a valid checkpoint. Falling back to default base model.")
             else:
                 base_model_path = previous_job.checkpoint_path
@@ -827,6 +827,7 @@ async def voice_clone(req: VoiceCloneRequest):
         )
 
     pipeline.inference._touch()
+    logger.info(f"Voice clone request: ref_audio_url={req.ref_audio_url[:120]}... text='{req.text[:50]}...'")
     
     filename = req.s3_filename or f"clone_{uuid.uuid4().hex[:8]}.wav"
     s3_prefix = "audio/voice_clone"
@@ -899,6 +900,7 @@ async def voice_clone_batch(req: VoiceCloneBatchRequest):
         )
 
     pipeline.inference._touch()
+    logger.info(f"Voice clone BATCH request: {len(req.items)} items, ref_audio_url={req.ref_audio_url[:120]}...")
 
     concurrency_limit = asyncio.Semaphore(10)
     s3_prefix = "audio/voice_clone"
@@ -932,7 +934,7 @@ async def voice_clone_batch(req: VoiceCloneBatchRequest):
                     x_vector_only_modes=req.use_xvec,
                 )
             except Exception as e:
-                logger.error(f"Voice clone batch item {index} failed: {e}")
+                logger.error(f"Voice clone batch item {index} failed: {e} | ref_audio_url={req.ref_audio_url[:120]}")
                 return None
 
             # Upload to S3

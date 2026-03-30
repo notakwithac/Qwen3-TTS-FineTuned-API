@@ -736,7 +736,8 @@ class InferenceManager:
                     op = ops_log.start("inference_voice_clone_flexible_batch", extra={
                         "batch_size": len(texts),
                     })
-                    logger.info(f"VoiceClone flexible started for {len(texts)} texts.")
+                    unique_refs = list(set(ref_audios))
+                    logger.info(f"VoiceClone flexible started for {len(texts)} texts. Unique ref_audios: {[u[:100] for u in unique_refs]}")
                     try:
                         wavs_list, sr = model.generate_voice_clone(
                             text=texts,

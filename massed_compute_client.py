@@ -3,14 +3,17 @@ API Wrapper for Massed Compute VM API (v1).
 Documentation: https://vm-docs.massedcompute.com/api/v1
 """
 
+import logging
 import os
 import requests
 from typing import List, Dict, Any, Optional
 
+logger = logging.getLogger("massed-compute-client")
+
 
 class MassedComputeClient:
 
-    BASE_URL = "https://api.massedcompute.com/api/v1"
+    BASE_URL = "https://vm.massedcompute.com/api/v1"
 
     def __init__(self, api_token: Optional[str] = None):
         self.api_token = api_token or os.getenv("MASSED_COMPUTE_API_TOKEN")
@@ -25,16 +28,18 @@ class MassedComputeClient:
         }
 
     def _get(self, endpoint: str) -> Dict[str, Any]:
-        response = requests.get(
-            f"{self.BASE_URL}/{endpoint}", headers=self.headers
-        )
+        url = f"{self.BASE_URL}/{endpoint}"
+        logger.debug("GET %s", url)
+        response = requests.get(url, headers=self.headers)
+        logger.debug("GET %s -> %d", url, response.status_code)
         response.raise_for_status()
         return response.json()
 
     def _post(self, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        response = requests.post(
-            f"{self.BASE_URL}/{endpoint}", headers=self.headers, json=payload
-        )
+        url = f"{self.BASE_URL}/{endpoint}"
+        logger.info("POST %s payload=%s", url, payload)
+        response = requests.post(url, headers=self.headers, json=payload)
+        logger.info("POST %s -> status=%d body=%s", url, response.status_code, response.text[:500])
         response.raise_for_status()
         return response.json()
 
@@ -86,8 +91,11 @@ class MassedComputeClient:
 
     def terminate_instance(self, instance_uuids: List[str]) -> Dict[str, Any]:
         """Terminate one or more instances."""
+        logger.warning(">>> terminate_instance called with UUIDs: %s", instance_uuids)
         payload = {"instanceUuids": instance_uuids}
-        return self._post("instance/terminate", payload)
+        result = self._post("instance/terminate", payload)
+        logger.warning(">>> terminate_instance result: %s", result)
+        return result
 
     def get_instance(self, instance_uuid: str) -> Dict[str, Any]:
         """Retrieve details of a single running instance by UUID."""

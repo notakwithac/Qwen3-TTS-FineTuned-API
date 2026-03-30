@@ -15,7 +15,11 @@
 # limitations under the License.
 import base64
 import io
+import logging
+import time
+import random
 import urllib.request
+import urllib.error
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
@@ -27,6 +31,8 @@ import torch
 from transformers import AutoConfig, AutoModel, AutoProcessor
 
 from ..core.models import Qwen3TTSConfig, Qwen3TTSForConditionalGeneration, Qwen3TTSProcessor
+
+logger = logging.getLogger(__name__)
 
 AudioLike = Union[
     str,                     # wav path, URL, base64
@@ -206,10 +212,56 @@ class Qwen3TTSModel:
 
     def _load_audio_to_np(self, x: str) -> Tuple[np.ndarray, int]:
         if self._is_url(x):
-            with urllib.request.urlopen(x) as resp:
-                audio_bytes = resp.read()
-            with io.BytesIO(audio_bytes) as f:
-                audio, sr = sf.read(f, dtype="float32", always_2d=False)
+            # Truncate URL for logging (hide sensitive tokens but show host/path)
+            from urllib.parse import urlparse as _urlparse
+            _parsed = _urlparse(x)
+            _safe_url = f"{_parsed.scheme}://{_parsed.netloc}{_parsed.path}"
+            if _parsed.query:
+                _safe_url += f"?<{len(_parsed.query)} chars>"
+            logger.info(f"Downloading ref audio from: {_safe_url}")
+            
+            max_retries = 3
+            last_err = None
+            for attempt in range(max_retries):
+                try:
+                    # Provide a browser-like User-Agent to avoid 403 Forbidden on some hosts
+                    req = urllib.request.Request(
+                        x, 
+                        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+                    )
+                    with urllib.request.urlopen(req, timeout=30) as resp:
+                        audio_bytes = resp.read()
+                    logger.info(f"Ref audio downloaded OK: {len(audio_bytes)} bytes from {_safe_url}")
+                    with io.BytesIO(audio_bytes) as f:
+                        audio, sr = sf.read(f, dtype="float32", always_2d=False)
+                    return audio.astype(np.float32), int(sr)
+                except Exception as e:
+                    last_err = e
+                    # Log detailed error info for HTTP errors
+                    if isinstance(e, urllib.error.HTTPError):
+                        resp_headers = dict(e.headers) if e.headers else {}
+                        logger.error(
+                            f"Audio download HTTP {e.code} from {_safe_url} "
+                            f"(attempt {attempt+1}/{max_retries}). "
+                            f"Response headers: {resp_headers}"
+                        )
+                    else:
+                        logger.error(f"Audio download error from {_safe_url} (attempt {attempt+1}/{max_retries}): {type(e).__name__}: {e}")
+                    
+                    # Retry on common transient errors: 403 (sometimes rate limit), 429 (Too Many Requests), 5xx (Server Error)
+                    is_retryable = False
+                    if isinstance(e, urllib.error.HTTPError):
+                        if e.code in (403, 429, 500, 502, 503, 504):
+                            is_retryable = True
+                    elif isinstance(e, (urllib.error.URLError, TimeoutError, ConnectionError)):
+                        is_retryable = True
+                    
+                    if is_retryable and attempt < max_retries - 1:
+                        sleep_time = (2 ** attempt) + random.random()
+                        logger.warning(f"Audio download attempt {attempt+1} failed: {e}. Retrying in {sleep_time:.1f}s...")
+                        time.sleep(sleep_time)
+                        continue
+                    raise last_err
         elif self._is_probably_base64(x):
             wav_bytes = self._decode_base64_to_wav_bytes(x)
             with io.BytesIO(wav_bytes) as f:
@@ -248,9 +300,13 @@ class Qwen3TTSModel:
             items = [audios]
 
         out: List[Tuple[np.ndarray, int]] = []
+        _local_cache: Dict[str, Tuple[np.ndarray, int]] = {}
+        
         for a in items:
             if isinstance(a, str):
-                out.append(self._load_audio_to_np(a))
+                if a not in _local_cache:
+                    _local_cache[a] = self._load_audio_to_np(a)
+                out.append(_local_cache[a])
             elif isinstance(a, tuple) and len(a) == 2 and isinstance(a[0], np.ndarray):
                 out.append((a[0].astype(np.float32), int(a[1])))
             elif isinstance(a, np.ndarray):
