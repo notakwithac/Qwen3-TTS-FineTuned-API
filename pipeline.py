@@ -296,6 +296,7 @@ class Pipeline:
         chapter_id: Optional[str] = None,
         character_id: Optional[str] = None,
         base_model_path: Optional[str] = None,
+        job_id: Optional[str] = None,
     ) -> Job:
         """Create a new fine-tuning job from an uploaded dataset zip.
 
@@ -303,9 +304,16 @@ class Pipeline:
           - train.jsonl
           - data/ directory with .wav files
         """
-        job_id = uuid.uuid4().hex[:12]
+        if not job_id:
+            job_id = uuid.uuid4().hex[:12]
+            
         job_dir = self.jobs_dir / job_id
         
+        # If job_id is reused and directory exists, clean it up
+        if job_dir.exists():
+            logger.info(f"Re-creating job {job_id}: Cleaning up existing directory {job_dir}")
+            shutil.rmtree(job_dir, ignore_errors=True)
+
         dataset_dir = job_dir / "dataset"
         output_dir = job_dir / "output"
 
@@ -505,9 +513,12 @@ class Pipeline:
         or can be restored from S3), skips straight to loading for inference
         instead of re-running the entire pipeline.
         """
-        job = self.jobs.get(job_id)
+        job = self.get_job(job_id)
         if not job:
             return None
+            
+        if job.status == JobStatus.READY:
+            return job # Already complete, just return it
             
         if job.status not in (JobStatus.FAILED, JobStatus.CANCELLED):
             return None  # Only allow retrying if it actually failed or died.

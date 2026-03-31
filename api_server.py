@@ -419,6 +419,7 @@ class FinetuneRequest(BaseModel):
     chapter_id: Optional[str] = None
     character_id: Optional[str] = None
     resume_job_id: Optional[str] = None
+    job_id: Optional[str] = None
 
 @app.post("/finetune", summary="Start a fine-tuning job", response_model=JobSummary)
 def create_finetune_job(req: FinetuneRequest):
@@ -465,6 +466,20 @@ def create_finetune_job(req: FinetuneRequest):
             else:
                 base_model_path = previous_job.checkpoint_path
 
+        # If job_id is provided, check if it already exists
+        if req.job_id:
+            existing_job = pipeline.get_job(req.job_id)
+            if existing_job:
+                # If job exists, we return it. If the user wanted a fresh start with same ID, 
+                # the pipeline.create_job logic will handle cleanup if called.
+                # However, to match the "create" intent, we only return existing if it's already active/ready.
+                # If they explicitly want to RE-CREATE, they should probably delete first or we can allow it.
+                # Given the user's request "create a finetune job with the same dataset and same job_id if job is not found",
+                # it implies they'll only call this if it's NOT found. 
+                # But if it IS found, returning it is the safest "idempotent" behavior.
+                logger.info(f"Job {req.job_id} already exists. Returning existing job.")
+                return JSONResponse(content=existing_job.to_dict(), status_code=200)
+
         # Download the file from S3
         storage.download_file(req.dataset_s3_key, tmp_path)
         
@@ -478,6 +493,7 @@ def create_finetune_job(req: FinetuneRequest):
             chapter_id=req.chapter_id,
             character_id=req.character_id,
             base_model_path=base_model_path,
+            job_id=req.job_id,
         )
         ops_log.end(op, extra={"job_id": job.job_id})
     except Exception as e:
@@ -526,12 +542,60 @@ async def delete_job(job_id: str):
 
 
 @app.post("/jobs/{job_id}/retry", summary="Retry a failed job", response_model=JobSummary)
-async def retry_job(job_id: str):
-    """Retry a job that has failed or been cancelled."""
+async def retry_job(job_id: str, req: Optional[FinetuneRequest] = None):
+    """Retry a job that has failed or been cancelled.
+    
+    If the job is not found in memory, disk, or S3, and a request body is provided,
+    it will attempt to create a new job with the specified `job_id`.
+    """
     job = pipeline.retry_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail=f"Job {job_id} not found, or it is not in a failed/cancelled state.")
-    return JSONResponse(content=job.to_dict(), status_code=202)
+    if job:
+        # If it was already READY or successfully retried
+        return JSONResponse(content=job.to_dict(), status_code=202 if job.status != JobStatus.READY else 200)
+
+    # Job not found or not in a retryable state. If we have a body, fallback to creation.
+    if req:
+        logger.info(f"Job {job_id} not found for retry. Falling back to creation as requested.")
+        # Re-use the creation logic but with our specific job_id
+        # We need to handle the S3 download again here or refactor it.
+        # For simplicity, we'll repeat the download logic since it's short.
+        
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+            tmp_path = tmp.name
+        
+        try:
+            storage.download_file(req.dataset_s3_key, tmp_path)
+            
+            # Resolve resume_job_id if any (unlikely for a fresh creation, but for completeness)
+            base_model_path = None
+            if req.resume_job_id:
+                prev = pipeline.get_job(req.resume_job_id)
+                if prev and prev.checkpoint_path and os.path.exists(prev.checkpoint_path):
+                    base_model_path = prev.checkpoint_path
+
+            job = pipeline.create_job(
+                dataset_zip_path=tmp_path,
+                speaker_name=req.speaker_name,
+                num_epochs=req.num_epochs,
+                batch_size=req.batch_size,
+                lr=req.lr,
+                book_id=req.book_id,
+                chapter_id=req.chapter_id,
+                character_id=req.character_id,
+                base_model_path=base_model_path,
+                job_id=job_id,
+            )
+            pipeline.start_job(job.job_id)
+            return JSONResponse(content=job.to_dict(), status_code=202)
+        except Exception as e:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise HTTPException(status_code=400, detail=f"Failed to resurrect job {job_id}: {str(e)}")
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    raise HTTPException(status_code=404, detail=f"Job {job_id} not found, or it is not in a failed/cancelled state.")
 
 
 @app.post(
