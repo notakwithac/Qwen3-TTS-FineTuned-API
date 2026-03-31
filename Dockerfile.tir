@@ -1,17 +1,20 @@
 # Dockerfile for running the fine-tuning API on E2E Networks TIR
 # Build:  docker build -f Dockerfile.tir -t qwen3-tts-api .
 # Run:    docker run --gpus all -p 8000:8000 qwen3-tts-api
+#
+# Uses pip (not uv) for installs so it detects the base image's existing
+# torch/CUDA packages and skips re-downloading them (~3 GB saved).
 
 FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 
-# System dependencies for audio processing & building flash-attn
+# System dependencies for audio processing
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl git build-essential libsndfile1 sox \
+    curl git build-essential libsndfile1 sox dos2unix \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Install uv
+# Install uv (kept for runtime use, not used for Docker install steps)
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.local/bin:$PATH"
 
@@ -21,14 +24,38 @@ COPY qwen_tts/ ./qwen_tts/
 COPY finetuning/ ./finetuning/
 COPY MANIFEST.in ./
 
-# Install dependencies (Linux mode — flash-attn from PyPI)
-RUN uv venv --python 3.11 .venv && \
-    . .venv/bin/activate && \
-    uv sync --extra cu128 && \
-    uv pip install fastapi uvicorn python-multipart
+# --- Layer 1: Core ML dependencies ---
+# pip sees the conda-installed torch and skips it (unlike uv which re-downloads)
+RUN pip install --no-cache-dir \
+    "numpy<2.0.0" \
+    "transformers==4.57.3" \
+    "accelerate==1.12.0" \
+    einops \
+    "tensorboard>=2.20.0" \
+    requests boto3
 
-# Copy API / pipeline code
-COPY api_server.py pipeline.py inference_manager.py ./
+# --- Layer 2: Audio / media / API dependencies ---
+RUN pip install --no-cache-dir \
+    gradio librosa soundfile sox onnxruntime \
+    "fastapi>=0.115.0" \
+    "uvicorn[standard]>=0.34.0" \
+    "python-multipart>=0.0.18"
+
+# --- Layer 3: flash-attn from pre-built wheel (own layer — GitHub can be slow) ---
+RUN pip install --no-cache-dir \
+    "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.5cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
+
+# --- Layer 4: Install the project package itself (no deps, just the code) ---
+RUN pip install --no-cache-dir --no-deps -e .
+
+# --- Layer 5: Create .venv for start_tir.sh compatibility ---
+# --system-site-packages gives the venv access to everything installed above
+RUN python -m venv --system-site-packages .venv
+
+# Copy all API / pipeline and related files
+COPY *.py ./
+COPY *.sh ./
+RUN dos2unix *.sh
 
 # Expose API port
 EXPOSE 8000
@@ -37,4 +64,4 @@ EXPOSE 8000
 ENV DEVICE=cuda:0
 ENV USE_FLASH_ATTN=1
 
-CMD ["/app/.venv/bin/uvicorn", "api_server:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["bash", "start_tir.sh"]
