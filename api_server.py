@@ -699,6 +699,10 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
     # Create a Semaphore to limit concurrent S3 checks and generation launching
     # Allowing up to GPU_BATCH_SIZE concurrent submissions ensures we fill our fusion batches efficiently.
     concurrency_limit = asyncio.Semaphore(GPU_BATCH_SIZE)
+    
+    # Generate one session code for the entire batch request so they are grouped together
+    batch_session_code = uuid.uuid4().hex[:8]
+    s3_prefix_base = f"audio/segments/{req.book_id}/{req.chapter_id}" if (req.book_id and req.chapter_id) else f"audio/{batch_session_code}/{job_id}"
 
     async def process_item(item, index):
         async with concurrency_limit:
@@ -709,8 +713,7 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
             overwrite = item.get("overwrite", req.overwrite)
             
             # Construct S3 prefix for the upload phase
-            session_code = uuid.uuid4().hex[:8]
-            s3_prefix = f"audio/segments/{req.book_id}/{req.chapter_id}" if (req.book_id and req.chapter_id) else f"audio/{session_code}/{job_id}"
+            s3_prefix = s3_prefix_base
 
             # Enhanced Fast-path check
             s3_key_found = None
@@ -903,11 +906,12 @@ async def voice_clone_batch(req: VoiceCloneBatchRequest):
     logger.info(f"Voice clone BATCH request: {len(req.items)} items, ref_audio_url={req.ref_audio_url[:120]}...")
 
     concurrency_limit = asyncio.Semaphore(10)
-    s3_prefix = "audio/voice_clone"
+    batch_session_code = uuid.uuid4().hex[:8]
+    s3_prefix = f"audio/voice_clone/{batch_session_code}"
 
     async def process_item(item: VoiceCloneBatchItem, index: int):
         async with concurrency_limit:
-            filename = item.filename or f"clone_batch_{uuid.uuid4().hex[:8]}.wav"
+            filename = item.filename or f"clone_batch_{index:04d}.wav"
             s3_key = f"{s3_prefix}/{filename}"
             
             # S3 fast-path
