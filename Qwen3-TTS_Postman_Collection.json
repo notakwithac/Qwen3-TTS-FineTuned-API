@@ -7,6 +7,54 @@
     },
     "item": [
         {
+            "name": "GPU Management",
+            "item": [
+                {
+                    "name": "Terminate Instance",
+                    "request": {
+                        "method": "POST",
+                        "header": [],
+                        "url": {
+                            "raw": "{{base_url}}/gpu/terminate",
+                            "host": ["{{base_url}}"],
+                            "path": ["gpu", "terminate"]
+                        },
+                        "description": "Request instance termination. Puts the server into DRAINING mode (rejects new POST requests) and creates a terminate_signal.tmp file that the GPU watchdog monitors. The instance will be terminated once all active operations complete."
+                    },
+                    "response": []
+                },
+                {
+                    "name": "Cancel Terminate",
+                    "request": {
+                        "method": "POST",
+                        "header": [],
+                        "url": {
+                            "raw": "{{base_url}}/gpu/cancel-terminate",
+                            "host": ["{{base_url}}"],
+                            "path": ["gpu", "cancel-terminate"]
+                        },
+                        "description": "Cancel a pending termination request. Resets IS_DRAINING to false so the server accepts new work again, and deletes the terminate_signal.tmp file so the watchdog stops monitoring for termination."
+                    },
+                    "response": []
+                },
+                {
+                    "name": "GPU Status",
+                    "request": {
+                        "method": "GET",
+                        "header": [],
+                        "url": {
+                            "raw": "{{base_url}}/gpu/status",
+                            "host": ["{{base_url}}"],
+                            "path": ["gpu", "status"]
+                        },
+                        "description": "Get GPU memory usage, model load state, and idle timer info."
+                    },
+                    "response": []
+                }
+            ]
+        },
+
+        {
             "name": "Voice Design",
             "request": {
                 "method": "POST",

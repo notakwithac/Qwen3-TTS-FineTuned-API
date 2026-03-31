@@ -280,17 +280,29 @@ class CharacterWorker:
         """Upload a single WAV to S3 and update progress."""
         from functools import partial
         try:
+            # Determine if session prefix is needed
+            is_segment = bool(msg.book_id and msg.chapter_id)
+            
+            # If no filename provided, generate a default one
+            filename = msg.s3_filename
+            if not filename:
+                ts = int(time.time())
+                filename = f"audio_{ts}.wav"
+            
+            # Prefix with session_id for non-segment uploads
+            final_filename = f"{msg.session_id}_{filename}" if not is_segment else filename
+
             s3_url = await loop.run_in_executor(
                 None,
                 partial(
                     self.storage.upload_wav,
                     wav_bytes, msg.job_id,
-                    filename=msg.s3_filename,
+                    filename=final_filename,
                     prefix=s3_prefix,
                     model_id=msg.job_id,
                 )
             )
-            s3_key = f"{s3_prefix}/{msg.s3_filename}"
+            s3_key = f"{s3_prefix}/{final_filename}"
             presigned_url = self.storage.get_presigned_url(s3_key, expires_in=86400)
             self.progress.completed += 1
             self.progress.results.append({

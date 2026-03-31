@@ -574,7 +574,7 @@ class Pipeline:
 
             self.inference.load(cp, job.speaker_name)
 
-            job.checkpoint_path = cp
+            job.checkpoint_path = str(Path(cp).resolve())  # always absolute
             job.status = JobStatus.READY
             job.finished_at = datetime.now(timezone.utc).isoformat()
             job.progress = {
@@ -772,7 +772,7 @@ class Pipeline:
                 self._training_queue.release()
                 return
 
-            job.checkpoint_path = checkpoint_path
+            job.checkpoint_path = str(Path(checkpoint_path).resolve())  # always absolute — prevents HF from_pretrained misinterpreting as a repo id
 
             # Free training GPU memory before loading for inference
             gc.collect()
@@ -784,7 +784,7 @@ class Pipeline:
             job.progress = {"stage": "loading", "detail": "Loading fine-tuned model for inference..."}
             job.save()
 
-            self.inference.load(str(checkpoint_path), job.speaker_name)
+            self.inference.load(str(Path(checkpoint_path).resolve()), job.speaker_name)
 
             job.status = JobStatus.READY
             job.finished_at = datetime.now(timezone.utc).isoformat()
@@ -966,7 +966,7 @@ class Pipeline:
         output_dir.mkdir(parents=True, exist_ok=True)
 
         checkpoint_dir = output_dir / f"checkpoint_{job.speaker_name}"
-        checkpoint_path = str(checkpoint_dir)
+        checkpoint_path = str(checkpoint_dir.resolve())  # always absolute
 
         # 1. Quick check: is it already there?
         if checkpoint_dir.exists() and any(checkpoint_dir.iterdir()):
@@ -983,7 +983,7 @@ class Pipeline:
         with lock:
             # 3. Double-check: did another thread just finish it?
             if checkpoint_dir.exists() and any(checkpoint_dir.iterdir()):
-                job.checkpoint_path = checkpoint_path
+                job.checkpoint_path = checkpoint_path  # already absolute (resolved above)
                 return checkpoint_path
 
             prev_status = job.status
@@ -1010,7 +1010,7 @@ class Pipeline:
 
                 os.unlink(tmp_path)
 
-                job.checkpoint_path = checkpoint_path
+                job.checkpoint_path = checkpoint_path  # already absolute (resolved above)
                 job.status = JobStatus.READY
                 job.progress = {
                     "stage": "ready",

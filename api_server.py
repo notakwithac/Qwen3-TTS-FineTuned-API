@@ -11,6 +11,7 @@ import tempfile
 import time
 import uuid
 import asyncio
+from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, Request
@@ -622,8 +623,9 @@ async def infer(job_id: str, req: InferRequest):
     if job.status not in (JobStatus.READY, JobStatus.RESTORING):
         # Auto-recover: if job FAILED but training completed (has S3 backup or local checkpoint),
         # transparently recover instead of returning an error
+        _cp_check = str(Path(job.checkpoint_path).resolve()) if job.checkpoint_path else None
         can_recover = job.status == JobStatus.FAILED and (
-            job.s3_model_key or (job.checkpoint_path and os.path.exists(str(job.checkpoint_path)))
+            job.s3_model_key or (_cp_check and os.path.exists(_cp_check))
         )
         if not can_recover:
             raise HTTPException(
@@ -643,6 +645,9 @@ async def infer(job_id: str, req: InferRequest):
             if storage.object_exists(proper_key):
                 s3_key_found = proper_key
         else:
+            # Check for existing session-based audio if filename provided
+            # Note: without a session_code in the request, we can't perfectly fast-path 
+            # prefixed files, but we can check the legacy path for backwards compatibility
             legacy_key = f"audio/{job_id}/{req.s3_filename}"
             if storage.object_exists(legacy_key):
                 s3_key_found = legacy_key
@@ -660,6 +665,10 @@ async def infer(job_id: str, req: InferRequest):
 
     try:
         checkpoint_path = str(job.checkpoint_path) if job.checkpoint_path else None
+        # Resolve to absolute path — relative paths (e.g. "jobs/id/output/ckpt") cause
+        # HuggingFace from_pretrained to misinterpret them as Hub repo IDs.
+        if checkpoint_path and not os.path.isabs(checkpoint_path):
+            checkpoint_path = str(Path(checkpoint_path).resolve())
         # If checkpoint is missing locally, restore from S3
         if not checkpoint_path or not os.path.exists(checkpoint_path):
             if job.s3_model_key:
@@ -681,14 +690,26 @@ async def infer(job_id: str, req: InferRequest):
 
     # If upload_to_s3 is True (default), return JSON URL
     if req.upload_to_s3:
-        # Construct S3 prefix based on user's structure decision
+        # Construct S3 prefix based on user's structure decision (audio/{job_id}/{session_code}_{filename})
         session_code = uuid.uuid4().hex[:8]
-        s3_prefix = f"audio/segments/{req.book_id}/{req.chapter_id}" if (req.book_id and req.chapter_id) else f"audio/{session_code}/{job_id}"
+        is_segment = bool(req.book_id and req.chapter_id)
         
+        s3_prefix = f"audio/segments/{req.book_id}/{req.chapter_id}" if is_segment else f"audio/{job_id}"
+        
+        # Determine final filename
+        final_filename = req.s3_filename
+        if not is_segment:
+            if not final_filename:
+                # Generate a default filename if none provided
+                ts = int(time.time())
+                final_filename = f"audio_{ts}.wav"
+            # Prefix with session code for non-segment uploads
+            final_filename = f"{session_code}_{final_filename}"
+
         with ops_log.operation("s3_upload", job_id=job_id):
-            s3_url = storage.upload_wav(wav_bytes, job_id, filename=req.s3_filename, prefix=s3_prefix, model_id=job_id)
+            s3_url = storage.upload_wav(wav_bytes, job_id, filename=final_filename, prefix=s3_prefix, model_id=job_id)
         
-        s3_key = f"{s3_prefix}/{req.s3_filename}" if req.s3_filename else s3_url.split(f"{storage.bucket}/")[-1]
+        s3_key = f"{s3_prefix}/{final_filename}"
         
         # Generate presigned URL for private bucket access
         presigned_url = storage.get_presigned_url(s3_key, expires_in=86400) # 24h
@@ -746,8 +767,9 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
     if not job:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
     if job.status not in (JobStatus.READY, JobStatus.RESTORING):
+        _cp_check = str(Path(job.checkpoint_path).resolve()) if job.checkpoint_path else None
         can_recover = job.status == JobStatus.FAILED and (
-            job.s3_model_key or (job.checkpoint_path and os.path.exists(str(job.checkpoint_path)))
+            job.s3_model_key or (_cp_check and os.path.exists(_cp_check))
         )
         if not can_recover:
             raise HTTPException(
@@ -766,7 +788,8 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
     
     # Generate one session code for the entire batch request so they are grouped together
     batch_session_code = uuid.uuid4().hex[:8]
-    s3_prefix_base = f"audio/segments/{req.book_id}/{req.chapter_id}" if (req.book_id and req.chapter_id) else f"audio/{batch_session_code}/{job_id}"
+    is_segment_batch = bool(req.book_id and req.chapter_id)
+    s3_prefix_base = f"audio/segments/{req.book_id}/{req.chapter_id}" if is_segment_batch else f"audio/{job_id}"
 
     async def process_item(item, index):
         async with concurrency_limit:
@@ -808,7 +831,25 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
             # Run generation using the local batcher (fuses multiple requests into one GPU pass)
             try:
                 loop = asyncio.get_running_loop()
+
+                # Resolve to absolute path — prevents HF from_pretrained treating a relative
+                # path like 'jobs/id/output/checkpoint-epoch-14' as a Hub repo ID.
                 checkpoint_path = str(job.checkpoint_path) if job.checkpoint_path else None
+                if checkpoint_path and not os.path.isabs(checkpoint_path):
+                    checkpoint_path = str(Path(checkpoint_path).resolve())
+
+                # If the local epoch folder was LRU-evicted or never restored, fall back to S3.
+                if not checkpoint_path or not os.path.exists(checkpoint_path):
+                    if job.s3_model_key:
+                        logger.info(f"Batch infer: checkpoint missing locally for job {job_id}, restoring from S3...")
+                        checkpoint_path = await loop.run_in_executor(
+                            None, pipeline._restore_checkpoint_from_s3, job
+                        )
+                    else:
+                        raise RuntimeError(
+                            f"Job {job_id} has no local checkpoint and no S3 backup to restore from."
+                        )
+
                 batcher = get_custom_voice_batcher(job_id, checkpoint_path, job.speaker_name)
                 
                 wav_bytes, sr = await batcher.submit(
@@ -817,13 +858,16 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
                     instructs=instruct
                 )
 
+                # Determine final filename with session prefix
+                final_filename = f"{batch_session_code}_{filename}" if not is_segment_batch else filename
+
                 # Parallel S3 upload
                 s3_url = await loop.run_in_executor(
                     None,
-                    partial(storage.upload_wav, wav_bytes, job_id, filename=filename, prefix=s3_prefix, model_id=job_id)
+                    partial(storage.upload_wav, wav_bytes, job_id, filename=final_filename, prefix=s3_prefix, model_id=job_id)
                 )
                 
-                s3_key = f"{s3_prefix}/{filename}"
+                s3_key = f"{s3_prefix}/{final_filename}"
                 presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
 
                 return {
