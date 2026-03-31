@@ -1285,6 +1285,35 @@ async def gpu_terminate():
     }
 
 
+@app.post("/gpu/cancel-terminate", summary="Cancel pending instance termination")
+async def gpu_cancel_terminate():
+    """Cancel a pending termination request.
+    
+    This resets the draining mode, allowing the API to accept new work again,
+    and deletes the signal file monitored by the GPU watchdog.
+    """
+    global IS_DRAINING
+    IS_DRAINING = False
+    
+    signal_file = "terminate_signal.tmp"
+    removed = False
+    if os.path.exists(signal_file):
+        try:
+            os.remove(signal_file)
+            removed = True
+        except Exception as e:
+            logger.error(f"Failed to remove signal file {signal_file}: {e}")
+    
+    ops_log.log_event("termination_cancelled")
+    logger.info("Instance termination CANCELLED — server resumed normal operation.")
+    
+    return {
+        "status": "termination_cancelled",
+        "detail": "Server is now ACTIVE. New work is accepted. Watchdog termination halted.",
+        "signal_file_removed": removed,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Session-Based Inference (Event-Driven)
 # ---------------------------------------------------------------------------
