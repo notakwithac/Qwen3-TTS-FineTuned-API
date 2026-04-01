@@ -30,6 +30,49 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# --- Log Streaming Setup ---
+from fastapi.responses import StreamingResponse
+
+# List of active log queues for SSE streaming
+log_queues: list[asyncio.Queue] = []
+
+class LogStreamHandler(logging.Handler):
+    """Custom logging handler that pushes log records into active client queues."""
+    def emit(self, record: logging.LogRecord):
+        # 1. General level filter for the stream: only INFO and above
+        if record.levelno < logging.DEBUG:
+            return
+
+        # 2. Filter out noisy operational and status logs from the SSE stream
+        # (while keeping them in terminal/files for local debugging)
+        if record.levelno < logging.WARNING:
+            # Silence specific loggers known for noise
+            if record.name in ("ops", "httpx", "httpcore", "urllib3"):
+                return
+            
+            # Silence high-frequency polling paths and metadata requests
+            msg = record.getMessage().lower()
+            noise_filters = [
+                "/health", "/status", "/ops/", "/gpu/status", 
+                "/gpu/vram", "/sessions", "/docs", "/openapi.json", "/favicon.ico"
+            ]
+            if any(f in msg for f in noise_filters):
+                return
+
+        try:
+            msg = self.format(record)
+            # Push to all active queues
+            for q in log_queues:
+                asyncio.run_coroutine_threadsafe(q.put(msg), asyncio.get_event_loop())
+        except Exception:
+            self.handleError(record)
+
+# Attach stream handler to root logger and 'ops' logger
+stream_handler = LogStreamHandler()
+stream_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+logging.getLogger().addHandler(stream_handler)
+logging.getLogger("ops").addHandler(stream_handler)
+
 # Suppress noisy model initialization logs
 logging.getLogger("qwen_tts.core.models.configuration_qwen3_tts").setLevel(logging.ERROR)
 logging.getLogger("qwen_tts.core.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2").setLevel(logging.ERROR)
@@ -260,6 +303,8 @@ voice_clone_batcher = DynamicBatcher(
 )
 
 custom_voice_batchers = {}  # Map job_id -> DynamicBatcher
+voice_clone_batch_jobs = {} # session_id -> {status, completed, total, results, error, ...}
+
 
 def get_custom_voice_batcher(job_id: str, checkpoint_path: str, speaker_name: str) -> DynamicBatcher:
     if job_id not in custom_voice_batchers:
@@ -365,7 +410,7 @@ class VoiceDesignBatchRequest(BaseModel):
 
 class VoiceCloneBatchItem(BaseModel):
     text: str
-    filename: Optional[str] = None
+    filename: str
 
 class VoiceCloneBatchRequest(BaseModel):
     """Batch generate zero-shot voice cloning from a reference audio and upload to S3."""
@@ -376,6 +421,18 @@ class VoiceCloneBatchRequest(BaseModel):
     use_xvec: bool = False
     upload_to_s3: bool = True
     overwrite: bool = False
+
+class VoiceCloneBatchStatusResponse(BaseModel):
+    session_id: str
+    status: str # processing, completed, failed
+    progress_pct: float = 0.0
+    total: int = 0
+    completed: int = 0
+    failed: int = 0
+    results: list[dict] = []
+    error: Optional[str] = None
+    created_at: float
+
 
 class VoiceCloneRequest(BaseModel):
     """Generate speech using zero-shot VoiceClone Base model."""
@@ -997,12 +1054,12 @@ async def voice_clone(req: VoiceCloneRequest):
 
 @app.post(
     "/voice-clone/batch",
-    summary="Batch generate zero-shot voice cloning",
-    response_model=list[InferS3Response],
+    summary="Batch generate zero-shot voice cloning (ASYNCHRONOUS)",
+    response_model=dict,
 )
 async def voice_clone_batch(req: VoiceCloneBatchRequest):
     """Generate multiple audio files in parallel using zero-shot VoiceClone Base model and upload to S3.
-    This uses the global voice_clone_batcher to fuse requests from different users/calls into single GPU passes.
+    This is asynchronous: returns a session_id immediately, poll status via GET /voice-clone/batch/{id}.
     """
     if req.upload_to_s3 and not storage.is_configured:
         raise HTTPException(
@@ -1011,75 +1068,139 @@ async def voice_clone_batch(req: VoiceCloneBatchRequest):
         )
 
     pipeline.inference._touch()
-    logger.info(f"Voice clone BATCH request: {len(req.items)} items, ref_audio_url={req.ref_audio_url[:120]}...")
+    session_id = uuid.uuid4().hex[:8]
+    logger.info(f"Voice clone BATCH request: {len(req.items)} items, session_id={session_id}")
 
-    concurrency_limit = asyncio.Semaphore(10)
-    batch_session_code = uuid.uuid4().hex[:8]
-    s3_prefix = f"audio/voice_clone/{batch_session_code}"
+    # Initialize status
+    voice_clone_batch_jobs[session_id] = {
+        "session_id": session_id,
+        "status": "processing",
+        "total": len(req.items),
+        "completed": 0,
+        "failed": 0,
+        "results": [],
+        "error": None,
+        "created_at": time.time(),
+    }
 
-    async def process_item(item: VoiceCloneBatchItem, index: int):
-        async with concurrency_limit:
-            filename = item.filename or f"clone_batch_{index:04d}.wav"
-            s3_key = f"{s3_prefix}/{filename}"
-            
-            # S3 fast-path
-            if not req.overwrite and req.upload_to_s3 and storage.is_configured:
-                loop = asyncio.get_running_loop()
-                if await loop.run_in_executor(None, storage.object_exists, s3_key):
-                    presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
-                    return {
-                        "s3_url": storage._object_url(s3_key),
-                        "presigned_url": presigned_url,
-                        "s3_key": s3_key,
-                        "sample_rate": 24000,
+    async def run_batch_task():
+        concurrency_limit = asyncio.Semaphore(10)
+        s3_prefix = f"audio/voice_clone/{session_id}"
+        
+        async def process_item(item: VoiceCloneBatchItem, index: int):
+            async with concurrency_limit:
+                filename = item.filename or f"clone_batch_{index:04d}.wav"
+                s3_key = f"{s3_prefix}/{filename}"
+                
+                # S3 fast-path
+                if not req.overwrite and req.upload_to_s3 and storage.is_configured:
+                    loop = asyncio.get_running_loop()
+                    if await loop.run_in_executor(None, storage.object_exists, s3_key):
+                        presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
+                        res = {
+                            "s3_url": storage._object_url(s3_key),
+                            "presigned_url": presigned_url,
+                            "s3_key": s3_key,
+                            "sample_rate": 24000,
+                            "text": item.text,
+                            "job_id": "voice_clone",
+                        }
+                        voice_clone_batch_jobs[session_id]["completed"] += 1
+                        voice_clone_batch_jobs[session_id]["results"].append(res)
+                        return
+
+                # Generate via batcher
+                try:
+                    wav_bytes, sr = await voice_clone_batcher.submit(
+                        texts=item.text,
+                        ref_audios=req.ref_audio_url,
+                        ref_texts=req.ref_text,
+                        languages=req.language,
+                        x_vector_only_modes=req.use_xvec,
+                    )
+                except Exception as e:
+                    logger.error(f"Voice clone batch item {index} failed: {e}")
+                    voice_clone_batch_jobs[session_id]["failed"] += 1
+                    return
+
+                # Upload to S3
+                if req.upload_to_s3:
+                    try:
+                        loop = asyncio.get_running_loop()
+                        from functools import partial
+                        s3_url = await loop.run_in_executor(
+                            None,
+                            partial(storage.upload_wav, wav_bytes, "voice_clone", filename=filename, prefix=s3_prefix, model_id="voice_clone_qwen")
+                        )
+                        presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
+                        res = {
+                            "s3_url": s3_url,
+                            "presigned_url": presigned_url,
+                            "s3_key": s3_key,
+                            "sample_rate": sr,
+                            "text": item.text,
+                            "job_id": "voice_clone",
+                        }
+                        voice_clone_batch_jobs[session_id]["completed"] += 1
+                        voice_clone_batch_jobs[session_id]["results"].append(res)
+                    except Exception as e:
+                        logger.error(f"Voice clone S3 upload item {index} failed: {e}")
+                        voice_clone_batch_jobs[session_id]["failed"] += 1
+                else:
+                    import base64
+                    res = {
+                        "s3_url": "",
+                        "presigned_url": f"data:audio/wav;base64,{base64.b64encode(wav_bytes).decode('utf-8')}",
+                        "s3_key": filename,
+                        "sample_rate": sr,
                         "text": item.text,
-                        "job_id": "voice_clone",
+                        "job_id": "voice_clone_local",
                     }
+                    voice_clone_batch_jobs[session_id]["completed"] += 1
+                    voice_clone_batch_jobs[session_id]["results"].append(res)
 
-            # Generate via batcher
-            try:
-                wav_bytes, sr = await voice_clone_batcher.submit(
-                    texts=item.text,
-                    ref_audios=req.ref_audio_url,
-                    ref_texts=req.ref_text,
-                    languages=req.language,
-                    x_vector_only_modes=req.use_xvec,
-                )
-            except Exception as e:
-                logger.error(f"Voice clone batch item {index} failed: {e} | ref_audio_url={req.ref_audio_url[:120]}")
-                return None
+        tasks = [process_item(item, i) for i, item in enumerate(req.items)]
+        await asyncio.gather(*tasks)
+        
+        job = voice_clone_batch_jobs[session_id]
+        if job["completed"] + job["failed"] >= job["total"]:
+            job["status"] = "completed" if job["failed"] == 0 else "completed_with_errors"
 
-            # Upload to S3
-            if req.upload_to_s3:
-                loop = asyncio.get_running_loop()
-                from functools import partial
-                s3_url = await loop.run_in_executor(
-                    None,
-                    partial(storage.upload_wav, wav_bytes, "voice_clone", filename=filename, prefix=s3_prefix, model_id="voice_clone_qwen")
-                )
-                presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
-                return {
-                    "s3_url": s3_url,
-                    "presigned_url": presigned_url,
-                    "s3_key": s3_key,
-                    "sample_rate": sr,
-                    "text": item.text,
-                    "job_id": "voice_clone",
-                }
-            else:
-                import base64
-                return {
-                    "s3_url": "",
-                    "presigned_url": f"data:audio/wav;base64,{base64.b64encode(wav_bytes).decode('utf-8')}",
-                    "s3_key": filename,
-                    "sample_rate": sr,
-                    "text": item.text,
-                    "job_id": "voice_clone_local",
-                }
+    # Start background task WITHOUT waiting
+    asyncio.create_task(run_batch_task())
+    
+    return {
+        "session_id": session_id,
+        "finetune_job_id": session_id,
+        "status": "processing",
+        "total": len(req.items)
+    }
 
-    tasks = [process_item(item, i) for i, item in enumerate(req.items)]
-    results_raw = await asyncio.gather(*tasks)
-    return [r for r in results_raw if r is not None]
+@app.get(
+    "/voice-clone/batch/{session_id}",
+    summary="Get status of an asynchronous voice clone batch",
+    response_model=VoiceCloneBatchStatusResponse,
+)
+async def get_voice_clone_batch_status(session_id: str):
+    """Poll for the status and results of a voice clone batch initiated via POST /voice-clone/batch."""
+    job = voice_clone_batch_jobs.get(session_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Voice clone batch {session_id} not found")
+    
+    # Calculate progress percentage
+    total = job["total"]
+    completed = job["completed"]
+    failed = job["failed"]
+    
+    progress_pct = 0.0
+    if total > 0:
+        progress_pct = round(((completed + failed) / total) * 100, 1)
+    
+    return {
+        **job,
+        "progress_pct": progress_pct
+    }
+
 
 @app.post(
     "/voice-design",
@@ -1614,6 +1735,32 @@ async def ops_history(
 async def ops_running():
     """Get operations currently in progress."""
     return ops_log.get_running()
+
+
+@app.get("/logs/stream", summary="Stream server logs in real-time")
+async def stream_logs(request: Request):
+    """Stream server logs using Server-Sent Events (SSE).
+    
+    This endpoint provides a real-time feed of all server logs, including 
+    structured operations from ops_logger.
+    """
+    queue = asyncio.Queue(maxsize=100)
+    log_queues.append(queue)
+    
+    async def log_generator():
+        try:
+            while True:
+                # Check if client disconnected
+                if await request.is_disconnected():
+                    break
+                
+                log_entry = await queue.get()
+                yield f"data: {log_entry}\n\n"
+        finally:
+            if queue in log_queues:
+                log_queues.remove(queue)
+
+    return StreamingResponse(log_generator(), media_type="text/event-stream")
 
 
 # ---------------------------------------------------------------------------
