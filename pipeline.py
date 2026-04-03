@@ -11,6 +11,7 @@ import logging
 import uuid
 import json
 import zipfile
+from enum import Enum
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -19,6 +20,7 @@ import torch
 
 from inference_manager import InferenceManager
 from ops_logger import ops_log
+from enum import StrEnum
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +34,7 @@ if _finetuning_dir not in sys.path:
 # Job state
 # ---------------------------------------------------------------------------
 
-class JobStatus:
+class JobStatus(StrEnum):
     QUEUED = "queued"
     PREPARING = "preparing"
     TRAINING = "training"
@@ -79,6 +81,7 @@ class Job:
         self.s3_model_key = s3_model_key
 
         self.status = JobStatus.QUEUED
+        self.message = "To force retry, send force = true"
         self.progress: Dict[str, Any] = {}
         self.checkpoint_path: Optional[str] = None
         self.error: Optional[str] = None
@@ -109,6 +112,7 @@ class Job:
                 "character_id": self.character_id,
                 "base_model_path": self.base_model_path,
             },
+            "message": self.message,
         }
         if self.status == JobStatus.READY:
             d["inference_url"] = f"/infer/{self.job_id}"
@@ -154,6 +158,7 @@ class Job:
                 s3_model_key=data.get("s3_model_key"),
             )
             job.status = data.get("status", JobStatus.QUEUED)
+            job.message = data.get("message", job.message)
             job.progress = data.get("progress", {})
             job.checkpoint_path = data.get("checkpoint_path")
             job.error = data.get("error")
@@ -368,7 +373,7 @@ class Pipeline:
         logger.info(f"Lookup job {job_id}")
         job = self.jobs.get(job_id)
         if job:
-            logger.info(f"Job {job_id} found in memory")
+            logger.info(f"Job {job_id} found in memory with status {job.status}")
             return job
             
         # Try to load from disk if not in memory

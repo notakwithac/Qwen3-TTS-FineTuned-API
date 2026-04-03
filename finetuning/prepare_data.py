@@ -19,7 +19,11 @@ import json
 from pathlib import Path
 
 import torch
+import time
+import logging
 from qwen_tts import Qwen3TTSTokenizer
+
+logger = logging.getLogger(__name__)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -33,10 +37,28 @@ def main():
     input_jsonl_path = Path(args.input_jsonl)
     input_base_dir = input_jsonl_path.parent
 
-    tokenizer_12hz = Qwen3TTSTokenizer.from_pretrained(
-        args.tokenizer_model_path,
-        device_map=args.device,
-    )
+    # Robust retry logic for CUDA initialization to handle transient "busy or unavailable" errors
+    max_retries = 5
+    retry_delay = 1.0
+    tokenizer_12hz = None
+    
+    for attempt in range(max_retries):
+        try:
+            tokenizer_12hz = Qwen3TTSTokenizer.from_pretrained(
+                args.tokenizer_model_path,
+                device_map=args.device,
+            )
+            break
+        except RuntimeError as e:
+            if "busy or unavailable" in str(e) and attempt < max_retries - 1:
+                logger.warning(
+                    f"CUDA device busy (attempt {attempt+1}/{max_retries}). "
+                    f"Retrying in {retry_delay}s..."
+                )
+                time.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+            else:
+                raise e
 
     total_lines = open(args.input_jsonl).readlines()
     total_lines = [json.loads(line.strip()) for line in total_lines]
@@ -107,10 +129,28 @@ def prepare_programmatic(
     input_jsonl_path = Path(input_jsonl)
     input_base_dir = input_jsonl_path.parent
 
-    tokenizer_12hz = Qwen3TTSTokenizer.from_pretrained(
-        tokenizer_model_path,
-        device_map=device,
-    )
+    # Robust retry logic for CUDA initialization to handle transient "busy or unavailable" errors
+    max_retries = 5
+    retry_delay = 1.0
+    tokenizer_12hz = None
+    
+    for attempt in range(max_retries):
+        try:
+            tokenizer_12hz = Qwen3TTSTokenizer.from_pretrained(
+                tokenizer_model_path,
+                device_map=device,
+            )
+            break
+        except RuntimeError as e:
+            if "busy or unavailable" in str(e) and attempt < max_retries - 1:
+                logger.warning(
+                    f"CUDA device busy (attempt {attempt+1}/{max_retries}). "
+                    f"Retrying in {retry_delay}s..."
+                )
+                time.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+            else:
+                raise e
 
     total_lines = open(input_jsonl).readlines()
     total_lines = [json.loads(line.strip()) for line in total_lines]

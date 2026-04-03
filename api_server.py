@@ -22,6 +22,7 @@ from pipeline import Pipeline, JobStatus
 from storage import storage
 from ops_logger import ops_log
 from session_manager import SessionManager, SessionStatus
+from metrics_collector import metrics_collector
 
 # Configure logging
 logging.basicConfig(
@@ -88,10 +89,12 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def _lifespan(app):
-    # Startup: start session cleanup loop
+    # Startup: start session cleanup loop and resource monitoring
     session_mgr.start_cleanup_loop()
+    metrics_collector.start()
     yield
-    # Shutdown: wait for any in-progress S3 uploads
+    # Shutdown: stop metrics collector and wait for any in-progress S3 uploads
+    metrics_collector.stop()
     logger.info("Server shutting down — waiting for pending S3 uploads...")
     import asyncio
     await asyncio.get_event_loop().run_in_executor(None, pipeline.shutdown)
@@ -362,7 +365,7 @@ class BatchInferRequest(BaseModel):
 
 class JobSummary(BaseModel):
     job_id: str
-    status: str
+    status: JobStatus
     speaker_name: str
     progress: dict = {}
     checkpoint_path: Optional[str] = None
@@ -371,6 +374,7 @@ class JobSummary(BaseModel):
     finished_at: Optional[str] = None
     config: dict = {}
     inference_url: Optional[str] = None
+    message: Optional[str] = None
 
 
 class StorageStatus(BaseModel):
@@ -478,6 +482,7 @@ class FinetuneRequest(BaseModel):
     character_id: Optional[str] = None
     resume_job_id: Optional[str] = None
     job_id: Optional[str] = None
+    force: bool = False
 
 @app.post("/finetune", summary="Start a fine-tuning job", response_model=JobSummary)
 def create_finetune_job(req: FinetuneRequest):
@@ -528,15 +533,14 @@ def create_finetune_job(req: FinetuneRequest):
         if req.job_id:
             existing_job = pipeline.get_job(req.job_id)
             if existing_job:
-                # If job exists, we return it. If the user wanted a fresh start with same ID, 
-                # the pipeline.create_job logic will handle cleanup if called.
-                # However, to match the "create" intent, we only return existing if it's already active/ready.
-                # If they explicitly want to RE-CREATE, they should probably delete first or we can allow it.
-                # Given the user's request "create a finetune job with the same dataset and same job_id if job is not found",
-                # it implies they'll only call this if it's NOT found. 
-                # But if it IS found, returning it is the safest "idempotent" behavior.
-                logger.info(f"Job {req.job_id} already exists. Returning existing job.")
-                return JSONResponse(content=existing_job.to_dict(), status_code=200)
+                # User refinement: Only return if status is QUEUED or TRAINING, 
+                # unless force is true in which case we restart anyway.
+                # All other states (FAILED, READY, etc) trigger a restart if force=False isn't enough.
+                if not req.force and existing_job.status in (JobStatus.QUEUED, JobStatus.TRAINING):
+                    logger.info(f"Job {req.job_id} already exists with active status {existing_job.status}. Returning existing.")
+                    return JSONResponse(content=existing_job.to_dict(), status_code=200)
+                else:
+                    logger.warning(f"Re-creating/Retrying job {req.job_id} (Status: {existing_job.status}, Force={req.force})")
 
         # Download the file from S3
         storage.download_file(req.dataset_s3_key, tmp_path)
@@ -608,12 +612,18 @@ async def retry_job(job_id: str, req: Optional[FinetuneRequest] = None):
     """
     job = pipeline.retry_job(job_id)
     if job:
-        # If it was already READY or successfully retried
+        # If it was already READY or safely transitioned (smart retry)
         return JSONResponse(content=job.to_dict(), status_code=202 if job.status != JobStatus.READY else 200)
 
-    # Job not found or not in a retryable state. If we have a body, fallback to creation.
+    # Job not found OR not in a failed/cancelled state (e.g. QUEUED, TRAINING).
     if req:
-        logger.info(f"Job {job_id} not found for retry. Falling back to creation as requested.")
+        # User refinement: Only skip retry if it's currently active (QUEUED/TRAINING)
+        existing = pipeline.get_job(job_id)
+        if existing and not req.force and existing.status in (JobStatus.QUEUED, JobStatus.TRAINING):
+            logger.info(f"Job {job_id} already active with status {existing.status}. Skipping restart.")
+            return JSONResponse(content=existing.to_dict(), status_code=200)
+            
+        logger.info(f"Retrying/Resurrecting job {job_id}. Status={existing.status if existing else 'None'}, Force={req.force}")
         # Re-use the creation logic but with our specific job_id
         # We need to handle the S3 download again here or refactor it.
         # For simplicity, we'll repeat the download logic since it's short.
@@ -1706,6 +1716,22 @@ async def list_sessions():
 async def gpu_vram():
     """Get detailed VRAM budget including session-pinned models."""
     return pipeline.inference.get_vram_budget()
+
+
+@app.get("/gpu/metrics", summary="Current resource utilization (CPU, GPU, RAM, VRAM)")
+async def gpu_metrics():
+    """Get real-time snapshot of system resources."""
+    return metrics_collector.get_latest()
+
+
+@app.get("/gpu/metrics/history", summary="Historical resource utilization")
+async def gpu_metrics_history(
+    limit: Optional[int] = Query(60, description="Max records to return"),
+    start_ts: Optional[str] = Query(None, description="Start ISO timestamp filter"),
+    end_ts: Optional[str] = Query(None, description="End ISO timestamp filter"),
+):
+    """Get historical resource utilization records with optional time filtering."""
+    return metrics_collector.get_history(limit=limit, start_ts=start_ts, end_ts=end_ts)
 
 
 # ---------------------------------------------------------------------------
