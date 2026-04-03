@@ -230,31 +230,53 @@ class InferenceManager:
         op = ops_log.start("model_load", extra={"model_type": model_type, "path": path})
         try:
             logger.info(f"Loading {model_type} model from {path}...")
-            try:
-                model = Qwen3TTSModel.from_pretrained(
-                    path,
-                    device_map=self._device,
-                    dtype=torch.bfloat16,
-                    attn_implementation=self._attn_impl,
-                )
-            except Exception as e:
-                # If we tried flash_attention_2 and it failed, fallback to eager
-                if self._attn_impl == "flash_attention_2":
-                    err_str = str(e)
-                    if any(x in err_str for x in ["FlashAttention2", "flash-attn", "flash_attn", "package f", "DLL load failed"]):
-                        logger.warning(
-                            f"Flash Attention (v2) could not be loaded for {path}. "
-                            f"Error: {err_str}. Falling back to 'eager' implementation."
-                        )
+            # Robust retry logic for CUDA initialization to handle transient "busy or unavailable" errors
+            max_retries = 5
+            retry_delay = 1.0
+            model = None
+            
+            for attempt in range(max_retries):
+                try:
+                    try:
                         model = Qwen3TTSModel.from_pretrained(
                             path,
                             device_map=self._device,
                             dtype=torch.bfloat16,
-                            attn_implementation="eager",
+                            attn_implementation=self._attn_impl,
                         )
+                        break # Success
+                    except Exception as e:
+                        # If we tried flash_attention_2 and it failed, fallback to eager
+                        if self._attn_impl == "flash_attention_2" and not any(x in str(e).lower() for x in ["busy", "unavailable"]):
+                            err_str = str(e)
+                            if any(x in err_str for x in ["FlashAttention2", "flash-attn", "flash_attn", "package f", "DLL load failed"]):
+                                logger.warning(
+                                    f"Flash Attention (v2) could not be loaded for {path}. "
+                                    f"Error: {err_str}. Falling back to 'eager' implementation."
+                                )
+                                model = Qwen3TTSModel.from_pretrained(
+                                    path,
+                                    device_map=self._device,
+                                    dtype=torch.bfloat16,
+                                    attn_implementation="eager",
+                                )
+                                break # Success with fallback
+                            else:
+                                raise e
+                        else:
+                            raise e
+                except RuntimeError as re_err:
+                    if "busy or unavailable" in str(re_err) and attempt < max_retries - 1:
+                        logger.warning(
+                            f"CUDA device busy (attempt {attempt+1}/{max_retries}). "
+                            f"Retrying in {retry_delay}s..."
+                        )
+                        time.sleep(retry_delay)
+                        retry_delay *= 2
                     else:
-                        raise e
-                else:
+                        raise re_err
+                except Exception as e:
+                    # Reraise any other exceptions after potential fallback failed
                     raise e
             
             # Speed up inference using torch.compile (requires Torch 2.0+)
@@ -389,28 +411,49 @@ class InferenceManager:
             try:
                 from qwen_tts import Qwen3TTSModel
                 logger.info(f"Loading model from {checkpoint_path} as {cache_key}...")
-                try:
-                    model = Qwen3TTSModel.from_pretrained(
-                        checkpoint_path,
-                        device_map=self._device,
-                        dtype=torch.bfloat16,
-                        attn_implementation=self._attn_impl,
-                    )
-                except Exception as e:
-                    if self._attn_impl == "flash_attention_2":
-                        err_str = str(e)
-                        if any(x in err_str for x in ["FlashAttention2", "flash-attn", "flash_attn", "package f", "DLL load failed"]):
-                            logger.warning(f"Flash Attention fallback for {cache_key}: {err_str}")
+                # Robust retry logic for CUDA initialization to handle transient "busy or unavailable" errors
+                max_retries = 5
+                retry_delay = 1.0
+                model = None
+                
+                for attempt in range(max_retries):
+                    try:
+                        try:
                             model = Qwen3TTSModel.from_pretrained(
                                 checkpoint_path,
                                 device_map=self._device,
                                 dtype=torch.bfloat16,
-                                attn_implementation="eager",
+                                attn_implementation=self._attn_impl,
                             )
+                            break # Success
+                        except Exception as e:
+                            if self._attn_impl == "flash_attention_2" and not any(x in str(e).lower() for x in ["busy", "unavailable"]):
+                                err_str = str(e)
+                                if any(x in err_str for x in ["FlashAttention2", "flash-attn", "flash_attn", "package f", "DLL load failed"]):
+                                    logger.warning(f"Flash Attention fallback for {cache_key}: {err_str}")
+                                    model = Qwen3TTSModel.from_pretrained(
+                                        checkpoint_path,
+                                        device_map=self._device,
+                                        dtype=torch.bfloat16,
+                                        attn_implementation="eager",
+                                    )
+                                    break # Success with fallback
+                                else:
+                                    raise e
+                            else:
+                                raise e
+                    except RuntimeError as re_err:
+                        if "busy or unavailable" in str(re_err) and attempt < max_retries - 1:
+                            logger.warning(
+                                f"CUDA device busy (attempt {attempt+1}/{max_retries}). "
+                                f"Retrying in {retry_delay}s..."
+                            )
+                            time.sleep(retry_delay)
+                            retry_delay *= 2
                         else:
-                            raise
-                    else:
-                        raise
+                            raise re_err
+                    except Exception as e:
+                        raise e
 
                 if self._compile:
                     logger.info(f"Compiling model {cache_key}...")

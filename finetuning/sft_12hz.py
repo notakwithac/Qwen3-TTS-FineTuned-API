@@ -22,6 +22,8 @@ import shutil
 from pathlib import Path
 
 import torch
+import time
+import logging
 from accelerate import Accelerator
 from dataset import TTSDataset
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
@@ -161,13 +163,28 @@ def train():
         if cfg.get("tts_model_type") != "base":
             config_override = AutoConfig.from_pretrained(MODEL_PATH)
             config_override.tts_model_type = "base"
-    qwen3tts = Qwen3TTSModel.from_pretrained(
-        MODEL_PATH,
-        torch_dtype=torch.bfloat16,
-        attn_implementation=attn_impl,
-        config=config_override,
-        low_cpu_mem_usage=True,
-    )
+    # Robust retry logic for CUDA initialization to handle transient 'busy or unavailable' errors
+    max_retries = 5
+    retry_delay = 1.0
+    qwen3tts = None
+    
+    for attempt in range(max_retries):
+        try:
+            qwen3tts = Qwen3TTSModel.from_pretrained(
+                MODEL_PATH,
+                torch_dtype=torch.bfloat16,
+                attn_implementation=attn_impl,
+                config=config_override,
+                low_cpu_mem_usage=True,
+            )
+            break
+        except RuntimeError as e:
+            if "busy or unavailable" in str(e) and attempt < max_retries - 1:
+                print(f"CUDA device busy (attempt {attempt+1}/{max_retries}). Retrying in {retry_delay}s...")
+                time.sleep(retry_delay)
+                retry_delay *= 2
+            else:
+                raise e
     config = config_override or AutoConfig.from_pretrained(MODEL_PATH)
 
     train_jsonl_path = Path(args.train_jsonl)
@@ -460,13 +477,28 @@ def train_programmatic(
         if cfg.get("tts_model_type") != "base":
             config_override = AutoConfig.from_pretrained(MODEL_PATH)
             config_override.tts_model_type = "base"
-    qwen3tts = Qwen3TTSModel.from_pretrained(
-        MODEL_PATH,
-        torch_dtype=torch.bfloat16,
-        attn_implementation=attn_impl,
-        config=config_override,
-        low_cpu_mem_usage=True,
-    )
+    # Robust retry logic for CUDA initialization to handle transient 'busy or unavailable' errors
+    max_retries = 5
+    retry_delay = 1.0
+    qwen3tts = None
+    
+    for attempt in range(max_retries):
+        try:
+            qwen3tts = Qwen3TTSModel.from_pretrained(
+                MODEL_PATH,
+                torch_dtype=torch.bfloat16,
+                attn_implementation=attn_impl,
+                config=config_override,
+                low_cpu_mem_usage=True,
+            )
+            break
+        except RuntimeError as e:
+            if "busy or unavailable" in str(e) and attempt < max_retries - 1:
+                print(f"CUDA device busy (attempt {attempt+1}/{max_retries}). Retrying in {retry_delay}s...")
+                time.sleep(retry_delay)
+                retry_delay *= 2
+            else:
+                raise e
     model_config = config_override or AutoConfig.from_pretrained(MODEL_PATH)
 
     train_jsonl_path = Path(args.train_jsonl)
