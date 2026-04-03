@@ -12,6 +12,7 @@ import sys
 import time
 import urllib.request
 import json
+from datetime import datetime, timezone
 
 try:
     from dotenv import load_dotenv
@@ -20,6 +21,8 @@ except ImportError:
     pass
 
 from massed_compute_client import MassedComputeClient
+from storage import storage
+import glob
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -175,6 +178,57 @@ def resolve_instance_uuid(client: MassedComputeClient) -> str | None:
     return None
 
 
+def upload_final_artifacts(instance_uuid: str):
+    """Upload API logs and instance logs (/tmp) to S3 before termination."""
+    if not storage.is_configured:
+        logger.warning("Storage not configured — skipping final artifact upload.")
+        return
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    s3_prefix = f"backups/{instance_uuid}/{timestamp}"
+    
+    # 1. API Logs (logs/*.log, metrics/*.jsonl)
+    log_files = glob.glob("logs/*.log")
+    if os.path.exists("metrics/resource_metrics.jsonl"):
+        log_files.append("metrics/resource_metrics.jsonl")
+    
+    # 2. Instance Logs (/tmp)
+    # On most Linux systems (TIR included), /tmp might contain logs or we check /var/log
+    # The user specifically asked for /tmp/
+    tmp_logs = glob.glob("/tmp/*.log") + glob.glob("/tmp/*.txt")
+    
+    # 3. Collect from API history if possible
+    try:
+        with urllib.request.urlopen("http://localhost:8000/ops/history", timeout=5) as response:
+            if response.status == 200:
+                history_data = response.read()
+                storage.upload_bytes(
+                    history_data, 
+                    f"{s3_prefix}/ops_history.json", 
+                    content_type="application/json"
+                )
+                logger.info("Uploaded ops history to S3.")
+    except Exception as exc:
+        logger.debug("Could not retrieve ops history from API: %s", exc)
+
+    # Combine all target files
+    all_files = list(set(log_files + tmp_logs))
+    for local_path in all_files:
+        if os.path.isfile(local_path):
+            filename = os.path.basename(local_path)
+            # Differentiate /tmp files in S3
+            if local_path.startswith("/tmp/"):
+                s3_key = f"{s3_prefix}/tmp/{filename}"
+            else:
+                s3_key = f"{s3_prefix}/{filename}"
+                
+            try:
+                storage.upload_file(local_path, s3_key)
+                logger.info("Uploaded %s to S3: %s", local_path, s3_key)
+            except Exception as exc:
+                logger.error("Failed to upload %s to S3: %s", local_path, exc)
+
+
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
@@ -302,6 +356,14 @@ def main():
 
             logger.error(">>> PRE-TERMINATE: uuid=%s, api_token=%s..., base_url=%s <<<",
                          uuid, client.api_token[:12] if client.api_token else "NONE", client.BASE_URL)
+            
+            # --- Upload artifacts before termination ---
+            try:
+                logger.info(">>> UPLOADING FINAL ARTIFACTS BEFORE TERMINATION <<<")
+                upload_final_artifacts(uuid)
+            except Exception as exc:
+                logger.error("Artifact upload failed: %s", exc, exc_info=True)
+
             logger.error(">>> CALLING client.terminate_instance([%s]) NOW <<<", uuid)
             try:
                 result = client.terminate_instance([uuid])

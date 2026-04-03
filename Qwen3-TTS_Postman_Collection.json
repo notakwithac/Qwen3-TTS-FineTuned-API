@@ -1,150 +1,501 @@
 {
-    "info": {
-        "_postman_id": "6a3fe033-b1d6-4e50-a92c-7b06b2cd8df6",
-        "name": "Qwen3-TTS API",
-        "description": "Postman Collection for Qwen3-TTS Fine-Tuning API",
-        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
-    },
-    "item": [
-        {
-            "name": "GPU Management",
-            "item": [
-                {
-                    "name": "Terminate Instance",
-                    "request": {
-                        "method": "POST",
-                        "header": [],
-                        "url": {
-                            "raw": "{{base_url}}/gpu/terminate",
-                            "host": ["{{base_url}}"],
-                            "path": ["gpu", "terminate"]
-                        },
-                        "description": "Request instance termination. Puts the server into DRAINING mode (rejects new POST requests) and creates a terminate_signal.tmp file that the GPU watchdog monitors. The instance will be terminated once all active operations complete."
-                    },
-                    "response": []
-                },
-                {
-                    "name": "Cancel Terminate",
-                    "request": {
-                        "method": "POST",
-                        "header": [],
-                        "url": {
-                            "raw": "{{base_url}}/gpu/cancel-terminate",
-                            "host": ["{{base_url}}"],
-                            "path": ["gpu", "cancel-terminate"]
-                        },
-                        "description": "Cancel a pending termination request. Resets IS_DRAINING to false so the server accepts new work again, and deletes the terminate_signal.tmp file so the watchdog stops monitoring for termination."
-                    },
-                    "response": []
-                },
-                {
-                    "name": "GPU Status",
-                    "request": {
-                        "method": "GET",
-                        "header": [],
-                        "url": {
-                            "raw": "{{base_url}}/gpu/status",
-                            "host": ["{{base_url}}"],
-                            "path": ["gpu", "status"]
-                        },
-                        "description": "Get GPU memory usage, model load state, and idle timer info."
-                    },
-                    "response": []
-                }
-            ]
-        },
-
-        {
-            "name": "Voice Design",
-            "request": {
-                "method": "POST",
-                "header": [
-                    {
-                        "key": "Content-Type",
-                        "value": "application/json"
-                    }
-                ],
-                "body": {
-                    "mode": "raw",
-                    "raw": "{\n    \"text\": \"Welcome to this audiobook. This voice was generated entirely from a text description.\",\n    \"instruct\": \"A warm male voice, middle-aged, calm and authoritative\",\n    \"language\": \"English\",\n    \"upload_to_s3\": true,\n    \"overwrite\": false\n}",
-                    "options": {
-                        "raw": {
-                            "language": "json"
-                        }
-                    }
-                },
-                "url": {
-                    "raw": "{{base_url}}/voice-design",
-                    "host": [
-                        "{{base_url}}"
-                    ],
-                    "path": [
-                        "voice-design"
-                    ]
-                },
-                "description": "Generate speech from a text description of the desired voice, using the VoiceDesign model directly."
-            },
-            "response": []
-        },
-        {
-            "name": "Voice Clone (Batch)",
-            "request": {
-                "method": "POST",
-                "header": [
-                    {
-                        "key": "Content-Type",
-                        "value": "application/json"
-                    }
-                ],
-                "body": {
-                    "mode": "raw",
-                    "raw": "{\n    \"ref_audio_url\": \"https://github.com/gradio-app/gradio/raw/main/test/test_files/audio_sample.wav\",\n    \"ref_text\": \"Beavers are second only to humans in their ability to manipulate their environment.\",\n    \"items\": [\n        {\n            \"text\": \"First sentence to generate in this newly cloned voice.\",\n            \"filename\": \"clone_001.wav\"\n        },\n        {\n            \"text\": \"Second sentence to generate concurrently.\",\n            \"filename\": \"clone_002.wav\"\n        }\n    ],\n    \"language\": \"English\",\n    \"upload_to_s3\": true,\n    \"overwrite\": false,\n    \"use_xvec\": false\n}",
-                    "options": {
-                        "raw": {
-                            "language": "json"
-                        }
-                    }
-                },
-                "url": {
-                    "raw": "{{base_url}}/voice-clone/batch",
-                    "host": [
-                        "{{base_url}}"
-                    ],
-                    "path": [
-                        "voice-clone",
-                        "batch"
-                    ]
-                },
-                "description": "Batch generate zero-shot voice cloning from a reference audio and text. Uses the Qwen3-TTS Base model."
-            },
-            "response": []
-        }
-    ],
-    "event": [
-        {
-            "listen": "prerequest",
-            "script": {
-                "type": "text/javascript",
-                "exec": [
-                    ""
-                ]
-            }
-        },
-        {
-            "listen": "test",
-            "script": {
-                "type": "text/javascript",
-                "exec": [
-                    ""
-                ]
-            }
-        }
-    ],
-    "variable": [
-        {
-            "key": "base_url",
-            "value": "http://localhost:8000",
-            "type": "string"
-        }
-    ]
+	"info": {
+		"_postman_id": "6a3fe033-b1d6-4e50-a92c-7b06b2cd8df6",
+		"name": "Qwen3-TTS API",
+		"description": "Postman Collection for Qwen3-TTS Fine-Tuning API",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"item": [
+		{
+			"name": "Job Lifecycle",
+			"item": [
+				{
+					"name": "Start Fine-Tuning",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"dataset_s3_key\": \"datasets/Hero1/dataset.zip\",\n    \"speaker_name\": \"hero_voice\",\n    \"num_epochs\": 15,\n    \"batch_size\": 2,\n    \"lr\": 1e-6,\n    \"force\": false\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/finetune",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"finetune"
+							]
+						},
+						"description": "Start a new fine-tuning job using a dataset stored on S3."
+					},
+					"response": []
+				},
+				{
+					"name": "List All Jobs",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/jobs",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"jobs"
+							]
+						},
+						"description": "Retrieve a list of all currently tracked and stored jobs."
+					},
+					"response": []
+				},
+				{
+					"name": "Get Job Status",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/jobs/:job_id",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"jobs",
+								":job_id"
+							],
+							"variable": [
+								{
+									"key": "job_id",
+									"value": "your_job_id"
+								}
+							]
+						},
+						"description": "Get detailed status and progress of a specific job."
+					},
+					"response": []
+				},
+				{
+					"name": "Retry Failed Job",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"force\": false\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/jobs/:job_id/retry",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"jobs",
+								":job_id",
+								"retry"
+							],
+							"variable": [
+								{
+									"key": "job_id",
+									"value": "your_job_id"
+								}
+							]
+						},
+						"description": "Retry a failed job or force restart an existing one."
+					},
+					"response": []
+				},
+				{
+					"name": "Delete Job",
+					"request": {
+						"method": "DELETE",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/jobs/:job_id",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"jobs",
+								":job_id"
+							],
+							"variable": [
+								{
+									"key": "job_id",
+									"value": "your_job_id"
+								}
+							]
+						},
+						"description": "Cancel a running job or delete a completed one from local storage."
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "Speech Generation",
+			"item": [
+				{
+					"name": "Single Inference",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"text\": \"Hello, welcome to our audiobook. This is a fine-tuned voice!\",\n    \"language\": \"English\",\n    \"upload_to_s3\": true,\n    \"overwrite\": false\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/infer/:job_id",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"infer",
+								":job_id"
+							],
+							"variable": [
+								{
+									"key": "job_id",
+									"value": "your_ready_job_id"
+								}
+							]
+						},
+						"description": "Generate a single audio file for a given text using a 'READY' fine-tuned model."
+					},
+					"response": []
+				},
+				{
+					"name": "Batch Inference",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"items\": [\n        {\"text\": \"Chapter one begins here.\", \"filename\": \"ch1_001.wav\"},\n        {\"text\": \"The journey was just starting.\", \"filename\": \"ch1_002.wav\"}\n    ],\n    \"language\": \"English\"\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/infer/:job_id/batch",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"infer",
+								":job_id",
+								"batch"
+							],
+							"variable": [
+								{
+									"key": "job_id",
+									"value": "your_ready_job_id"
+								}
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Voice Design",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"text\": \"Welcome to this audiobook.\",\n    \"instruct\": \"A warm male voice, middle-aged, calm\",\n    \"language\": \"English\",\n    \"upload_to_s3\": true\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/voice-design",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"voice-design"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Voice Clone (Batch)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"ref_audio_url\": \"https://example.com/sample.wav\",\n    \"ref_text\": \"Original transcript of the reference audio.\",\n    \"items\": [\n        {\"text\": \"New sentence in the cloned voice.\", \"filename\": \"clone_01.wav\"}\n    ],\n    \"language\": \"English\"\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/voice-clone/batch",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"voice-clone",
+								"batch"
+							]
+						}
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "Resource Monitoring",
+			"item": [
+				{
+					"name": "Latest Metrics Snapshot",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/gpu/metrics",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"gpu",
+								"metrics"
+							]
+						},
+						"description": "Get a real-time snapshot of CPU, RAM, GPU, and VRAM utilization."
+					},
+					"response": []
+				},
+				{
+					"name": "Historical Resource Metrics",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/gpu/metrics/history?limit=60&start_ts=2024-04-03T00:00:00Z&end_ts=2024-04-03T23:59:59Z",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"gpu",
+								"metrics",
+								"history"
+							],
+							"query": [
+								{
+									"key": "limit",
+									"value": "60"
+								},
+								{
+									"key": "start_ts",
+									"value": "2024-04-03T00:00:00Z"
+								},
+								{
+									"key": "end_ts",
+									"value": "2024-04-03T23:59:59Z"
+								}
+							]
+						},
+						"description": "Get historical records of resource metrics with time filtering."
+					},
+					"response": []
+				},
+				{
+					"name": "Op Durations (Averages)",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/ops/averages",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"ops",
+								"averages"
+							]
+						}
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "GPU Management",
+			"item": [
+				{
+					"name": "GPU Status",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/gpu/status",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"gpu",
+								"status"
+							]
+						},
+						"description": "VRAM allocation and model load status."
+					},
+					"response": []
+				},
+				{
+					"name": "Unload Model",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/gpu/unload",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"gpu",
+								"unload"
+							]
+						},
+						"description": "Immediately free GPU memory by unloading all active voices."
+					},
+					"response": []
+				},
+				{
+					"name": "Terminate Instance",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/gpu/terminate",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"gpu",
+								"terminate"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Cancel Terminate",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/gpu/cancel-terminate",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"gpu",
+								"cancel-terminate"
+							]
+						}
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "Storage",
+			"item": [
+				{
+					"name": "S3 Configuration",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/storage/status",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"storage",
+								"status"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "List Job Artifacts",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/storage/list/:job_id",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"storage",
+								"list",
+								":job_id"
+							],
+							"variable": [
+								{
+									"key": "job_id",
+									"value": "your_job_id"
+								}
+							]
+						}
+					},
+					"response": []
+				}
+			]
+		}
+	],
+	"event": [
+		{
+			"listen": "prerequest",
+			"script": {
+				"type": "text/javascript",
+				"exec": [
+					""
+				]
+			}
+		},
+		{
+			"listen": "test",
+			"script": {
+				"type": "text/javascript",
+				"exec": [
+					""
+				]
+			}
+		}
+	],
+	"variable": [
+		{
+			"key": "base_url",
+			"value": "http://localhost:8000",
+			"type": "string"
+		}
+	]
 }
