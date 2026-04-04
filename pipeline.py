@@ -194,12 +194,14 @@ class Pipeline:
         max_concurrency: int = 2,
         max_models: int = 4,
         compile: bool = False,
+        gpu_controller: Any = None,
     ):
         self.base_dir = Path(base_dir)
         self.jobs_dir = self.base_dir / jobs_dir
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
         self.device = device
         self.use_flash_attn = use_flash_attn
+        self._gpu_controller = gpu_controller
 
         self.jobs: Dict[str, Job] = {}
         self._lock = threading.Lock()
@@ -212,6 +214,7 @@ class Pipeline:
             max_concurrency=max_concurrency,
             max_models=max_models,
             compile=compile,
+            gpu_controller=gpu_controller,
         )
         self._restore_locks: Dict[str, threading.Lock] = {}
 
@@ -649,6 +652,9 @@ class Pipeline:
             
             self._training_queue.acquire()
             
+            if self._gpu_controller:
+                self._gpu_controller.begin_training(job.job_id)
+            
             job.status = JobStatus.PREPARING
             job.progress = {"stage": "preparing", "detail": "Encoding audio to codec tokens..."}
             job.save()
@@ -784,6 +790,10 @@ class Pipeline:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+            # Release GPU training lock before Stage 3 (Inference loading)
+            if self._gpu_controller:
+                self._gpu_controller.end_training(job.job_id)
+
             # Stage 3: Load for inference
             job.status = JobStatus.LOADING
             job.progress = {"stage": "loading", "detail": "Loading fine-tuned model for inference..."}
@@ -841,6 +851,8 @@ class Pipeline:
             job.error = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
             job.finished_at = datetime.now(timezone.utc).isoformat()
             job.save()
+            if self._gpu_controller:
+                self._gpu_controller.end_training(job.job_id)
             ops_log.fail(pipeline_op, str(e))
             self._training_queue.release()
 

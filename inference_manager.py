@@ -49,10 +49,12 @@ class InferenceManager:
         max_concurrency: int = 16,
         max_models: int = 4,  # Default to 4 (good for 40GB)
         compile: bool = False,
+        gpu_controller: Any = None,
     ):
         self._device = device
         self._attn_impl = "flash_attention_2" if use_flash_attn else "eager"
         self._compile = compile
+        self._gpu_controller = gpu_controller
         self._lock = threading.Lock()
         # Cap concurrent inference to max_models: each inference holds one
         # model in VRAM, so we can never run more than max_models at once.
@@ -558,7 +560,9 @@ class InferenceManager:
             instructs = [""] * len(texts)
 
         # Acquire semaphore FIRST to limit concurrent model usage to max_models
-        with ops_log.operation("gpu_semaphore_wait", extra={"checkpoint": checkpoint_path}):
+        with ops_log.operation("gpu_resource_wait", extra={"checkpoint": checkpoint_path}):
+            if self._gpu_controller:
+                self._gpu_controller.begin_inference("inference_custom_voice_batch")
             self._inference_semaphore.acquire()
         try:
             with self._lock:
@@ -598,6 +602,8 @@ class InferenceManager:
                 self._mark_released(checkpoint_path)
         finally:
             self._inference_semaphore.release()
+            if self._gpu_controller:
+                self._gpu_controller.end_inference()
 
     def generate(
         self,
@@ -608,7 +614,9 @@ class InferenceManager:
         instruct: str = "",
     ) -> tuple[bytes, int]:
         """Generate speech using CustomVoice model. Auto-loads if not in cache."""
-        with ops_log.operation("gpu_semaphore_wait", extra={"checkpoint": checkpoint_path}):
+        with ops_log.operation("gpu_resource_wait", extra={"checkpoint": checkpoint_path}):
+            if self._gpu_controller:
+                self._gpu_controller.begin_inference("inference_custom_voice")
             self._inference_semaphore.acquire()
         try:
             with self._lock:
@@ -655,7 +663,9 @@ class InferenceManager:
         if not languages:
             languages = ["English"] * len(texts)
 
-        with ops_log.operation("gpu_semaphore_wait", extra={"model": "voice_design"}):
+        with ops_log.operation("gpu_resource_wait", extra={"model": "voice_design"}):
+            if self._gpu_controller:
+                self._gpu_controller.begin_inference("inference_voice_design_batch")
             self._inference_semaphore.acquire()
         try:
             with self._lock:
@@ -699,7 +709,9 @@ class InferenceManager:
         language: str = "English",
     ) -> tuple[bytes, int]:
         """Generate speech using VoiceDesign model."""
-        with ops_log.operation("gpu_semaphore_wait", extra={"model": "voice_design"}):
+        with ops_log.operation("gpu_resource_wait", extra={"model": "voice_design"}):
+            if self._gpu_controller:
+                self._gpu_controller.begin_inference("inference_voice_design")
             self._inference_semaphore.acquire()
         try:
             with self._lock:
@@ -766,7 +778,9 @@ class InferenceManager:
         if not x_vector_only_modes:
             x_vector_only_modes = [False] * len(texts)
 
-        with ops_log.operation("gpu_semaphore_wait", extra={"model": "voice_clone"}):
+        with ops_log.operation("gpu_resource_wait", extra={"model": "voice_clone"}):
+            if self._gpu_controller:
+                self._gpu_controller.begin_inference("inference_voice_clone_flexible_batch")
             self._inference_semaphore.acquire()
         try:
             with self._lock:
@@ -805,6 +819,8 @@ class InferenceManager:
                 self._mark_released(VOICE_CLONE_MODEL)
         finally:
             self._inference_semaphore.release()
+            if self._gpu_controller:
+                self._gpu_controller.end_inference()
 
     def generate_to_file(
         self,

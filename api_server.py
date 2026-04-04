@@ -23,6 +23,7 @@ from storage import storage
 from ops_logger import ops_log
 from session_manager import SessionManager, SessionStatus
 from metrics_collector import metrics_collector
+from gpu_resource_controller import GPUResourceController
 
 # Configure logging
 logging.basicConfig(
@@ -48,8 +49,12 @@ class LogStreamHandler(logging.Handler):
         # (while keeping them in terminal/files for local debugging)
         if record.levelno < logging.WARNING:
             # Silence specific loggers known for noise
+            # Silence noisy infrastructure loggers unless it's specifically for voice design
             if record.name in ("ops", "httpx", "httpcore", "urllib3"):
-                return
+                if record.name == "ops" and "voice_design" in record.getMessage():
+                    pass # Allow voice design operations through
+                else:
+                    return
             
             # Silence high-frequency polling paths and metadata requests
             msg = record.getMessage().lower()
@@ -170,6 +175,14 @@ GPU_MAX_MODELS = int(os.environ.get("GPU_MAX_MODELS", "4"))
 GPU_BATCH_SIZE = int(os.environ.get("GPU_BATCH_SIZE", "32"))
 USE_TORCH_COMPILE = os.environ.get("USE_TORCH_COMPILE", "1") == "1"
 
+# Resource Isolation
+_allow_concurrent_val = os.environ.get("ALLOW_CONCURRENT_TRAINING_INFERENCE")
+ALLOW_CONCURRENT = None
+if _allow_concurrent_val is not None:
+    ALLOW_CONCURRENT = _allow_concurrent_val == "1"
+
+gpu_controller = GPUResourceController(allow_concurrent=ALLOW_CONCURRENT)
+
 # Session configuration
 REPLICA_THRESHOLD = int(os.environ.get("REPLICA_THRESHOLD", "500"))
 MAX_REPLICAS_PER_MODEL = int(os.environ.get("MAX_REPLICAS_PER_MODEL", "4"))
@@ -198,6 +211,7 @@ pipeline = Pipeline(
     max_concurrency=GPU_MAX_CONCURRENCY,
     max_models=GPU_MAX_MODELS,
     compile=USE_TORCH_COMPILE,
+    gpu_controller=gpu_controller,
 )
 
 # Session-based inference manager
@@ -1233,6 +1247,7 @@ async def voice_design(req: VoiceDesignRequest):
     - "A young female voice, energetic and cheerful"
     - "A deep, gravelly old man's voice, speaking slowly"
     """
+    logger.info(f"Voice design request: character='{req.character_name}' text='{req.text[:50]}...' instruct='{req.instruct[:50]}...'")
     parts = []
     if req.character_name:
         safe_name = "".join(c for c in req.character_name if c.isalnum() or c in ("-", "_", " ")).strip().replace(" ", "_")
@@ -1330,6 +1345,7 @@ async def voice_design_batch(req: VoiceDesignBatchRequest):
     }
     ```
     """
+    logger.info(f"Voice design BATCH request: {len(req.items)} items")
     if not req.items:
         raise HTTPException(status_code=400, detail="No items provided.")
 
