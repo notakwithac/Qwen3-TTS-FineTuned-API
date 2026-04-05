@@ -719,6 +719,7 @@ class VoiceCloneBatchItem(APIModel):
 
 class VoiceCloneBatchRequest(APIModel):
     """Batch generate zero-shot voice cloning from a reference audio and upload to S3."""
+    session_id: Optional[str] = None
     ref_audio_url: str
     ref_text: str
     items: list[VoiceCloneBatchItem]
@@ -749,6 +750,18 @@ class VoiceCloneBatchRequest(APIModel):
             raise ValueError("items cannot be empty")
         if len(value) > MAX_CLONE_BATCH_ITEMS:
             raise ValueError(f"items exceeds max batch size of {MAX_CLONE_BATCH_ITEMS}")
+        return value
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value):
+            raise ValueError("session_id must be 1-64 characters of letters, numbers, underscore, or hyphen")
         return value
 
 
@@ -1462,8 +1475,18 @@ async def voice_clone_batch(req: VoiceCloneBatchRequest):
         )
 
     pipeline.inference._touch()
-    session_id = uuid.uuid4().hex[:8]
+    session_id = req.session_id or uuid.uuid4().hex[:8]
     logger.info(f"Voice clone BATCH request: {len(req.items)} items, session_id={session_id}")
+
+    existing_job = voice_clone_batch_jobs.get(session_id)
+    if existing_job:
+        logger.info("Voice clone batch %s already exists in memory. Returning existing status.", session_id)
+        return {
+            "session_id": session_id,
+            "finetune_job_id": session_id,
+            "status": existing_job.get("status", "processing"),
+            "total": existing_job.get("total", len(req.items)),
+        }
 
     # Initialize status
     voice_clone_batch_jobs[session_id] = {
