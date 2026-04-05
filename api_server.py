@@ -380,6 +380,17 @@ def get_custom_voice_batcher(job_id: str, checkpoint_path: str, speaker_name: st
     return custom_voice_batchers[job_id]
 
 
+def _sorted_clone_batch_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        results,
+        key=lambda item: (
+            item.get("index") is None,
+            item.get("index", 0),
+            item.get("filename", ""),
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Request / Response models
 # ---------------------------------------------------------------------------
@@ -471,8 +482,16 @@ class AsyncSubmissionResponse(APIModel):
     total: int
 
 
-class VoiceCloneBatchResultItem(AudioS3Result):
-    filename: Optional[str] = None
+class VoiceCloneBatchResultItem(APIModel):
+    filename: str
+    status: str
+    index: Optional[int] = None
+    text: Optional[str] = None
+    s3_url: Optional[str] = None
+    presigned_url: Optional[str] = None
+    s3_key: Optional[str] = None
+    sample_rate: Optional[int] = None
+    job_id: Optional[str] = None
     error: Optional[str] = None
 
 
@@ -483,6 +502,7 @@ class VoiceCloneBatchStatusResponse(APIModel):
     total: int = 0
     completed: int = 0
     failed: int = 0
+    clones: list[VoiceCloneBatchResultItem] = Field(default_factory=list)
     results: list[VoiceCloneBatchResultItem] = Field(default_factory=list)
     error: Optional[str] = None
     created_at: float
@@ -1515,6 +1535,7 @@ async def voice_clone_batch(req: VoiceCloneBatchRequest):
                     if await loop.run_in_executor(None, storage.object_exists, s3_key):
                         presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
                         res = {
+                            "index": index,
                             "s3_url": storage._object_url(s3_key),
                             "presigned_url": presigned_url,
                             "s3_key": s3_key,
@@ -1541,6 +1562,7 @@ async def voice_clone_batch(req: VoiceCloneBatchRequest):
                     logger.error(f"Voice clone batch item {index} failed: {e}")
                     voice_clone_batch_jobs[session_id]["failed"] += 1
                     voice_clone_batch_jobs[session_id]["results"].append({
+                        "index": index,
                         "s3_url": "",
                         "presigned_url": None,
                         "s3_key": s3_key,
@@ -1564,6 +1586,7 @@ async def voice_clone_batch(req: VoiceCloneBatchRequest):
                         )
                         presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
                         res = {
+                            "index": index,
                             "s3_url": s3_url,
                             "presigned_url": presigned_url,
                             "s3_key": s3_key,
@@ -1579,6 +1602,7 @@ async def voice_clone_batch(req: VoiceCloneBatchRequest):
                         logger.error(f"Voice clone S3 upload item {index} failed: {e}")
                         voice_clone_batch_jobs[session_id]["failed"] += 1
                         voice_clone_batch_jobs[session_id]["results"].append({
+                            "index": index,
                             "s3_url": "",
                             "presigned_url": None,
                             "s3_key": s3_key,
@@ -1592,6 +1616,7 @@ async def voice_clone_batch(req: VoiceCloneBatchRequest):
                 else:
                     import base64
                     res = {
+                        "index": index,
                         "s3_url": "",
                         "presigned_url": f"data:audio/wav;base64,{base64.b64encode(wav_bytes).decode('utf-8')}",
                         "s3_key": filename,
@@ -1605,11 +1630,16 @@ async def voice_clone_batch(req: VoiceCloneBatchRequest):
                     voice_clone_batch_jobs[session_id]["results"].append(res)
 
         tasks = [process_item(item, i) for i, item in enumerate(req.items)]
-        await asyncio.gather(*tasks)
-        
-        job = voice_clone_batch_jobs[session_id]
-        if job["completed"] + job["failed"] >= job["total"]:
-            job["status"] = "completed" if job["failed"] == 0 else "completed_with_errors"
+        try:
+            await asyncio.gather(*tasks)
+            job = voice_clone_batch_jobs[session_id]
+            if job["completed"] + job["failed"] >= job["total"]:
+                job["status"] = "completed" if job["failed"] == 0 else "completed_with_errors"
+        except Exception as e:
+            logger.exception("Voice clone batch %s crashed", session_id)
+            job = voice_clone_batch_jobs[session_id]
+            job["status"] = "failed"
+            job["error"] = str(e)
 
     # Start background task WITHOUT waiting
     asyncio.create_task(run_batch_task())
@@ -1640,10 +1670,14 @@ async def get_voice_clone_batch_status(session_id: str):
     progress_pct = 0.0
     if total > 0:
         progress_pct = round(((completed + failed) / total) * 100, 1)
+
+    sorted_results = _sorted_clone_batch_results(job["results"])
     
     return {
         **job,
-        "progress_pct": progress_pct
+        "progress_pct": progress_pct,
+        "clones": sorted_results,
+        "results": sorted_results,
     }
 
 
