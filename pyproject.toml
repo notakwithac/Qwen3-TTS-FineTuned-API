@@ -28,7 +28,6 @@ dependencies = [
   "sox",
   "onnxruntime",
   "einops",
-  "tensorboard>=2.20.0",
   "fastapi>=0.115.0",
   "uvicorn[standard]>=0.34.0",
   "python-multipart>=0.0.18",
@@ -61,6 +60,10 @@ cu121 = [
 
 flash = [
   "flash-attn>=2.5.0"
+]
+
+train = [
+  "tensorboard>=2.20.0"
 ]
 
 [tool.uv.sources]

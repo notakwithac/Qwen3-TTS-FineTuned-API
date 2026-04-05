@@ -24,8 +24,7 @@ if [ -f ".venv/bin/activate" ]; then
     echo "[INFO] Activating virtual environment..." | tee -a "${LOG_DIR}/startup.log"
     source .venv/bin/activate
 else
-    echo "[ERROR] .venv not found. Please run setup_tir.sh first." | tee -a "${LOG_DIR}/startup.log"
-    exit 1
+    echo "[INFO] .venv not found. Using the container's default Python environment." | tee -a "${LOG_DIR}/startup.log"
 fi
 
 # Load .env if it exists
