@@ -47,6 +47,12 @@ SIGNAL_GRACE_MINUTES = int(os.getenv("GPU_SIGNAL_GRACE_MINUTES", "5"))
 # During this window, Connection refused is normal (uvicorn still loading models).
 API_STARTUP_WAIT_MINUTES = int(os.getenv("GPU_API_STARTUP_WAIT_MINUTES", "5"))
 
+# --- Heartbeat / Periodic Upload Config ---
+# How often to upload artifacts even if the API is busy (to prevent data loss).
+PERIODIC_UPLOAD_MINUTES = int(os.getenv("GPU_PERIODIC_UPLOAD_MINUTES", "5"))
+# Whether to include training/finetuning weights in the upload.
+UPLOAD_OUTPUTS = os.getenv("GPU_UPLOAD_OUTPUTS", "true").lower() == "true"
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -178,55 +184,106 @@ def resolve_instance_uuid(client: MassedComputeClient) -> str | None:
     return None
 
 
-def upload_final_artifacts(instance_uuid: str):
-    """Upload API logs and instance logs (/tmp) to S3 before termination."""
+def upload_final_artifacts(instance_uuid: str, is_periodic: bool = False):
+    """Upload API logs, instance logs (/tmp), and training outputs to S3.
+    
+    Args:
+        instance_uuid: The Massed Compute instance ID.
+        is_periodic: If True, this is a heartbeat upload (uses 'periodic' folder).
+    """
     if not storage.is_configured:
-        logger.warning("Storage not configured — skipping final artifact upload.")
+        logger.warning("Storage not configured — skipping artifact upload.")
         return
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    s3_prefix = f"backups/{instance_uuid}/{timestamp}"
+    if is_periodic:
+        # For heartbeats, use a fixed 'latest' folder to avoid S3 bloat
+        s3_prefix = f"backups/{instance_uuid}/periodic/latest"
+    else:
+        # For final termination, use a timestamped folder for complete history
+        s3_prefix = f"backups/{instance_uuid}/final/{timestamp}"
     
-    # 1. API Logs (logs/*.log, metrics/*.jsonl)
-    log_files = glob.glob("logs/*.log")
-    if os.path.exists("metrics/resource_metrics.jsonl"):
-        log_files.append("metrics/resource_metrics.jsonl")
+    # 1. API Logs & Metrics
+    artifact_paths = [
+        "logs",    # Directory
+        "metrics", # Directory
+        "/tmp",    # Directory (for system logs)
+    ]
     
-    # 2. Instance Logs (/tmp)
-    # On most Linux systems (TIR included), /tmp might contain logs or we check /var/log
-    # The user specifically asked for /tmp/
-    tmp_logs = glob.glob("/tmp/*.log") + glob.glob("/tmp/*.txt")
+    # 2. Training/Jobs Outputs (if enabled)
+    if UPLOAD_OUTPUTS:
+        artifact_paths.extend(["output", "runs", "jobs"])
     
-    # 3. Collect from API history if possible
-    try:
-        with urllib.request.urlopen("http://localhost:8000/ops/history", timeout=5) as response:
-            if response.status == 200:
-                history_data = response.read()
-                storage.upload_bytes(
-                    history_data, 
-                    f"{s3_prefix}/ops_history.json", 
-                    content_type="application/json"
-                )
-                logger.info("Uploaded ops history to S3.")
-    except Exception as exc:
-        logger.debug("Could not retrieve ops history from API: %s", exc)
+    # Files to glob for in those paths
+    log_patterns = ["*.log", "*.jsonl", "*.txt", "events.out.tfevents.*"]
+    # Model patterns: include config/trainer state always, weights only for final upload
+    model_patterns = ["config.json", "trainer_state.json", "*.pt"] if UPLOAD_OUTPUTS else []
+    if UPLOAD_OUTPUTS and not is_periodic:
+        model_patterns.append("*.safetensors")
+        
+    all_patterns = list(set(log_patterns + model_patterns))
 
-    # Combine all target files
-    all_files = list(set(log_files + tmp_logs))
-    for local_path in all_files:
+    found_files = []
+    for base in artifact_paths:
+        if not os.path.exists(base):
+            continue
+        
+        if os.path.isfile(base):
+            found_files.append(base)
+            continue
+
+        # Recursively find files matching patterns
+        for root, _, files in os.walk(base):
+            for filename in files:
+                # Basic pattern matching
+                matches = any(
+                    (filename.endswith(p.replace("*", "")) if p.startswith("*") else filename == p)
+                    for p in all_patterns
+                )
+                if matches:
+                    found_files.append(os.path.join(root, filename))
+
+    # 3. Collect from API history if possible (only for final or long-interval periodic)
+    if not is_periodic or timestamp.endswith("00"): # simplified throttle for history
+        try:
+            with urllib.request.urlopen("http://localhost:8000/ops/history", timeout=5) as response:
+                if response.status == 200:
+                    history_data = response.read()
+                    storage.upload_bytes(
+                        history_data, 
+                        f"{s3_prefix}/ops_history.json", 
+                        content_type="application/json"
+                    )
+                    logger.info("Uploaded ops history to S3.")
+        except Exception as exc:
+            logger.debug("Could not retrieve ops history from API: %s", exc)
+
+    # 4. Upload all collected files
+    upload_count = 0
+    for local_path in list(set(found_files)):
         if os.path.isfile(local_path):
-            filename = os.path.basename(local_path)
-            # Differentiate /tmp files in S3
-            if local_path.startswith("/tmp/"):
-                s3_key = f"{s3_prefix}/tmp/{filename}"
-            else:
-                s3_key = f"{s3_prefix}/{filename}"
+            # Maintain some structure in S3
+            rel_path = os.path.relpath(local_path, start=".")
+            # Sanitize rel_path for S3 (remove leading dots/slashes)
+            rel_path = rel_path.replace("..", "up").replace(":", "_")
+            if rel_path.startswith("/") or rel_path.startswith("\\"):
+                rel_path = rel_path[1:]
+            
+            s3_key = f"{s3_prefix}/{rel_path}"
                 
             try:
+                # Basic size throttle for periodic uploads
+                file_size = os.path.getsize(local_path)
+                if is_periodic and file_size > 1024*1024*500:
+                    logger.warning("Skipping massive file %s (%.1f MB) during periodic upload", local_path, file_size/1e6)
+                    continue
+
                 storage.upload_file(local_path, s3_key)
-                logger.info("Uploaded %s to S3: %s", local_path, s3_key)
+                upload_count += 1
             except Exception as exc:
                 logger.error("Failed to upload %s to S3: %s", local_path, exc)
+    
+    logger.info("Artifact upload complete (%d files -> %s)", upload_count, s3_prefix)
 
 
 # ---------------------------------------------------------------------------
@@ -290,12 +347,29 @@ def main():
                 SIGNAL_GRACE_MINUTES)
     logger.info("  API startup window   : %d min (Connection refused suppressed + idle timer paused)",
                 API_STARTUP_WAIT_MINUTES)
+    logger.info("  Periodic heartbeat   : %d min (upload artifacts even if busy)",
+                PERIODIC_UPLOAD_MINUTES)
+
+    last_periodic_upload_at = time.time()
 
     while True:
         api_busy = is_api_busy()
         termination_requested = os.path.exists(signal_file)
         uptime_seconds = time.time() - start_time
         in_startup_window = uptime_seconds < api_startup_wait_seconds
+        
+        # --- Periodic Heartbeat Upload ---
+        now = time.time()
+        if (now - last_periodic_upload_at) >= (PERIODIC_UPLOAD_MINUTES * 60):
+            if initial_uuid:
+                logger.info(">>> PERIODIC HEARTBEAT UPLOAD TRIGGERED (even if busy) <<<")
+                try:
+                    upload_final_artifacts(initial_uuid, is_periodic=True)
+                    last_periodic_upload_at = now
+                except Exception as exc:
+                    logger.error("Periodic heartbeat upload failed: %s", exc)
+            else:
+                logger.warning("Periodic heartbeat skipped: instance UUID not resolved yet")
 
         if termination_requested:
             now = time.time()

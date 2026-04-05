@@ -21,9 +21,18 @@ try:
         nvmlDeviceGetUtilizationRates, nvmlDeviceGetMemoryInfo,
         nvmlDeviceGetName, nvmlShutdown, NVMLError
     )
-    HAS_GPU = True
+    HAS_PYNVML = True
+    PYNVML_ERROR = None
+except ImportError as e:
+    HAS_PYNVML = False
+    PYNVML_ERROR = f"Package 'nvidia-ml-py' (pynvml) not installed: {e}"
+
+# Fallback basic GPU support via torch
+try:
+    import torch
+    HAS_TORCH = True
 except ImportError:
-    HAS_GPU = False
+    HAS_TORCH = False
 
 logger = logging.getLogger("metrics")
 
@@ -41,13 +50,26 @@ class MetricsCollector:
         
         # Initialize NVML if available
         self.nvml_initialized = False
-        if HAS_GPU:
+        self.gpu_count = 0
+        self.init_error = None
+        
+        if HAS_PYNVML:
             try:
                 nvmlInit()
                 self.nvml_initialized = True
-                logger.info("NVML initialized successfully. GPU monitoring enabled.")
+                self.gpu_count = nvmlDeviceGetCount()
+                logger.info(f"NVML initialized. Found {self.gpu_count} GPUs.")
             except Exception as e:
-                logger.warning(f"Failed to initialize NVML: {e}. GPU monitoring disabled.")
+                self.init_error = f"NVML init failed: {e}"
+                logger.warning(f"{self.init_error}. Falling back to basic monitoring.")
+        else:
+            self.init_error = PYNVML_ERROR
+            logger.warning(f"pynvml not available: {self.init_error}")
+
+        # If NVML failed but we have torch, we can still detect count/names
+        if not self.nvml_initialized and HAS_TORCH and torch.cuda.is_available():
+            self.gpu_count = torch.cuda.device_count()
+            logger.info(f"Using torch.cuda as fallback. Detected {self.gpu_count} GPUs.")
 
     def collect_now(self) -> Dict[str, Any]:
         """Manually trigger a collection and return the snapshot."""
@@ -68,8 +90,7 @@ class MetricsCollector:
         
         if self.nvml_initialized:
             try:
-                device_count = nvmlDeviceGetCount()
-                for i in range(device_count):
+                for i in range(self.gpu_count):
                     handle = nvmlDeviceGetHandleByIndex(i)
                     name = nvmlDeviceGetName(handle)
                     if isinstance(name, bytes):
@@ -88,7 +109,27 @@ class MetricsCollector:
                         "vram_percent": round((mem.used / mem.total) * 100, 2)
                     })
             except Exception as e:
-                logger.error(f"Error collecting GPU metrics: {e}")
+                logger.error(f"Error collecting high-precision GPU metrics: {e}")
+        elif HAS_TORCH and torch.cuda.is_available():
+            # Basic fallback using torch
+            try:
+                for i in range(self.gpu_count):
+                    name = torch.cuda.get_device_name(i)
+                    mem_total = torch.cuda.get_device_properties(i).total_memory
+                    mem_used = torch.cuda.memory_allocated(i) # This only sees current process though
+                    # Better to report what torch knows
+                    metrics["gpus"].append({
+                        "index": i,
+                        "name": name,
+                        "vram_total_gb": round(mem_total / (1024**3), 2),
+                        "note": "Stats limited (pynvml unavailable)"
+                    })
+            except Exception as e:
+                logger.error(f"Error collecting fallback GPU metrics: {e}")
+        
+        # Add error info if no GPUs found despite trying
+        if not metrics["gpus"] and self.init_error:
+            metrics["gpu_error"] = self.init_error
         
         with self._lock:
             self._latest_metrics = metrics

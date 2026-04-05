@@ -12,11 +12,11 @@ import time
 import uuid
 import asyncio
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, Request
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from pipeline import Pipeline, JobStatus
 from storage import storage
@@ -32,46 +32,72 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Log Streaming Setup ---
-from fastapi.responses import StreamingResponse
+# --- Log Streaming & SSE Setup ---
+from sse_starlette.sse import EventSourceResponse
+from broadcaster import Broadcast
+import sys
+from collections import deque
 
-# List of active log queues for SSE streaming
-log_queues: list[asyncio.Queue] = []
+# Broadcast instance for efficient fan-out
+broadcast = Broadcast("memory://")
+
+# In-memory history buffer for new client context (last 200 logs)
+log_history = deque(maxlen=200)
 
 class LogStreamHandler(logging.Handler):
-    """Custom logging handler that pushes log records into active client queues."""
+    """Custom logging handler that publishes log records to a broadcast channel."""
+    def __init__(self):
+        super().__init__()
+        self.loop = None
+
     def emit(self, record: logging.LogRecord):
         # 1. General level filter for the stream: only INFO and above
-        if record.levelno < logging.DEBUG:
+        if record.levelno < logging.INFO:
             return
 
         # 2. Filter out noisy operational and status logs from the SSE stream
-        # (while keeping them in terminal/files for local debugging)
         if record.levelno < logging.WARNING:
-            # Silence specific loggers known for noise
-            # Silence noisy infrastructure loggers unless it's specifically for voice design
             if record.name in ("ops", "httpx", "httpcore", "urllib3"):
                 if record.name == "ops" and "voice_design" in record.getMessage():
                     pass # Allow voice design operations through
                 else:
                     return
             
-            # Silence high-frequency polling paths and metadata requests
-            msg = record.getMessage().lower()
+            msg_lower = record.getMessage().lower()
             noise_filters = [
                 "/health", "/status", "/ops/", "/gpu/status", 
                 "/gpu/vram", "/sessions", "/docs", "/openapi.json", "/favicon.ico"
             ]
-            if any(f in msg for f in noise_filters):
+            if any(f in msg_lower for f in noise_filters):
                 return
 
         try:
             msg = self.format(record)
-            # Push to all active queues
-            for q in log_queues:
-                asyncio.run_coroutine_threadsafe(q.put(msg), asyncio.get_event_loop())
+            
+            # Add to history buffer
+            log_history.append(msg)
+            
+            # Publish to broadcast channel if loop is available
+            if self.loop:
+                self.loop.call_soon_threadsafe(
+                    lambda: asyncio.create_task(broadcast.publish("logs", msg))
+                )
         except Exception:
             self.handleError(record)
+
+class StreamToLogger:
+    """Utility to redirect stdout/stderr to a logger."""
+    def __init__(self, logger, log_level):
+        self.logger = logger
+        self.log_level = log_level
+        self.linebuf = ""
+
+    def write(self, buf):
+        for line in buf.rstrip().splitlines():
+            self.logger.log(self.log_level, line.rstrip())
+
+    def flush(self):
+        pass
 
 # Attach stream handler to root logger and 'ops' logger
 stream_handler = LogStreamHandler()
@@ -94,14 +120,26 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def _lifespan(app):
+    # Startup: connect to broadcast
+    await broadcast.connect()
+    
+    # Startup: capture the main event loop for our stream handler
+    stream_handler.loop = asyncio.get_running_loop()
+    
+    # Redirect stdout to logger (so prints from sub-modules show up in stream)
+    sys.stdout = StreamToLogger(logger, logging.INFO)
+    
     # Startup: start session cleanup loop and resource monitoring
     session_mgr.start_cleanup_loop()
     metrics_collector.start()
     yield
+    # Shutdown: disconnect broadcast
+    await broadcast.disconnect()
+    # Restore stdout
+    sys.stdout = sys.__stdout__
     # Shutdown: stop metrics collector and wait for any in-progress S3 uploads
     metrics_collector.stop()
     logger.info("Server shutting down — waiting for pending S3 uploads...")
-    import asyncio
     await asyncio.get_event_loop().run_in_executor(None, pipeline.shutdown)
     logger.info("Shutdown complete.")
 
@@ -346,7 +384,116 @@ def get_custom_voice_batcher(job_id: str, checkpoint_path: str, speaker_name: st
 # Request / Response models
 # ---------------------------------------------------------------------------
 
-class InferRequest(BaseModel):
+MAX_TEXT_LENGTH = int(os.environ.get("MAX_TEXT_LENGTH", "5000"))
+MAX_INSTRUCT_LENGTH = int(os.environ.get("MAX_INSTRUCT_LENGTH", "1000"))
+MAX_REF_TEXT_LENGTH = int(os.environ.get("MAX_REF_TEXT_LENGTH", "5000"))
+MAX_BATCH_ITEMS = int(os.environ.get("MAX_BATCH_ITEMS", str(GPU_BATCH_SIZE)))
+MAX_CLONE_BATCH_ITEMS = int(os.environ.get("MAX_CLONE_BATCH_ITEMS", "32"))
+
+
+def _normalize_text(value: str, field_name: str, max_length: int) -> str:
+    value = (value or "").strip()
+    if not value:
+        raise ValueError(f"{field_name} cannot be empty")
+    if len(value) > max_length:
+        raise ValueError(f"{field_name} exceeds max length of {max_length}")
+    return value
+
+
+def _normalize_optional_id(value: Optional[str], field_name: str) -> Optional[str]:
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    if len(value) > 255:
+        raise ValueError(f"{field_name} exceeds max length of 255")
+    return value
+
+
+def _normalize_filename(value: Optional[str], field_name: str = "filename") -> Optional[str]:
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    if len(value) > 255:
+        raise ValueError(f"{field_name} exceeds max length of 255")
+    if value.startswith("/") or value.startswith("\\"):
+        raise ValueError(f"{field_name} must be a relative file name")
+    if ".." in value or "/" in value or "\\" in value:
+        raise ValueError(f"{field_name} must not contain path traversal or directory separators")
+    if not value.lower().endswith(".wav"):
+        raise ValueError(f"{field_name} must end with .wav")
+    if not re.fullmatch(r"[A-Za-z0-9._ -]+", value):
+        raise ValueError(f"{field_name} contains unsupported characters")
+    return value
+
+
+def _normalize_language(value: Optional[str]) -> str:
+    value = (value or "English").strip()
+    if not value:
+        return "English"
+    if len(value) > 64:
+        raise ValueError("language exceeds max length of 64")
+    return value
+
+
+def _validate_http_url(value: str, field_name: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        raise ValueError(f"{field_name} cannot be empty")
+    if not re.match(r"^https?://", value, re.IGNORECASE):
+        raise ValueError(f"{field_name} must be an http or https URL")
+    if len(value) > 2048:
+        raise ValueError(f"{field_name} exceeds max length of 2048")
+    return value
+
+
+class APIModel(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+
+class AudioS3Result(APIModel):
+    s3_url: str
+    presigned_url: Optional[str] = None
+    s3_key: str
+    sample_rate: int
+    text: str
+    job_id: str
+    status: str = "success"
+
+
+class AsyncSubmissionResponse(APIModel):
+    session_id: str
+    finetune_job_id: str
+    status: str
+    total: int
+
+
+class VoiceCloneBatchResultItem(AudioS3Result):
+    filename: Optional[str] = None
+    error: Optional[str] = None
+
+
+class VoiceCloneBatchStatusResponse(APIModel):
+    session_id: str
+    status: str
+    progress_pct: float = 0.0
+    total: int = 0
+    completed: int = 0
+    failed: int = 0
+    results: list[VoiceCloneBatchResultItem] = Field(default_factory=list)
+    error: Optional[str] = None
+    created_at: float
+
+
+class VoiceDesignResponse(AudioS3Result):
+    job_id: str = "voice_design"
+    instruct: str
+
+
+class InferRequest(APIModel):
     text: str
     language: str = "English"
     instruct: str = ""
@@ -357,47 +504,114 @@ class InferRequest(BaseModel):
     character_id: Optional[str] = None
     overwrite: bool = False  # If false, skips generation if file already exists on S3
 
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        return _normalize_text(value, "text", MAX_TEXT_LENGTH)
 
-class InferS3Response(BaseModel):
-    s3_url: str
-    presigned_url: Optional[str] = None
-    s3_key: str
-    sample_rate: int
+    @field_validator("language")
+    @classmethod
+    def validate_language(cls, value: str) -> str:
+        return _normalize_language(value)
+
+    @field_validator("instruct")
+    @classmethod
+    def validate_instruct(cls, value: str) -> str:
+        value = (value or "").strip()
+        if len(value) > MAX_INSTRUCT_LENGTH:
+            raise ValueError(f"instruct exceeds max length of {MAX_INSTRUCT_LENGTH}")
+        return value
+
+    @field_validator("s3_filename")
+    @classmethod
+    def validate_s3_filename(cls, value: Optional[str]) -> Optional[str]:
+        return _normalize_filename(value, "s3_filename")
+
+    @field_validator("book_id", "chapter_id", "character_id")
+    @classmethod
+    def validate_ids(cls, value: Optional[str], info) -> Optional[str]:
+        return _normalize_optional_id(value, info.field_name)
+
+
+class BatchInferItem(APIModel):
     text: str
-    job_id: str
+    filename: str
+    language: Optional[str] = None
+    instruct: str = ""
+    overwrite: Optional[bool] = None
+
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        return _normalize_text(value, "text", MAX_TEXT_LENGTH)
+
+    @field_validator("filename")
+    @classmethod
+    def validate_filename(cls, value: str) -> str:
+        normalized = _normalize_filename(value, "filename")
+        if not normalized:
+            raise ValueError("filename cannot be empty")
+        return normalized
+
+    @field_validator("language")
+    @classmethod
+    def validate_language(cls, value: Optional[str]) -> str:
+        return _normalize_language(value)
+
+    @field_validator("instruct")
+    @classmethod
+    def validate_instruct(cls, value: str) -> str:
+        value = (value or "").strip()
+        if len(value) > MAX_INSTRUCT_LENGTH:
+            raise ValueError(f"instruct exceeds max length of {MAX_INSTRUCT_LENGTH}")
+        return value
 
 
-class BatchInferRequest(BaseModel):
+class BatchInferRequest(APIModel):
     """Generate multiple audio files in one call, all uploaded to S3."""
-    items: list  # list of {"text": str, "language": str, "instruct": str, "filename": str, "overwrite": bool, "character_id": str}
+    items: list[BatchInferItem]
     language: str = "English"
     book_id: Optional[str] = None
     chapter_id: Optional[str] = None
     character_id: Optional[str] = None
     overwrite: bool = False  # Default overwrite flag for all items
 
+    @field_validator("items")
+    @classmethod
+    def validate_items(cls, value: list[BatchInferItem]) -> list[BatchInferItem]:
+        if not value:
+            raise ValueError("items cannot be empty")
+        if len(value) > MAX_BATCH_ITEMS:
+            raise ValueError(f"items exceeds max batch size of {MAX_BATCH_ITEMS}")
+        return value
 
-class JobSummary(BaseModel):
+    @field_validator("language")
+    @classmethod
+    def validate_language(cls, value: str) -> str:
+        return _normalize_language(value)
+
+
+class JobSummary(APIModel):
     job_id: str
     status: JobStatus
     speaker_name: str
-    progress: dict = {}
+    progress: dict[str, Any] = Field(default_factory=dict)
     checkpoint_path: Optional[str] = None
     error: Optional[str] = None
     created_at: str
     finished_at: Optional[str] = None
-    config: dict = {}
+    config: dict[str, Any] = Field(default_factory=dict)
     inference_url: Optional[str] = None
     message: Optional[str] = None
 
 
-class StorageStatus(BaseModel):
+class StorageStatus(APIModel):
     configured: bool
     endpoint: str
     bucket: str
 
 
-class VoiceDesignRequest(BaseModel):
+class VoiceDesignRequest(APIModel):
     """Generate speech using VoiceDesign model (no fine-tuning needed)."""
     text: str
     instruct: str  # Voice description, e.g. "A warm male voice, middle-aged, calm"
@@ -408,8 +622,33 @@ class VoiceDesignRequest(BaseModel):
     character_uuid: Optional[str] = None
     overwrite: bool = False  # If false, skips generation if file already exists on S3
 
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        return _normalize_text(value, "text", MAX_TEXT_LENGTH)
 
-class VoiceDesignBatchItem(BaseModel):
+    @field_validator("instruct")
+    @classmethod
+    def validate_instruct(cls, value: str) -> str:
+        return _normalize_text(value, "instruct", MAX_INSTRUCT_LENGTH)
+
+    @field_validator("language")
+    @classmethod
+    def validate_language(cls, value: str) -> str:
+        return _normalize_language(value)
+
+    @field_validator("s3_filename")
+    @classmethod
+    def validate_s3_filename(cls, value: Optional[str]) -> Optional[str]:
+        return _normalize_filename(value, "s3_filename")
+
+    @field_validator("character_name", "character_uuid")
+    @classmethod
+    def validate_character_fields(cls, value: Optional[str], info) -> Optional[str]:
+        return _normalize_optional_id(value, info.field_name)
+
+
+class VoiceDesignBatchItem(APIModel):
     """A single item in a voice design batch request."""
     text: str
     instruct: str  # Voice description, e.g. "A warm male voice, middle-aged, calm"
@@ -418,19 +657,67 @@ class VoiceDesignBatchItem(BaseModel):
     character_uuid: Optional[str] = None
     s3_filename: Optional[str] = None
 
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        return _normalize_text(value, "text", MAX_TEXT_LENGTH)
 
-class VoiceDesignBatchRequest(BaseModel):
+    @field_validator("instruct")
+    @classmethod
+    def validate_instruct(cls, value: str) -> str:
+        return _normalize_text(value, "instruct", MAX_INSTRUCT_LENGTH)
+
+    @field_validator("language")
+    @classmethod
+    def validate_language(cls, value: str) -> str:
+        return _normalize_language(value)
+
+    @field_validator("character_name", "character_uuid")
+    @classmethod
+    def validate_character_fields(cls, value: Optional[str], info) -> Optional[str]:
+        return _normalize_optional_id(value, info.field_name)
+
+    @field_validator("s3_filename")
+    @classmethod
+    def validate_filename(cls, value: Optional[str]) -> Optional[str]:
+        return _normalize_filename(value, "s3_filename")
+
+
+class VoiceDesignBatchRequest(APIModel):
     """Generate multiple voice designs concurrently for rapid character voice iteration."""
     items: list[VoiceDesignBatchItem]
     upload_to_s3: bool = True
     overwrite: bool = False
 
+    @field_validator("items")
+    @classmethod
+    def validate_items(cls, value: list[VoiceDesignBatchItem]) -> list[VoiceDesignBatchItem]:
+        if not value:
+            raise ValueError("items cannot be empty")
+        if len(value) > MAX_CONCURRENT_VOICE_DESIGNS:
+            raise ValueError(f"items exceeds max batch size of {MAX_CONCURRENT_VOICE_DESIGNS}")
+        return value
 
-class VoiceCloneBatchItem(BaseModel):
+
+class VoiceCloneBatchItem(APIModel):
     text: str
     filename: str
 
-class VoiceCloneBatchRequest(BaseModel):
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        return _normalize_text(value, "text", MAX_TEXT_LENGTH)
+
+    @field_validator("filename")
+    @classmethod
+    def validate_filename(cls, value: str) -> str:
+        normalized = _normalize_filename(value, "filename")
+        if not normalized:
+            raise ValueError("filename cannot be empty")
+        return normalized
+
+
+class VoiceCloneBatchRequest(APIModel):
     """Batch generate zero-shot voice cloning from a reference audio and upload to S3."""
     ref_audio_url: str
     ref_text: str
@@ -440,19 +727,32 @@ class VoiceCloneBatchRequest(BaseModel):
     upload_to_s3: bool = True
     overwrite: bool = False
 
-class VoiceCloneBatchStatusResponse(BaseModel):
-    session_id: str
-    status: str # processing, completed, failed
-    progress_pct: float = 0.0
-    total: int = 0
-    completed: int = 0
-    failed: int = 0
-    results: list[dict] = []
-    error: Optional[str] = None
-    created_at: float
+    @field_validator("ref_audio_url")
+    @classmethod
+    def validate_ref_audio_url(cls, value: str) -> str:
+        return _validate_http_url(value, "ref_audio_url")
+
+    @field_validator("ref_text")
+    @classmethod
+    def validate_ref_text(cls, value: str) -> str:
+        return _normalize_text(value, "ref_text", MAX_REF_TEXT_LENGTH)
+
+    @field_validator("language")
+    @classmethod
+    def validate_language(cls, value: str) -> str:
+        return _normalize_language(value)
+
+    @field_validator("items")
+    @classmethod
+    def validate_items(cls, value: list[VoiceCloneBatchItem]) -> list[VoiceCloneBatchItem]:
+        if not value:
+            raise ValueError("items cannot be empty")
+        if len(value) > MAX_CLONE_BATCH_ITEMS:
+            raise ValueError(f"items exceeds max batch size of {MAX_CLONE_BATCH_ITEMS}")
+        return value
 
 
-class VoiceCloneRequest(BaseModel):
+class VoiceCloneRequest(APIModel):
     """Generate speech using zero-shot VoiceClone Base model."""
     text: str
     ref_audio_url: str
@@ -462,6 +762,31 @@ class VoiceCloneRequest(BaseModel):
     upload_to_s3: bool = True
     s3_filename: Optional[str] = None
     overwrite: bool = False
+
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        return _normalize_text(value, "text", MAX_TEXT_LENGTH)
+
+    @field_validator("ref_audio_url")
+    @classmethod
+    def validate_ref_audio_url(cls, value: str) -> str:
+        return _validate_http_url(value, "ref_audio_url")
+
+    @field_validator("ref_text")
+    @classmethod
+    def validate_ref_text(cls, value: str) -> str:
+        return _normalize_text(value, "ref_text", MAX_REF_TEXT_LENGTH)
+
+    @field_validator("language")
+    @classmethod
+    def validate_language(cls, value: str) -> str:
+        return _normalize_language(value)
+
+    @field_validator("s3_filename")
+    @classmethod
+    def validate_s3_filename(cls, value: Optional[str]) -> Optional[str]:
+        return _normalize_filename(value, "s3_filename")
 
 # ---------------------------------------------------------------------------
 # Endpoints
@@ -485,7 +810,7 @@ async def storage_status():
         "bucket": storage.bucket,
     }
 
-class FinetuneRequest(BaseModel):
+class FinetuneRequest(APIModel):
     dataset_s3_key: str
     speaker_name: str
     batch_size: int = 2
@@ -497,6 +822,50 @@ class FinetuneRequest(BaseModel):
     resume_job_id: Optional[str] = None
     job_id: Optional[str] = None
     force: bool = False
+
+    @field_validator("dataset_s3_key")
+    @classmethod
+    def validate_dataset_key(cls, value: str) -> str:
+        value = (value or "").strip()
+        if not value:
+            raise ValueError("dataset_s3_key cannot be empty")
+        if len(value) > 1024:
+            raise ValueError("dataset_s3_key exceeds max length of 1024")
+        return value
+
+    @field_validator("speaker_name")
+    @classmethod
+    def validate_speaker_name(cls, value: str) -> str:
+        value = _normalize_text(value, "speaker_name", 128)
+        if not re.fullmatch(r"[A-Za-z0-9_ -]+", value):
+            raise ValueError("speaker_name contains unsupported characters")
+        return value
+
+    @field_validator("batch_size")
+    @classmethod
+    def validate_batch_size(cls, value: int) -> int:
+        if value < 1 or value > 64:
+            raise ValueError("batch_size must be between 1 and 64")
+        return value
+
+    @field_validator("num_epochs")
+    @classmethod
+    def validate_num_epochs(cls, value: int) -> int:
+        if value < 1 or value > 200:
+            raise ValueError("num_epochs must be between 1 and 200")
+        return value
+
+    @field_validator("lr")
+    @classmethod
+    def validate_lr(cls, value: float) -> float:
+        if value <= 0 or value > 1:
+            raise ValueError("lr must be greater than 0 and at most 1")
+        return value
+
+    @field_validator("book_id", "chapter_id", "character_id", "resume_job_id", "job_id")
+    @classmethod
+    def validate_ids(cls, value: Optional[str], info) -> Optional[str]:
+        return _normalize_optional_id(value, info.field_name)
 
 @app.post("/finetune", summary="Start a fine-tuning job", response_model=JobSummary)
 def create_finetune_job(req: FinetuneRequest):
@@ -818,7 +1187,7 @@ async def infer(job_id: str, req: InferRequest):
 @app.post(
     "/infer/{job_id}/batch",
     summary="Batch generate speech and upload to S3",
-    response_model=list[InferS3Response],
+    response_model=list[AudioS3Result],
 )
 async def infer_batch(job_id: str, req: BatchInferRequest):
     """Generate multiple audio files and upload all to E2E Object Storage.
@@ -874,11 +1243,11 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
 
     async def process_item(item, index):
         async with concurrency_limit:
-            text = item.get("text", "")
-            language = item.get("language", req.language)
-            instruct = item.get("instruct", "")
-            filename = item.get("filename", f"audio_{index:04d}.wav")
-            overwrite = item.get("overwrite", req.overwrite)
+            text = item.text
+            language = item.language or req.language
+            instruct = item.instruct
+            filename = item.filename or f"audio_{index:04d}.wav"
+            overwrite = req.overwrite if item.overwrite is None else item.overwrite
             
             # Construct S3 prefix for the upload phase
             s3_prefix = s3_prefix_base
@@ -1007,6 +1376,7 @@ def list_storage(job_id: str, book_id: Optional[str] = None, chapter_id: Optiona
             "description": "WAV audio or JSON with S3 URL",
         }
     },
+    response_model=AudioS3Result,
 )
 async def voice_clone(req: VoiceCloneRequest):
     """Generate speech using zero-shot VoiceClone Base model.
@@ -1079,7 +1449,7 @@ async def voice_clone(req: VoiceCloneRequest):
 @app.post(
     "/voice-clone/batch",
     summary="Batch generate zero-shot voice cloning (ASYNCHRONOUS)",
-    response_model=dict,
+    response_model=AsyncSubmissionResponse,
 )
 async def voice_clone_batch(req: VoiceCloneBatchRequest):
     """Generate multiple audio files in parallel using zero-shot VoiceClone Base model and upload to S3.
@@ -1128,6 +1498,8 @@ async def voice_clone_batch(req: VoiceCloneBatchRequest):
                             "sample_rate": 24000,
                             "text": item.text,
                             "job_id": "voice_clone",
+                            "filename": filename,
+                            "status": "success",
                         }
                         voice_clone_batch_jobs[session_id]["completed"] += 1
                         voice_clone_batch_jobs[session_id]["results"].append(res)
@@ -1145,6 +1517,17 @@ async def voice_clone_batch(req: VoiceCloneBatchRequest):
                 except Exception as e:
                     logger.error(f"Voice clone batch item {index} failed: {e}")
                     voice_clone_batch_jobs[session_id]["failed"] += 1
+                    voice_clone_batch_jobs[session_id]["results"].append({
+                        "s3_url": "",
+                        "presigned_url": None,
+                        "s3_key": s3_key,
+                        "sample_rate": 0,
+                        "text": item.text,
+                        "job_id": "voice_clone",
+                        "filename": filename,
+                        "status": "failed",
+                        "error": str(e),
+                    })
                     return
 
                 # Upload to S3
@@ -1164,12 +1547,25 @@ async def voice_clone_batch(req: VoiceCloneBatchRequest):
                             "sample_rate": sr,
                             "text": item.text,
                             "job_id": "voice_clone",
+                            "filename": filename,
+                            "status": "success",
                         }
                         voice_clone_batch_jobs[session_id]["completed"] += 1
                         voice_clone_batch_jobs[session_id]["results"].append(res)
                     except Exception as e:
                         logger.error(f"Voice clone S3 upload item {index} failed: {e}")
                         voice_clone_batch_jobs[session_id]["failed"] += 1
+                        voice_clone_batch_jobs[session_id]["results"].append({
+                            "s3_url": "",
+                            "presigned_url": None,
+                            "s3_key": s3_key,
+                            "sample_rate": 0,
+                            "text": item.text,
+                            "job_id": "voice_clone",
+                            "filename": filename,
+                            "status": "failed",
+                            "error": str(e),
+                        })
                 else:
                     import base64
                     res = {
@@ -1179,6 +1575,8 @@ async def voice_clone_batch(req: VoiceCloneBatchRequest):
                         "sample_rate": sr,
                         "text": item.text,
                         "job_id": "voice_clone_local",
+                        "filename": filename,
+                        "status": "success",
                     }
                     voice_clone_batch_jobs[session_id]["completed"] += 1
                     voice_clone_batch_jobs[session_id]["results"].append(res)
@@ -1235,6 +1633,7 @@ async def get_voice_clone_batch_status(session_id: str):
             "description": "WAV audio or JSON with S3 URL",
         }
     },
+    response_model=VoiceDesignResponse,
 )
 async def voice_design(req: VoiceDesignRequest):
     """Generate speech from a text description of the desired voice.
@@ -1283,6 +1682,8 @@ async def voice_design(req: VoiceDesignRequest):
                     "sample_rate": 24000,
                     "text": req.text,
                     "instruct": req.instruct,
+                    "job_id": "voice_design",
+                    "status": "success",
                 }
 
         try:
@@ -1310,6 +1711,8 @@ async def voice_design(req: VoiceDesignRequest):
             "sample_rate": sr,
             "text": req.text,
             "instruct": req.instruct,
+            "job_id": "voice_design",
+            "status": "success",
         }
 
     return Response(
@@ -1784,25 +2187,21 @@ async def stream_logs(request: Request):
     """Stream server logs using Server-Sent Events (SSE).
     
     This endpoint provides a real-time feed of all server logs, including 
-    structured operations from ops_logger.
+    structured operations from ops_logger and stdout redirects.
     """
-    queue = asyncio.Queue(maxsize=100)
-    log_queues.append(queue)
-    
     async def log_generator():
-        try:
-            while True:
-                # Check if client disconnected
+        # 1. Send recent history first
+        for msg in list(log_history):
+            yield {"data": msg}
+            
+        # 2. Subscribe to real-time updates
+        async with broadcast.subscribe(channel="logs") as subscriber:
+            async for event in subscriber:
                 if await request.is_disconnected():
                     break
-                
-                log_entry = await queue.get()
-                yield f"data: {log_entry}\n\n"
-        finally:
-            if queue in log_queues:
-                log_queues.remove(queue)
+                yield {"data": event.message}
 
-    return StreamingResponse(log_generator(), media_type="text/event-stream")
+    return EventSourceResponse(log_generator())
 
 
 # ---------------------------------------------------------------------------
