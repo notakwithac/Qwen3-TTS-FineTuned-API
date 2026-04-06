@@ -53,6 +53,18 @@ class LogStreamHandler(logging.Handler):
         super().__init__()
         self.loop = None
 
+    @staticmethod
+    def _should_keep_ops_record(message: str) -> bool:
+        message = message.lower()
+        keep_keywords = (
+            "voice_design",
+            "voice_clone",
+            "session_worker_batch",
+            "session_prepare",
+            "session_teardown",
+        )
+        return any(keyword in message for keyword in keep_keywords)
+
     def emit(self, record: logging.LogRecord):
         # 1. General level filter for the stream: only INFO and above
         if record.levelno < logging.INFO:
@@ -61,8 +73,8 @@ class LogStreamHandler(logging.Handler):
         # 2. Filter out noisy operational and status logs from the SSE stream
         if record.levelno < logging.WARNING:
             if record.name in ("ops", "httpx", "httpcore", "urllib3"):
-                if record.name == "ops" and "voice_design" in record.getMessage():
-                    pass # Allow voice design operations through
+                if record.name == "ops" and self._should_keep_ops_record(record.getMessage()):
+                    pass  # Allow inference/session ops that are useful during stress runs.
                 else:
                     return
             
@@ -2067,6 +2079,31 @@ class GpuConfigRequest(BaseModel):
     idle_timeout_seconds: int = 300
 
 
+class GPUConcurrencyConfigRequest(BaseModel):
+    gpu_max_models: int = Field(..., ge=1)
+    voice_design_replicas: int = Field(..., ge=1)
+    voice_clone_replicas: int = Field(..., ge=1)
+    shared_model_min_headroom_gb: float = Field(..., ge=0)
+
+
+class GPUConcurrencyConfigResponse(BaseModel):
+    gpu_max_models: int
+    voice_design_replicas: int
+    voice_clone_replicas: int
+    shared_model_min_headroom_gb: float
+
+
+def _gpu_concurrency_config_response() -> GPUConcurrencyConfigResponse:
+    stats = pipeline.inference.stats
+    shared_model_replicas = stats.get("shared_model_replicas", {})
+    return GPUConcurrencyConfigResponse(
+        gpu_max_models=stats["max_models"],
+        voice_design_replicas=shared_model_replicas.get("voice_design", 1),
+        voice_clone_replicas=shared_model_replicas.get("voice_clone", 1),
+        shared_model_min_headroom_gb=stats["shared_model_min_headroom_gb"],
+    )
+
+
 @app.put("/gpu/config", summary="Update GPU idle timeout")
 async def gpu_config(req: GpuConfigRequest):
     """Change idle timeout. Set to 0 to disable auto-unload."""
@@ -2075,6 +2112,38 @@ async def gpu_config(req: GpuConfigRequest):
         "idle_timeout_seconds": req.idle_timeout_seconds,
         "auto_unload_enabled": req.idle_timeout_seconds > 0,
     }
+
+
+@app.get(
+    "/gpu/concurrency",
+    response_model=GPUConcurrencyConfigResponse,
+    summary="Get live GPU concurrency settings",
+)
+async def get_gpu_concurrency():
+    """Return the effective runtime GPU concurrency configuration."""
+    return _gpu_concurrency_config_response()
+
+
+@app.post(
+    "/gpu/concurrency",
+    response_model=GPUConcurrencyConfigResponse,
+    summary="Update live GPU concurrency settings",
+)
+async def update_gpu_concurrency(req: GPUConcurrencyConfigRequest):
+    """Apply GPU concurrency settings in memory without restarting the server."""
+    try:
+        pipeline.inference.update_runtime_config(
+            max_models=req.gpu_max_models,
+            shared_model_replicas={
+                "voice_design": req.voice_design_replicas,
+                "voice_clone": req.voice_clone_replicas,
+            },
+            shared_model_min_headroom_gb=req.shared_model_min_headroom_gb,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return _gpu_concurrency_config_response()
 
 
 @app.post("/gpu/terminate", summary="Request instance termination")

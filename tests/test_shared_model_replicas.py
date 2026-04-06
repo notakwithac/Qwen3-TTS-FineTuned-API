@@ -47,3 +47,29 @@ def test_acquire_shared_replica_reuses_loaded_replica_when_headroom_is_tight():
     selected = manager._acquire_shared_replica(VOICE_DESIGN_MODEL, "voice_design")
 
     assert selected == first
+
+
+def test_runtime_max_models_update_changes_effective_limit():
+    manager = InferenceManager(device="cpu", max_models=2)
+
+    manager.update_runtime_config(max_models=4)
+
+    assert manager.max_models == 4
+    assert manager.stats["inference_limiter"] == {
+        "capacity": 4,
+        "active": 0,
+        "available": 4,
+    }
+
+
+def test_runtime_shared_replica_update_changes_targets():
+    manager = InferenceManager(device="cpu", shared_model_replicas={"voice_design": 1})
+
+    manager.update_runtime_config(shared_model_replicas={"voice_design": 3})
+
+    assert manager.stats["shared_model_replicas"]["voice_design"] == 3
+    assert manager._shared_replica_keys(VOICE_DESIGN_MODEL, "voice_design") == [
+        f"{VOICE_DESIGN_MODEL}::replica-0",
+        f"{VOICE_DESIGN_MODEL}::replica-1",
+        f"{VOICE_DESIGN_MODEL}::replica-2",
+    ]

@@ -217,6 +217,31 @@ Content-Type: application/json
 - `GET /gpu/vram`: Direct access to VRAM budget/allocations.
 - `POST /gpu/unload`: Manually free GPU memory.
 - `PUT /gpu/config`: Update idle timeout for auto-unload.
+- `GET /gpu/concurrency`: Show the live runtime GPU concurrency and shared-replica targets.
+- `POST /gpu/concurrency`: Update runtime GPU concurrency in memory without redeploying.
+
+**Runtime concurrency payload example:**
+```json
+{
+  "gpu_max_models": 7,
+  "voice_design_replicas": 2,
+  "voice_clone_replicas": 2,
+  "shared_model_min_headroom_gb": 4
+}
+```
+
+**Notes:**
+- `.env` values are startup defaults only.
+- `POST /gpu/concurrency` overrides the live process immediately.
+- Aggressive values are allowed, but actual replica admission is still gated by runtime VRAM headroom.
+
+**Suggested tuning workflow:**
+1. Boot the server with conservative `.env` defaults.
+2. Call `GET /gpu/concurrency` to inspect the live baseline.
+3. Call `POST /gpu/concurrency` with your test values.
+4. Run `python stress_shared_model_replicas.py --base-url http://<TIR_GPU_IP>:8000`.
+5. Run `python stress_logs_stream.py --base-url http://<TIR_GPU_IP>:8000`.
+6. Inspect `GET /gpu/vram`, `GET /gpu/metrics`, and `GET /ops/history?limit=100`.
 
 ---
 
@@ -225,9 +250,18 @@ Content-Type: application/json
 ### Environment Variables
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `GPU_MAX_MODELS` | `4` | Max voices kept hot in VRAM |
+| `GPU_MAX_MODELS` | `auto` / `7` | Startup capacity budget for loaded models, not an automatic shared-replica count |
+| `VOICE_DESIGN_REPLICAS` | `1` / `2` | Startup default for shared VoiceDesign replicas |
+| `VOICE_CLONE_REPLICAS` | `1` / `2` | Startup default for shared VoiceClone replicas |
+| `SHARED_MODEL_MIN_HEADROOM_GB` | `4` | Minimum free VRAM headroom required before loading another shared replica |
 | `GPU_IDLE_TIMEOUT` | `300` | Seconds before auto-unload |
 | `E2E_BUCKET` | `qwen3-tts` | Default S3 bucket |
+
+### Manual Stress Utilities
+- `python stress_shared_model_replicas.py --base-url http://<TIR_GPU_IP>:8000`
+  - Seeds real VoiceDesign audio in S3, then runs clone-only and mixed design+clone waves while polling clone batch completion.
+- `python stress_logs_stream.py --base-url http://<TIR_GPU_IP>:8000`
+  - Keeps `/logs/stream` open during live GPU work and asserts that design/clone activity appears in the stream.
 
 ### Error Codes
 | Status | Meaning |

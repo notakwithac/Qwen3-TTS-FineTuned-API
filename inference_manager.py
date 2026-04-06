@@ -19,7 +19,6 @@ from typing import Any, Optional, Dict
 import soundfile as sf
 import torch
 import traceback
-from qwen_tts import Qwen3TTSModel
 from ops_logger import ops_log
 
 logger = logging.getLogger(__name__)
@@ -29,6 +28,40 @@ VOICE_DESIGN_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
 
 # Default Base model from HuggingFace
 VOICE_CLONE_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+
+
+class RuntimeAdjustableLimiter:
+    """Thread-safe limiter whose capacity can be changed at runtime."""
+
+    def __init__(self, capacity: int):
+        self._capacity = max(1, int(capacity))
+        self._active = 0
+        self._condition = threading.Condition()
+
+    def acquire(self):
+        with self._condition:
+            while self._active >= self._capacity:
+                self._condition.wait()
+            self._active += 1
+
+    def release(self):
+        with self._condition:
+            if self._active > 0:
+                self._active -= 1
+            self._condition.notify_all()
+
+    def update_capacity(self, capacity: int):
+        with self._condition:
+            self._capacity = max(1, int(capacity))
+            self._condition.notify_all()
+
+    def snapshot(self) -> dict[str, int]:
+        with self._condition:
+            return {
+                "capacity": self._capacity,
+                "active": self._active,
+                "available": max(self._capacity - self._active, 0),
+            }
 
 
 class InferenceManager:
@@ -61,7 +94,7 @@ class InferenceManager:
         self._lock = threading.Lock()
         # Cap concurrent inference to max_models: each inference holds one
         # model in VRAM, so we can never run more than max_models at once.
-        self._inference_semaphore = threading.Semaphore(max_models)
+        self._inference_limiter = RuntimeAdjustableLimiter(max_models)
 
         # Model cache: Dict[path, (model, type, speaker_name)]
         # We use an OrderedDict to implement LRU
@@ -121,9 +154,7 @@ class InferenceManager:
     @max_models.setter
     def max_models(self, value: int):
         with self._lock:
-            self._max_models = value
-            ops_log.log_event("max_models_updated", extra={"new_value": value})
-            self._enforce_cache_size()
+            self._set_max_models_locked(value)
 
     @property
     def loaded_paths(self) -> list[str]:
@@ -165,6 +196,7 @@ class InferenceManager:
             "loaded_checkpoints": self.loaded_paths,
             "shared_model_replicas": dict(self._shared_model_replicas),
             "shared_model_min_headroom_gb": self._shared_model_min_headroom_gb,
+            "inference_limiter": self._inference_limiter.snapshot(),
             "auto_unload_enabled": self._auto_unload_enabled,
             "idle_timeout_seconds": self._idle_timeout,
             "idle_seconds": round(idle_seconds, 1) if idle_seconds else None,
@@ -207,6 +239,47 @@ class InferenceManager:
     def _touch(self):
         self._last_used = time.time()
         self._reset_idle_timer()
+
+    def _set_max_models_locked(self, value: int):
+        value = int(value)
+        if value < 1:
+            raise ValueError("max_models must be >= 1")
+        self._max_models = value
+        self._inference_limiter.update_capacity(value)
+        ops_log.log_event("max_models_updated", extra={"new_value": value})
+        self._enforce_cache_size()
+
+    def update_runtime_config(
+        self,
+        *,
+        max_models: Optional[int] = None,
+        shared_model_replicas: Optional[Dict[str, int]] = None,
+        shared_model_min_headroom_gb: Optional[float] = None,
+    ) -> dict:
+        with self._lock:
+            if max_models is not None:
+                self._set_max_models_locked(max_models)
+
+            if shared_model_replicas is not None:
+                updated_replicas = dict(self._shared_model_replicas)
+                for model_type, count in shared_model_replicas.items():
+                    normalized_count = int(count)
+                    if normalized_count < 1:
+                        raise ValueError(f"{model_type} replicas must be >= 1")
+                    updated_replicas[model_type] = normalized_count
+                self._shared_model_replicas = updated_replicas
+
+            if shared_model_min_headroom_gb is not None:
+                normalized_headroom = float(shared_model_min_headroom_gb)
+                if normalized_headroom < 0:
+                    raise ValueError("shared_model_min_headroom_gb must be >= 0")
+                self._shared_model_min_headroom_gb = normalized_headroom
+
+            return {
+                "max_models": self._max_models,
+                "shared_model_replicas": dict(self._shared_model_replicas),
+                "shared_model_min_headroom_gb": self._shared_model_min_headroom_gb,
+            }
 
     @contextlib.contextmanager
     def _track_active(self):
@@ -269,6 +342,8 @@ class InferenceManager:
             "speaker": speaker_name,
         })
         try:
+            from qwen_tts import Qwen3TTSModel
+
             if cache_key == source_path:
                 logger.info(f"Loading {model_type} model from {source_path}...")
             else:
@@ -603,7 +678,7 @@ class InferenceManager:
         with ops_log.operation("gpu_resource_wait", extra={"checkpoint": checkpoint_path}):
             if self._gpu_controller:
                 self._gpu_controller.begin_inference("inference_custom_voice_batch")
-            self._inference_semaphore.acquire()
+            self._inference_limiter.acquire()
         try:
             with self._lock:
                 model, spk = self._get_model(checkpoint_path, "custom_voice", speaker_name)
@@ -641,7 +716,7 @@ class InferenceManager:
             finally:
                 self._mark_released(checkpoint_path)
         finally:
-            self._inference_semaphore.release()
+            self._inference_limiter.release()
             if self._gpu_controller:
                 self._gpu_controller.end_inference()
 
@@ -657,7 +732,7 @@ class InferenceManager:
         with ops_log.operation("gpu_resource_wait", extra={"checkpoint": checkpoint_path}):
             if self._gpu_controller:
                 self._gpu_controller.begin_inference("inference_custom_voice")
-            self._inference_semaphore.acquire()
+            self._inference_limiter.acquire()
         try:
             with self._lock:
                 model, spk = self._get_model(checkpoint_path, "custom_voice", speaker_name)
@@ -689,7 +764,7 @@ class InferenceManager:
             finally:
                 self._mark_released(checkpoint_path)
         finally:
-            self._inference_semaphore.release()
+            self._inference_limiter.release()
 
     # -- VoiceDesign inference ------------------------------------------------
 
@@ -706,7 +781,7 @@ class InferenceManager:
         with ops_log.operation("gpu_resource_wait", extra={"model": "voice_design"}):
             if self._gpu_controller:
                 self._gpu_controller.begin_inference("inference_voice_design_batch")
-            self._inference_semaphore.acquire()
+            self._inference_limiter.acquire()
         cache_key = self._acquire_shared_replica(VOICE_DESIGN_MODEL, "voice_design")
         try:
             with self._lock:
@@ -745,7 +820,7 @@ class InferenceManager:
                 self._mark_released(cache_key)
         finally:
             self._release_shared_replica(cache_key)
-            self._inference_semaphore.release()
+            self._inference_limiter.release()
 
     def generate_voice_design(
         self,
@@ -757,7 +832,7 @@ class InferenceManager:
         with ops_log.operation("gpu_resource_wait", extra={"model": "voice_design"}):
             if self._gpu_controller:
                 self._gpu_controller.begin_inference("inference_voice_design")
-            self._inference_semaphore.acquire()
+            self._inference_limiter.acquire()
         cache_key = self._acquire_shared_replica(VOICE_DESIGN_MODEL, "voice_design")
         try:
             with self._lock:
@@ -793,7 +868,7 @@ class InferenceManager:
                 self._mark_released(cache_key)
         finally:
             self._release_shared_replica(cache_key)
-            self._inference_semaphore.release()
+            self._inference_limiter.release()
 
     # -- VoiceClone inference -------------------------------------------------
 
@@ -831,7 +906,7 @@ class InferenceManager:
         with ops_log.operation("gpu_resource_wait", extra={"model": "voice_clone"}):
             if self._gpu_controller:
                 self._gpu_controller.begin_inference("inference_voice_clone_flexible_batch")
-            self._inference_semaphore.acquire()
+            self._inference_limiter.acquire()
         cache_key = self._acquire_shared_replica(VOICE_CLONE_MODEL, "voice_clone")
         try:
             with self._lock:
@@ -897,7 +972,7 @@ class InferenceManager:
                 self._mark_released(cache_key)
         finally:
             self._release_shared_replica(cache_key)
-            self._inference_semaphore.release()
+            self._inference_limiter.release()
             if self._gpu_controller:
                 self._gpu_controller.end_inference()
 
