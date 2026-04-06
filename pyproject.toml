@@ -37,6 +37,8 @@ dependencies = [
   "boto3",
   "psutil",
   "nvidia-ml-py",
+  "pydub",
+  "whisperx",
 ]
 
 [project.urls]

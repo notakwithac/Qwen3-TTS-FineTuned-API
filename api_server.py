@@ -27,6 +27,12 @@ from ops_logger import ops_log
 from session_manager import SessionManager, SessionStatus
 from metrics_collector import metrics_collector
 from gpu_resource_controller import GPUResourceController
+from dataset_jobs import (
+    load_existing_package_result,
+    load_existing_prepare_result,
+    package_dataset,
+    prepare_dataset_items,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -316,6 +322,7 @@ MAX_REPLICAS_PER_MODEL = int(os.environ.get("MAX_REPLICAS_PER_MODEL", "4"))
 SESSION_TIMEOUT = int(os.environ.get("SESSION_TIMEOUT", "3600"))
 MAX_CONCURRENT_VOICE_DESIGNS = int(os.environ.get("MAX_CONCURRENT_VOICE_DESIGNS", str(GPU_BATCH_SIZE)))
 BATCH_STORAGE_CONCURRENCY = int(os.environ.get("BATCH_STORAGE_CONCURRENCY", "8"))
+MAX_CONCURRENT_DATASET_JOBS = int(os.environ.get("MAX_CONCURRENT_DATASET_JOBS", "1"))
 VOICE_DESIGN_REPLICAS = int(os.environ.get("VOICE_DESIGN_REPLICAS", "1"))
 VOICE_CLONE_REPLICAS = int(os.environ.get("VOICE_CLONE_REPLICAS", "1"))
 SHARED_MODEL_MIN_HEADROOM_GB = float(os.environ.get("SHARED_MODEL_MIN_HEADROOM_GB", "4"))
@@ -331,6 +338,7 @@ logger.info(f"  - USE_TORCH_COMPILE: {USE_TORCH_COMPILE}")
 logger.info(f"  - REPLICA_THRESHOLD: {REPLICA_THRESHOLD}")
 logger.info(f"  - MAX_CONCURRENT_VOICE_DESIGNS: {MAX_CONCURRENT_VOICE_DESIGNS}")
 logger.info(f"  - BATCH_STORAGE_CONCURRENCY: {BATCH_STORAGE_CONCURRENCY}")
+logger.info(f"  - MAX_CONCURRENT_DATASET_JOBS: {MAX_CONCURRENT_DATASET_JOBS}")
 logger.info(f"  - VOICE_DESIGN_REPLICAS: {VOICE_DESIGN_REPLICAS}")
 logger.info(f"  - VOICE_CLONE_REPLICAS: {VOICE_CLONE_REPLICAS}")
 logger.info(f"  - SHARED_MODEL_MIN_HEADROOM_GB: {SHARED_MODEL_MIN_HEADROOM_GB}")
@@ -461,6 +469,8 @@ voice_clone_batcher = DynamicBatcher(
 
 custom_voice_batchers = {}  # Map job_id -> DynamicBatcher
 voice_clone_batch_jobs = {} # session_id -> {status, completed, total, results, error, ...}
+dataset_jobs = {}  # job_id -> {kind, status, total, completed, failed, ...}
+dataset_job_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DATASET_JOBS)
 
 
 def get_custom_voice_batcher(job_id: str, checkpoint_path: str, speaker_name: str) -> DynamicBatcher:
@@ -662,6 +672,157 @@ class VoiceCloneBatchStatusResponse(APIModel):
     failed: int = 0
     clones: list[VoiceCloneBatchResultItem] = Field(default_factory=list)
     results: list[VoiceCloneBatchResultItem] = Field(default_factory=list)
+    error: Optional[str] = None
+    created_at: float
+
+
+def _normalize_storage_ref(value: str, field_name: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        raise ValueError(f"{field_name} cannot be empty")
+    if len(value) > 2048:
+        raise ValueError(f"{field_name} exceeds max length of 2048")
+    return value
+
+
+class DatasetPrepareItem(APIModel):
+    filename: str
+    prompt_id: Optional[str] = None
+    text: str
+    s3_url: str
+
+    @field_validator("filename")
+    @classmethod
+    def validate_filename(cls, value: str) -> str:
+        normalized = _normalize_filename(value, "filename")
+        if not normalized:
+            raise ValueError("filename cannot be empty")
+        return normalized
+
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        return _normalize_text(value, "text", MAX_TEXT_LENGTH)
+
+    @field_validator("s3_url")
+    @classmethod
+    def validate_s3_url(cls, value: str) -> str:
+        return _normalize_storage_ref(value, "s3_url")
+
+
+class DatasetPrepareRequest(APIModel):
+    job_id: Optional[str] = None
+    book_id: str
+    chapter_id: Optional[str] = None
+    character_id: str
+    character_name: Optional[str] = None
+    ref_audio_url: str
+    ref_text: str
+    items: list[DatasetPrepareItem] = Field(default_factory=list)
+    amplitude: float = 1.0
+    speed: float = 1.0
+    pitch_shift: float = 0.0
+    approval_mode: str = "manual"
+    overwrite: bool = False
+
+    @field_validator("job_id", "book_id", "chapter_id", "character_id")
+    @classmethod
+    def validate_ids(cls, value: Optional[str], info) -> Optional[str]:
+        return _normalize_optional_id(value, info.field_name)
+
+    @field_validator("character_name")
+    @classmethod
+    def validate_character_name(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        return _normalize_text(value, "character_name", 128)
+
+    @field_validator("ref_audio_url")
+    @classmethod
+    def validate_ref_audio_url(cls, value: str) -> str:
+        return _normalize_storage_ref(value, "ref_audio_url")
+
+    @field_validator("ref_text")
+    @classmethod
+    def validate_ref_text(cls, value: str) -> str:
+        return _normalize_text(value, "ref_text", MAX_REF_TEXT_LENGTH)
+
+    @field_validator("approval_mode")
+    @classmethod
+    def validate_approval_mode(cls, value: str) -> str:
+        value = (value or "").strip().lower()
+        if value not in {"manual", "auto"}:
+            raise ValueError("approval_mode must be either 'manual' or 'auto'")
+        return value
+
+
+class DatasetPackageItem(APIModel):
+    id: str
+    s3_url: Optional[str] = None
+    url: Optional[str] = None
+    text: str
+    is_reference: bool = False
+    included: bool = True
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, value: str) -> str:
+        return _normalize_text(value, "id", 256)
+
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        return _normalize_text(value, "text", MAX_TEXT_LENGTH)
+
+    @field_validator("s3_url", "url")
+    @classmethod
+    def validate_refs(cls, value: Optional[str], info) -> Optional[str]:
+        if value is None:
+            return None
+        return _normalize_storage_ref(value, info.field_name)
+
+
+class DatasetPackageRequest(APIModel):
+    job_id: Optional[str] = None
+    book_id: str
+    chapter_id: Optional[str] = None
+    character_id: str
+    dataset_items: list[DatasetPackageItem]
+    overwrite: bool = False
+
+    @field_validator("job_id", "book_id", "chapter_id", "character_id")
+    @classmethod
+    def validate_ids(cls, value: Optional[str], info) -> Optional[str]:
+        return _normalize_optional_id(value, info.field_name)
+
+    @field_validator("dataset_items")
+    @classmethod
+    def validate_dataset_items(cls, value: list[DatasetPackageItem]) -> list[DatasetPackageItem]:
+        if not value:
+            raise ValueError("dataset_items cannot be empty")
+        return value
+
+
+class DatasetJobSubmissionResponse(APIModel):
+    job_id: str
+    finetune_job_id: str
+    status: str
+    kind: str
+    total: int
+
+
+class DatasetJobStatusResponse(APIModel):
+    job_id: str
+    kind: str
+    status: str
+    phase: str
+    progress_pct: float = 0.0
+    total: int = 0
+    completed: int = 0
+    failed: int = 0
+    dataset_items: list[dict[str, Any]] = Field(default_factory=list)
+    dataset_s3_key: Optional[str] = None
+    dataset_s3_url: Optional[str] = None
     error: Optional[str] = None
     created_at: float
 
@@ -1848,6 +2009,230 @@ async def get_voice_clone_batch_status(session_id: str):
         "clones": sorted_results,
         "results": sorted_results,
     }
+
+
+def _dataset_progress_pct(job: dict[str, Any]) -> float:
+    total = job.get("total", 0)
+    if total <= 0:
+        return 0.0
+    return round(((job.get("completed", 0) + job.get("failed", 0)) / total) * 100, 1)
+
+
+def _dataset_status_payload(job: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "job_id": job["job_id"],
+        "kind": job["kind"],
+        "status": job["status"],
+        "phase": job.get("phase", job["kind"]),
+        "progress_pct": _dataset_progress_pct(job),
+        "total": job.get("total", 0),
+        "completed": job.get("completed", 0),
+        "failed": job.get("failed", 0),
+        "dataset_items": job.get("dataset_items", []),
+        "dataset_s3_key": job.get("dataset_s3_key"),
+        "dataset_s3_url": job.get("dataset_s3_url"),
+        "error": job.get("error"),
+        "created_at": job["created_at"],
+    }
+
+
+async def _run_dataset_prepare_job(job_id: str, req: DatasetPrepareRequest) -> None:
+    job = dataset_jobs[job_id]
+    async with dataset_job_semaphore:
+        try:
+            dataset_items = await prepare_dataset_items(
+                storage,
+                book_id=req.book_id,
+                character_id=req.character_id,
+                character_name=req.character_name or req.character_id,
+                job_id=job_id,
+                ref_audio_url=req.ref_audio_url,
+                ref_text=req.ref_text,
+                items=[item.model_dump() for item in req.items],
+                amplitude=req.amplitude,
+                speed=req.speed,
+                pitch_shift=req.pitch_shift,
+            )
+            job["completed"] = job["total"]
+            job["dataset_items"] = dataset_items
+            job["phase"] = "awaiting_approval"
+            job["status"] = "completed"
+
+            if req.approval_mode == "auto":
+                job["phase"] = "packaging"
+                packaged = await package_dataset(
+                    storage,
+                    book_id=req.book_id,
+                    character_id=req.character_id,
+                    job_id=job_id,
+                    dataset_items=dataset_items,
+                )
+                job["dataset_s3_key"] = packaged["dataset_s3_key"]
+                job["dataset_s3_url"] = packaged["dataset_s3_url"]
+                job["phase"] = "packaged"
+        except Exception as exc:
+            logger.exception("Dataset prepare job %s failed", job_id)
+            job["status"] = "failed"
+            job["failed"] = max(1, job.get("failed", 0))
+            job["error"] = str(exc)
+
+
+async def _run_dataset_package_job(job_id: str, req: DatasetPackageRequest) -> None:
+    job = dataset_jobs[job_id]
+    async with dataset_job_semaphore:
+        try:
+            packaged = await package_dataset(
+                storage,
+                book_id=req.book_id,
+                character_id=req.character_id,
+                job_id=job_id,
+                dataset_items=[item.model_dump() for item in req.dataset_items],
+            )
+            job["completed"] = job["total"]
+            job["dataset_s3_key"] = packaged["dataset_s3_key"]
+            job["dataset_s3_url"] = packaged["dataset_s3_url"]
+            job["phase"] = "packaged"
+            job["status"] = "completed"
+        except Exception as exc:
+            logger.exception("Dataset package job %s failed", job_id)
+            job["status"] = "failed"
+            job["failed"] = max(1, job.get("failed", 0))
+            job["error"] = str(exc)
+
+
+@app.post(
+    "/dataset/prepare",
+    summary="Prepare dataset items from cloned audio",
+    response_model=DatasetJobSubmissionResponse,
+)
+async def dataset_prepare(req: DatasetPrepareRequest):
+    if not storage.is_configured:
+        raise HTTPException(status_code=503, detail="Storage not configured.")
+
+    job_id = req.job_id or uuid.uuid4().hex[:8]
+    existing_job = dataset_jobs.get(job_id)
+    if existing_job:
+        return {
+            "job_id": job_id,
+            "finetune_job_id": job_id,
+            "status": existing_job["status"],
+            "kind": existing_job["kind"],
+            "total": existing_job.get("total", len(req.items)),
+        }
+
+    existing_items = None
+    if not req.overwrite:
+        existing_items = await load_existing_prepare_result(
+            storage,
+            book_id=req.book_id,
+            character_id=req.character_id,
+            job_id=job_id,
+        )
+
+    dataset_jobs[job_id] = {
+        "job_id": job_id,
+        "kind": "prepare",
+        "status": "processing",
+        "phase": "preparing_dataset_items",
+        "total": len(req.items),
+        "completed": 0,
+        "failed": 0,
+        "dataset_items": [],
+        "error": None,
+        "created_at": time.time(),
+    }
+
+    job = dataset_jobs[job_id]
+    if existing_items is not None:
+        job["dataset_items"] = existing_items
+        job["completed"] = job["total"]
+        job["status"] = "completed"
+        job["phase"] = "awaiting_approval"
+    else:
+        asyncio.create_task(_run_dataset_prepare_job(job_id, req))
+
+    return {
+        "job_id": job_id,
+        "finetune_job_id": job_id,
+        "status": job["status"],
+        "kind": job["kind"],
+        "total": job["total"],
+    }
+
+
+@app.post(
+    "/dataset/package",
+    summary="Package approved dataset items into the final finetune zip",
+    response_model=DatasetJobSubmissionResponse,
+)
+async def dataset_package(req: DatasetPackageRequest):
+    if not storage.is_configured:
+        raise HTTPException(status_code=503, detail="Storage not configured.")
+
+    job_id = req.job_id or uuid.uuid4().hex[:8]
+    existing_job = dataset_jobs.get(job_id)
+    if existing_job and existing_job.get("kind") == "package":
+        return {
+            "job_id": job_id,
+            "finetune_job_id": job_id,
+            "status": existing_job["status"],
+            "kind": existing_job["kind"],
+            "total": existing_job.get("total", len(req.dataset_items)),
+        }
+
+    existing_package = None
+    if not req.overwrite:
+        existing_package = await load_existing_package_result(
+            storage,
+            book_id=req.book_id,
+            character_id=req.character_id,
+            job_id=job_id,
+        )
+
+    dataset_jobs[job_id] = {
+        "job_id": job_id,
+        "kind": "package",
+        "status": "processing",
+        "phase": "packaging_dataset_zip",
+        "total": len(req.dataset_items),
+        "completed": 0,
+        "failed": 0,
+        "dataset_items": [],
+        "dataset_s3_key": None,
+        "dataset_s3_url": None,
+        "error": None,
+        "created_at": time.time(),
+    }
+
+    job = dataset_jobs[job_id]
+    if existing_package is not None:
+        job["completed"] = job["total"]
+        job["status"] = "completed"
+        job["phase"] = "packaged"
+        job["dataset_s3_key"] = existing_package["dataset_s3_key"]
+        job["dataset_s3_url"] = existing_package["dataset_s3_url"]
+    else:
+        asyncio.create_task(_run_dataset_package_job(job_id, req))
+
+    return {
+        "job_id": job_id,
+        "finetune_job_id": job_id,
+        "status": job["status"],
+        "kind": job["kind"],
+        "total": job["total"],
+    }
+
+
+@app.get(
+    "/dataset/status/{job_id}",
+    summary="Get status of a dataset prepare/package job",
+    response_model=DatasetJobStatusResponse,
+)
+async def get_dataset_status(job_id: str):
+    job = dataset_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Dataset job {job_id} not found")
+    return _dataset_status_payload(job)
 
 
 @app.post(
