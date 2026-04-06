@@ -9,6 +9,7 @@ import collections
 import io
 import logging
 import re
+import traceback
 import threading
 import time
 import asyncio
@@ -18,7 +19,6 @@ from typing import Any, Optional, Dict
 
 import soundfile as sf
 import torch
-import traceback
 from ops_logger import ops_log
 
 logger = logging.getLogger(__name__)
@@ -177,14 +177,13 @@ class InferenceManager:
     def stats(self) -> dict:
         gpu_info = {}
         if torch.cuda.is_available():
+            snapshot = self._get_gpu_memory_snapshot()
             gpu_info = {
                 "gpu_name": torch.cuda.get_device_name(0),
-                "gpu_memory_total_gb": round(torch.cuda.get_device_properties(0).total_memory / 1e9, 2),
-                "gpu_memory_allocated_gb": round(torch.cuda.memory_allocated(0) / 1e9, 2),
-                "gpu_memory_reserved_gb": round(torch.cuda.memory_reserved(0) / 1e9, 2),
-                "gpu_memory_free_gb": round(
-                    (torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated(0)) / 1e9, 2
-                ),
+                "gpu_memory_total_gb": round(snapshot["total_gb"], 2),
+                "gpu_memory_allocated_gb": round(snapshot["allocated_gb"], 2),
+                "gpu_memory_reserved_gb": round(snapshot["reserved_gb"], 2),
+                "gpu_memory_free_gb": round(snapshot["free_gb"], 2),
             }
 
         idle_seconds = time.time() - self._last_used if self._last_used > 0 else None
@@ -239,6 +238,53 @@ class InferenceManager:
     def _touch(self):
         self._last_used = time.time()
         self._reset_idle_timer()
+
+    def _get_gpu_memory_snapshot(self) -> dict[str, float]:
+        if not torch.cuda.is_available():
+            return {
+                "total_gb": 0.0,
+                "allocated_gb": 0.0,
+                "reserved_gb": 0.0,
+                "free_gb": 0.0,
+            }
+
+        total_bytes = torch.cuda.get_device_properties(0).total_memory
+        allocated_bytes = torch.cuda.memory_allocated(0)
+        reserved_bytes = torch.cuda.memory_reserved(0)
+        free_bytes = None
+        mem_get_info = getattr(torch.cuda, "mem_get_info", None)
+
+        if mem_get_info is not None:
+            try:
+                free_bytes, total_bytes = mem_get_info(0)
+            except TypeError:
+                free_bytes, total_bytes = mem_get_info()
+            except Exception:
+                free_bytes = None
+
+        if free_bytes is None:
+            free_bytes = max(total_bytes - reserved_bytes, 0)
+
+        return {
+            "total_gb": total_bytes / 1e9,
+            "allocated_gb": allocated_bytes / 1e9,
+            "reserved_gb": reserved_bytes / 1e9,
+            "free_gb": max(free_bytes, 0) / 1e9,
+        }
+
+    def _build_runtime_diagnostics_locked(self, **extra) -> dict[str, Any]:
+        diagnostics: dict[str, Any] = {
+            "loaded_count": self.loaded_count,
+            "max_models": self._max_models,
+            "loaded_checkpoints": self.loaded_paths[:8],
+            "models_in_use": dict(self._models_in_use),
+            "shared_model_replicas": dict(self._shared_model_replicas),
+            "shared_model_min_headroom_gb": self._shared_model_min_headroom_gb,
+            "inference_limiter": self._inference_limiter.snapshot(),
+            "gpu_memory": self._get_gpu_memory_snapshot(),
+        }
+        diagnostics.update(extra)
+        return diagnostics
 
     def _set_max_models_locked(self, value: int):
         value = int(value)
@@ -354,6 +400,19 @@ class InferenceManager:
             model = None
 
             for attempt in range(max_retries):
+                attempt_number = attempt + 1
+                attempt_context = self._build_runtime_diagnostics_locked(
+                    cache_key=cache_key,
+                    path=source_path,
+                    model_type=model_type,
+                    speaker=speaker_name,
+                    session_id=session_id or None,
+                    attn_impl=self._attn_impl,
+                    attempt=attempt_number,
+                    max_retries=max_retries,
+                    stage="from_pretrained",
+                )
+                ops_log.log_event("model_load_attempt", extra=attempt_context)
                 try:
                     try:
                         model = Qwen3TTSModel.from_pretrained(
@@ -382,6 +441,23 @@ class InferenceManager:
                         raise e
                 except RuntimeError as re_err:
                     if "busy or unavailable" in str(re_err) and attempt < max_retries - 1:
+                        retry_context = self._build_runtime_diagnostics_locked(
+                            cache_key=cache_key,
+                            path=source_path,
+                            model_type=model_type,
+                            speaker=speaker_name,
+                            session_id=session_id or None,
+                            attn_impl=self._attn_impl,
+                            attempt=attempt_number,
+                            max_retries=max_retries,
+                            stage="retry_after_cuda_busy",
+                            error=str(re_err),
+                        )
+                        ops_log.log_event(
+                            "model_load_retry",
+                            extra=retry_context,
+                            level=logging.WARNING,
+                        )
                         logger.warning(
                             f"CUDA device busy (attempt {attempt+1}/{max_retries}). "
                             f"Retrying in {retry_delay}s..."
@@ -413,7 +489,24 @@ class InferenceManager:
             ops_log.end(op, extra={"gpu_memory_gb": round(mem, 2)})
             return model
         except Exception as e:
-            ops_log.fail(op, str(e))
+            failure_context = self._build_runtime_diagnostics_locked(
+                cache_key=cache_key,
+                path=source_path,
+                model_type=model_type,
+                speaker=speaker_name,
+                session_id=session_id or None,
+                attn_impl=self._attn_impl,
+                stage="load_model_into_cache",
+                traceback_tail=traceback.format_exc(limit=6).strip().splitlines()[-6:],
+            )
+            ops_log.fail(op, str(e), extra=failure_context)
+            logger.exception(
+                "Model load failed for model_type=%s cache_key=%s source_path=%s diagnostics=%s",
+                model_type,
+                cache_key,
+                source_path,
+                failure_context,
+            )
             raise
 
     def _enforce_cache_size(self, reserve: int = 0):
@@ -474,19 +567,21 @@ class InferenceManager:
     def _has_shared_replica_headroom_locked(self) -> bool:
         if not torch.cuda.is_available():
             return True
-        total = torch.cuda.get_device_properties(0).total_memory / 1e9
-        reserved = torch.cuda.memory_reserved(0) / 1e9
-        return (total - reserved) >= (self._estimated_model_vram_gb + self._shared_model_min_headroom_gb)
+        snapshot = self._get_gpu_memory_snapshot()
+        return snapshot["free_gb"] >= (
+            self._estimated_model_vram_gb + self._shared_model_min_headroom_gb
+        )
 
     def _acquire_shared_replica(self, source_path: str, model_type: str) -> str:
         with self._lock:
             candidate_keys = self._shared_replica_keys(source_path, model_type)
             loaded_candidates = [key for key in candidate_keys if key in self._models]
+            headroom_ok = self._has_shared_replica_headroom_locked()
 
             can_expand = (
                 len(loaded_candidates) < len(candidate_keys)
                 and self.loaded_count < self._max_models
-                and self._has_shared_replica_headroom_locked()
+                and headroom_ok
             )
 
             if can_expand:
@@ -504,6 +599,19 @@ class InferenceManager:
                     key,
                 ),
             )
+            selection_kind = "expand_or_load" if selected not in loaded_candidates else "reuse_loaded"
+            selection_context = self._build_runtime_diagnostics_locked(
+                model_type=model_type,
+                source_path=source_path,
+                selected_cache_key=selected,
+                selection_kind=selection_kind,
+                candidate_replica_count=len(candidate_keys),
+                loaded_candidate_count=len(loaded_candidates),
+                loaded_candidates=loaded_candidates,
+                headroom_ok=headroom_ok,
+                can_expand=can_expand,
+            )
+            ops_log.log_event("shared_replica_selection", extra=selection_context)
             self._shared_replica_loads[selected] = self._shared_replica_loads.get(selected, 0) + 1
             return selected
 
@@ -605,12 +713,11 @@ class InferenceManager:
         """Return VRAM budget information."""
         if not torch.cuda.is_available():
             return {"total_gb": 0, "allocated_gb": 0, "free_gb": 0}
-        total = torch.cuda.get_device_properties(0).total_memory / 1e9
-        allocated = torch.cuda.memory_allocated(0) / 1e9
+        snapshot = self._get_gpu_memory_snapshot()
         return {
-            "total_gb": round(total, 2),
-            "allocated_gb": round(allocated, 2),
-            "free_gb": round(total - allocated, 2),
+            "total_gb": round(snapshot["total_gb"], 2),
+            "allocated_gb": round(snapshot["allocated_gb"], 2),
+            "free_gb": round(snapshot["free_gb"], 2),
             "models_loaded": self.loaded_count,
             "session_pinned": len(self._session_pins),
         }
@@ -784,10 +891,27 @@ class InferenceManager:
             self._inference_limiter.acquire()
         cache_key = self._acquire_shared_replica(VOICE_DESIGN_MODEL, "voice_design")
         try:
-            with self._lock:
-                model, _ = self._get_model_by_cache_key(cache_key, VOICE_DESIGN_MODEL, "voice_design")
-                self._mark_in_use(cache_key)
-                self._total_requests += len(texts)
+            try:
+                with self._lock:
+                    model, _ = self._get_model_by_cache_key(cache_key, VOICE_DESIGN_MODEL, "voice_design")
+                    self._mark_in_use(cache_key)
+                    self._total_requests += len(texts)
+            except Exception as e:
+                with self._lock:
+                    prepare_context = self._build_runtime_diagnostics_locked(
+                        model_type="voice_design",
+                        cache_key=cache_key,
+                        path=VOICE_DESIGN_MODEL,
+                        batch_size=len(texts),
+                        stage="prepare_voice_design_batch",
+                        error=str(e),
+                    )
+                ops_log.log_event(
+                    "voice_design_model_prepare_failed",
+                    extra=prepare_context,
+                    level=logging.ERROR,
+                )
+                raise
             model_lock = self._get_execution_lock(cache_key)
 
             try:
@@ -835,10 +959,28 @@ class InferenceManager:
             self._inference_limiter.acquire()
         cache_key = self._acquire_shared_replica(VOICE_DESIGN_MODEL, "voice_design")
         try:
-            with self._lock:
-                model, _ = self._get_model_by_cache_key(cache_key, VOICE_DESIGN_MODEL, "voice_design")
-                self._mark_in_use(cache_key)
-                self._total_requests += 1
+            try:
+                with self._lock:
+                    model, _ = self._get_model_by_cache_key(cache_key, VOICE_DESIGN_MODEL, "voice_design")
+                    self._mark_in_use(cache_key)
+                    self._total_requests += 1
+            except Exception as e:
+                with self._lock:
+                    prepare_context = self._build_runtime_diagnostics_locked(
+                        model_type="voice_design",
+                        cache_key=cache_key,
+                        path=VOICE_DESIGN_MODEL,
+                        text_length=len(text),
+                        instruct_length=len(instruct),
+                        stage="prepare_voice_design",
+                        error=str(e),
+                    )
+                ops_log.log_event(
+                    "voice_design_model_prepare_failed",
+                    extra=prepare_context,
+                    level=logging.ERROR,
+                )
+                raise
             model_lock = self._get_execution_lock(cache_key)
 
             try:

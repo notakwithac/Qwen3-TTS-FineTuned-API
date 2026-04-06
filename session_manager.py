@@ -525,10 +525,22 @@ class SessionManager:
         if not torch.cuda.is_available():
             return 40.0  # Default assumption
 
+        mem_get_info = getattr(torch.cuda, "mem_get_info", None)
+        if mem_get_info is not None:
+            try:
+                free_bytes, _ = mem_get_info(0)
+            except TypeError:
+                free_bytes, _ = mem_get_info()
+            except Exception:
+                free_bytes = None
+            if free_bytes is not None:
+                free_gb = free_bytes / 1e9
+                return max(0, free_gb - 2.0)
+
         total = torch.cuda.get_device_properties(0).total_memory / 1e9
-        allocated = torch.cuda.memory_allocated(0) / 1e9
+        reserved = torch.cuda.memory_reserved(0) / 1e9
         # Leave 2GB headroom for activations/KV-cache during inference
-        return max(0, total - allocated - 2.0)
+        return max(0, total - reserved - 2.0)
 
     # -- Session Lifecycle ----------------------------------------------------
 

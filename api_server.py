@@ -1856,6 +1856,13 @@ async def voice_design(req: VoiceDesignRequest):
                 languages=req.language,
             )
         except Exception as e:
+            logger.exception(
+                "Voice design request failed during batcher submit. text_length=%s instruct_length=%s upload_to_s3=%s runtime_stats=%s",
+                len(req.text),
+                len(req.instruct),
+                req.upload_to_s3,
+                pipeline.inference.stats,
+            )
             raise HTTPException(status_code=500, detail=f"Voice design failed: {str(e)}")
 
     if req.upload_to_s3:
