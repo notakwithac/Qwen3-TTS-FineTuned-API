@@ -47,7 +47,7 @@ RUN pip install --no-cache-dir \
 # Copy all API / pipeline and related files
 COPY *.py ./
 COPY *.sh ./
-RUN sed -i 's/\r$//' *.sh
+RUN sed -i 's/\r$//' *.sh && chmod +x *.sh
 
 # Expose API port
 EXPOSE 8000
@@ -104,4 +104,4 @@ ENV DEVICE=$DEVICE \
     GPU_IDLE_THRESHOLD=$GPU_IDLE_THRESHOLD \
     GPU_IDLE_TERMINATE_MINUTES=$GPU_IDLE_TERMINATE_MINUTES
 
-CMD ["bash", "start_tir.sh"]
+CMD ["/bin/bash", "/app/start_tir.sh"]
