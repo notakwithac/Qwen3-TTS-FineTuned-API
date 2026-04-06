@@ -47,21 +47,53 @@ import api_server
 
 
 class StubInference:
-    def __init__(self):
+    def __init__(self, fail_on=None):
         self._max_models = 5
         self._shared_model_replicas = {
             "voice_design": 1,
             "voice_clone": 1,
         }
         self._shared_model_min_headroom_gb = 3.0
+        self._loaded_checkpoints = []
+        self.fail_on = fail_on
+        self.load_calls = []
 
     @property
     def stats(self):
         return {
             "max_models": self._max_models,
+            "loaded_count": len(self._loaded_checkpoints),
+            "loaded_checkpoints": list(self._loaded_checkpoints),
             "shared_model_replicas": dict(self._shared_model_replicas),
             "shared_model_min_headroom_gb": self._shared_model_min_headroom_gb,
+            "inference_limiter": {
+                "capacity": 5,
+                "active": 0,
+                "available": 5,
+                "holders": {},
+                "waiting": {},
+            },
+            "gpu_memory_total_gb": 48.0,
+            "gpu_memory_allocated_gb": 0.0,
+            "gpu_memory_reserved_gb": 0.0,
+            "gpu_memory_free_gb": 48.0,
         }
+
+    def load_voice_design(self):
+        self.load_calls.append("voice_design")
+        if self.fail_on == "voice_design":
+            raise RuntimeError("voice design preload failed")
+        checkpoint = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign::replica-0"
+        if checkpoint not in self._loaded_checkpoints:
+            self._loaded_checkpoints.append(checkpoint)
+
+    def load_voice_clone(self):
+        self.load_calls.append("voice_clone")
+        if self.fail_on == "voice_clone":
+            raise RuntimeError("voice clone preload failed")
+        checkpoint = "Qwen/Qwen3-TTS-12Hz-1.7B-Base::replica-0"
+        if checkpoint not in self._loaded_checkpoints:
+            self._loaded_checkpoints.append(checkpoint)
 
     def update_runtime_config(
         self,
@@ -86,9 +118,16 @@ class StubPipeline:
         return None
 
 
+def _patch_startup_dependencies(monkeypatch):
+    monkeypatch.setattr(api_server.session_mgr, "start_cleanup_loop", lambda: None)
+    monkeypatch.setattr(api_server.metrics_collector, "start", lambda: None)
+    monkeypatch.setattr(api_server.metrics_collector, "stop", lambda: None)
+
+
 def test_get_gpu_concurrency_returns_effective_runtime_config(monkeypatch):
     inference = StubInference()
     monkeypatch.setattr(api_server, "pipeline", StubPipeline(inference))
+    _patch_startup_dependencies(monkeypatch)
 
     with TestClient(api_server.app) as client:
         response = client.get("/gpu/concurrency")
@@ -105,6 +144,7 @@ def test_get_gpu_concurrency_returns_effective_runtime_config(monkeypatch):
 def test_post_gpu_concurrency_updates_runtime_config(monkeypatch):
     inference = StubInference()
     monkeypatch.setattr(api_server, "pipeline", StubPipeline(inference))
+    _patch_startup_dependencies(monkeypatch)
 
     with TestClient(api_server.app) as client:
         response = client.post(
@@ -135,6 +175,7 @@ def test_post_gpu_concurrency_updates_runtime_config(monkeypatch):
 def test_post_gpu_concurrency_rejects_invalid_payload(monkeypatch):
     inference = StubInference()
     monkeypatch.setattr(api_server, "pipeline", StubPipeline(inference))
+    _patch_startup_dependencies(monkeypatch)
 
     with TestClient(api_server.app) as client:
         response = client.post(
@@ -148,3 +189,71 @@ def test_post_gpu_concurrency_rejects_invalid_payload(monkeypatch):
         )
 
     assert response.status_code == 422
+
+
+def test_lifespan_preloads_shared_models_on_startup(monkeypatch):
+    inference = StubInference()
+    events = []
+
+    monkeypatch.setattr(api_server, "pipeline", StubPipeline(inference))
+    _patch_startup_dependencies(monkeypatch)
+    monkeypatch.setattr(
+        api_server.ops_log,
+        "log_event",
+        lambda event_name, job_id=None, extra=None, level=None: events.append(
+            {"event_name": event_name, "extra": extra, "level": level}
+        ),
+    )
+
+    with TestClient(api_server.app):
+        pass
+
+    assert inference.load_calls == ["voice_design", "voice_clone"]
+    assert inference.stats["loaded_checkpoints"] == [
+        "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign::replica-0",
+        "Qwen/Qwen3-TTS-12Hz-1.7B-Base::replica-0",
+    ]
+    assert [event["event_name"] for event in events] == [
+        "startup_preload_started",
+        "startup_preload_finished",
+        "startup_preload_started",
+        "startup_preload_finished",
+    ]
+    assert events[1]["extra"]["loaded_checkpoints"] == [
+        "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign::replica-0",
+    ]
+    assert events[3]["extra"]["loaded_checkpoints"] == [
+        "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign::replica-0",
+        "Qwen/Qwen3-TTS-12Hz-1.7B-Base::replica-0",
+    ]
+
+
+def test_lifespan_logs_preload_failure_and_continues_boot(monkeypatch):
+    inference = StubInference(fail_on="voice_design")
+    events = []
+
+    monkeypatch.setattr(api_server, "pipeline", StubPipeline(inference))
+    _patch_startup_dependencies(monkeypatch)
+    monkeypatch.setattr(
+        api_server.ops_log,
+        "log_event",
+        lambda event_name, job_id=None, extra=None, level=None: events.append(
+            {"event_name": event_name, "extra": extra, "level": level}
+        ),
+    )
+
+    with TestClient(api_server.app):
+        pass
+
+    assert inference.load_calls == ["voice_design", "voice_clone"]
+    assert inference.stats["loaded_checkpoints"] == [
+        "Qwen/Qwen3-TTS-12Hz-1.7B-Base::replica-0",
+    ]
+    assert [event["event_name"] for event in events] == [
+        "startup_preload_started",
+        "startup_preload_failed",
+        "startup_preload_started",
+        "startup_preload_finished",
+    ]
+    assert events[1]["extra"]["continue_boot"] is True
+    assert events[1]["extra"]["error"] == "voice design preload failed"

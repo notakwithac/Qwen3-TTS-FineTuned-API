@@ -220,6 +220,11 @@ Content-Type: application/json
 - `GET /gpu/concurrency`: Show the live runtime GPU concurrency and shared-replica targets.
 - `POST /gpu/concurrency`: Update runtime GPU concurrency in memory without redeploying.
 
+**Startup preload behavior:**
+- On boot, the server attempts to warm one shared `VoiceDesign` model and one shared `Base` model before serving requests.
+- These preloaded shared models are not pinned. They remain normal cache entries and can still be evicted later if custom checkpoints need VRAM.
+- If a preload step fails, startup continues and the server falls back to lazy loading for that model type.
+
 **Runtime concurrency payload example:**
 ```json
 {
@@ -234,6 +239,8 @@ Content-Type: application/json
 - `.env` values are startup defaults only.
 - `POST /gpu/concurrency` overrides the live process immediately.
 - Aggressive values are allowed, but actual replica admission is still gated by runtime VRAM headroom.
+- Configured shared replica targets can be higher than the effective loaded replica count. The runtime will only materialize additional shared replicas when true free VRAM still satisfies the headroom rule.
+- For current throughput tuning, hot resident models plus large batch requests are usually more effective than pushing per-model replica counts upward until the GPU fragments or stalls.
 
 **Suggested tuning workflow:**
 1. Boot the server with conservative `.env` defaults.
@@ -250,12 +257,18 @@ Content-Type: application/json
 ### Environment Variables
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `GPU_MAX_MODELS` | `auto` / `7` | Startup capacity budget for loaded models, not an automatic shared-replica count |
-| `VOICE_DESIGN_REPLICAS` | `1` / `2` | Startup default for shared VoiceDesign replicas |
-| `VOICE_CLONE_REPLICAS` | `1` / `2` | Startup default for shared VoiceClone replicas |
+| `GPU_MAX_MODELS` | `auto` / `7` | Startup capacity budget for loaded models, not an automatic shared-replica count. Keep this high when custom checkpoints also need to share the GPU |
+| `VOICE_DESIGN_REPLICAS` | `1` | Throughput-mode startup target for shared VoiceDesign replicas. The server preloads `replica-0` at boot and may load more later only if headroom allows |
+| `VOICE_CLONE_REPLICAS` | `1` | Throughput-mode startup target for shared VoiceClone replicas. Prefer batching before increasing this target |
 | `SHARED_MODEL_MIN_HEADROOM_GB` | `4` | Minimum free VRAM headroom required before loading another shared replica |
-| `GPU_IDLE_TIMEOUT` | `300` | Seconds before auto-unload |
+| `GPU_IDLE_TIMEOUT` | `0` | Throughput-mode recommendation for keeping the hot shared models resident. Use a larger value if you still want eventual idle unload |
 | `E2E_BUCKET` | `qwen3-tts` | Default S3 bucket |
+
+**Throughput-mode guidance:**
+- Keep `GPU_MAX_MODELS=7` so custom fine-tuned checkpoints can still load when needed.
+- Start with `VOICE_DESIGN_REPLICAS=1` and `VOICE_CLONE_REPLICAS=1`; these are warm defaults, not guarantees that more replicas will fit.
+- Keep `GPU_IDLE_TIMEOUT=0` or very large if you want startup preload and `torch.compile` warm-up costs to be paid once per process boot instead of repeatedly after idle unload.
+- Use `/voice-clone/batch` and other batch paths to increase throughput. A single loaded replica still serializes the actual generate call, so batching is the main throughput lever on one GPU.
 
 ### Manual Stress Utilities
 - `python stress_shared_model_replicas.py --base-url http://<TIR_GPU_IP>:8000`

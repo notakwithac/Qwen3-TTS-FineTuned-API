@@ -47,6 +47,11 @@ sys.modules["broadcaster"] = broadcast_module
 import api_server
 
 
+def test_ops_logger_relies_on_root_handler_for_streaming():
+    assert api_server.stream_handler in logging.getLogger().handlers
+    assert api_server.stream_handler not in logging.getLogger("ops").handlers
+
+
 def test_log_stream_handler_emits_background_thread_logs(monkeypatch):
     handler = api_server.LogStreamHandler()
     handler.setFormatter(logging.Formatter("%(message)s"))

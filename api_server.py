@@ -118,7 +118,6 @@ class StreamToLogger:
 stream_handler = LogStreamHandler()
 stream_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
 logging.getLogger().addHandler(stream_handler)
-logging.getLogger("ops").addHandler(stream_handler)
 
 # Suppress noisy model initialization logs
 logging.getLogger("qwen_tts.core.models.configuration_qwen3_tts").setLevel(logging.ERROR)
@@ -132,6 +131,69 @@ logging.getLogger("transformers.generation.utils").setLevel(logging.ERROR)
 # ---------------------------------------------------------------------------
 
 from contextlib import asynccontextmanager
+
+
+def _startup_preload_snapshot() -> dict[str, Any]:
+    stats = pipeline.inference.stats
+    return {
+        "loaded_count": stats.get("loaded_count"),
+        "max_models": stats.get("max_models"),
+        "loaded_checkpoints": stats.get("loaded_checkpoints", []),
+        "shared_model_replicas": stats.get("shared_model_replicas", {}),
+        "shared_model_min_headroom_gb": stats.get("shared_model_min_headroom_gb"),
+        "inference_limiter": stats.get("inference_limiter", {}),
+        "gpu_memory": {
+            "total_gb": stats.get("gpu_memory_total_gb"),
+            "allocated_gb": stats.get("gpu_memory_allocated_gb"),
+            "reserved_gb": stats.get("gpu_memory_reserved_gb"),
+            "free_gb": stats.get("gpu_memory_free_gb"),
+        },
+    }
+
+
+async def _startup_preload_shared_models() -> None:
+    loop = asyncio.get_running_loop()
+    preload_steps = (
+        ("voice_design", pipeline.inference.load_voice_design),
+        ("voice_clone", pipeline.inference.load_voice_clone),
+    )
+
+    for model_type, loader in preload_steps:
+        ops_log.log_event(
+            "startup_preload_started",
+            extra={
+                "model_type": model_type,
+                "preload_policy": "warn_and_continue",
+                **_startup_preload_snapshot(),
+            },
+        )
+        try:
+            await loop.run_in_executor(None, loader)
+        except Exception as exc:
+            logger.warning(
+                "Startup preload failed for %s; continuing boot with lazy loading.",
+                model_type,
+                exc_info=True,
+            )
+            ops_log.log_event(
+                "startup_preload_failed",
+                extra={
+                    "model_type": model_type,
+                    "continue_boot": True,
+                    "error": str(exc),
+                    **_startup_preload_snapshot(),
+                },
+                level=logging.WARNING,
+            )
+        else:
+            ops_log.log_event(
+                "startup_preload_finished",
+                extra={
+                    "model_type": model_type,
+                    "preload_policy": "warn_and_continue",
+                    **_startup_preload_snapshot(),
+                },
+            )
 
 @asynccontextmanager
 async def _lifespan(app):
@@ -147,6 +209,7 @@ async def _lifespan(app):
     # Startup: start session cleanup loop and resource monitoring
     session_mgr.start_cleanup_loop()
     metrics_collector.start()
+    await _startup_preload_shared_models()
     yield
     # Shutdown: disconnect broadcast
     await broadcast.disconnect()

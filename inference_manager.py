@@ -36,18 +36,74 @@ class RuntimeAdjustableLimiter:
     def __init__(self, capacity: int):
         self._capacity = max(1, int(capacity))
         self._active = 0
+        self._holders: dict[str, int] = {}
+        self._waiters: dict[str, int] = {}
         self._condition = threading.Condition()
+        self._wait_heartbeat_seconds = 30.0
 
-    def acquire(self):
+    def _snapshot_locked(self) -> dict[str, Any]:
+        return {
+            "capacity": self._capacity,
+            "active": self._active,
+            "available": max(self._capacity - self._active, 0),
+            "holders": dict(self._holders),
+            "waiting": dict(self._waiters),
+        }
+
+    def acquire(self, label: str = "unknown"):
         with self._condition:
+            wait_started_at = None
             while self._active >= self._capacity:
-                self._condition.wait()
-            self._active += 1
+                if wait_started_at is None:
+                    wait_started_at = time.time()
+                    self._waiters[label] = self._waiters.get(label, 0) + 1
+                    ops_log.log_event(
+                        "limiter_wait_started",
+                        extra={
+                            "label": label,
+                            **self._snapshot_locked(),
+                        },
+                    )
 
-    def release(self):
+                self._condition.wait(timeout=self._wait_heartbeat_seconds)
+
+                if self._active >= self._capacity and wait_started_at is not None:
+                    ops_log.log_event(
+                        "limiter_wait_heartbeat",
+                        extra={
+                            "label": label,
+                            "waited_seconds": round(time.time() - wait_started_at, 3),
+                            **self._snapshot_locked(),
+                        },
+                    )
+
+            if wait_started_at is not None:
+                count = self._waiters.get(label, 0)
+                if count <= 1:
+                    self._waiters.pop(label, None)
+                else:
+                    self._waiters[label] = count - 1
+            self._active += 1
+            self._holders[label] = self._holders.get(label, 0) + 1
+            if wait_started_at is not None:
+                ops_log.log_event(
+                    "limiter_wait_finished",
+                    extra={
+                        "label": label,
+                        "waited_seconds": round(time.time() - wait_started_at, 3),
+                        **self._snapshot_locked(),
+                    },
+                )
+
+    def release(self, label: str = "unknown"):
         with self._condition:
             if self._active > 0:
                 self._active -= 1
+            count = self._holders.get(label, 0)
+            if count <= 1:
+                self._holders.pop(label, None)
+            else:
+                self._holders[label] = count - 1
             self._condition.notify_all()
 
     def update_capacity(self, capacity: int):
@@ -55,13 +111,9 @@ class RuntimeAdjustableLimiter:
             self._capacity = max(1, int(capacity))
             self._condition.notify_all()
 
-    def snapshot(self) -> dict[str, int]:
+    def snapshot(self) -> dict[str, Any]:
         with self._condition:
-            return {
-                "capacity": self._capacity,
-                "active": self._active,
-                "available": max(self._capacity - self._active, 0),
-            }
+            return self._snapshot_locked()
 
 
 class InferenceManager:
@@ -785,7 +837,7 @@ class InferenceManager:
         with ops_log.operation("gpu_resource_wait", extra={"checkpoint": checkpoint_path}):
             if self._gpu_controller:
                 self._gpu_controller.begin_inference("inference_custom_voice_batch")
-            self._inference_limiter.acquire()
+            self._inference_limiter.acquire("inference_custom_voice_batch")
         try:
             with self._lock:
                 model, spk = self._get_model(checkpoint_path, "custom_voice", speaker_name)
@@ -823,7 +875,7 @@ class InferenceManager:
             finally:
                 self._mark_released(checkpoint_path)
         finally:
-            self._inference_limiter.release()
+            self._inference_limiter.release("inference_custom_voice_batch")
             if self._gpu_controller:
                 self._gpu_controller.end_inference()
 
@@ -839,7 +891,7 @@ class InferenceManager:
         with ops_log.operation("gpu_resource_wait", extra={"checkpoint": checkpoint_path}):
             if self._gpu_controller:
                 self._gpu_controller.begin_inference("inference_custom_voice")
-            self._inference_limiter.acquire()
+            self._inference_limiter.acquire("inference_custom_voice")
         try:
             with self._lock:
                 model, spk = self._get_model(checkpoint_path, "custom_voice", speaker_name)
@@ -871,7 +923,9 @@ class InferenceManager:
             finally:
                 self._mark_released(checkpoint_path)
         finally:
-            self._inference_limiter.release()
+            self._inference_limiter.release("inference_custom_voice")
+            if self._gpu_controller:
+                self._gpu_controller.end_inference()
 
     # -- VoiceDesign inference ------------------------------------------------
 
@@ -888,7 +942,7 @@ class InferenceManager:
         with ops_log.operation("gpu_resource_wait", extra={"model": "voice_design"}):
             if self._gpu_controller:
                 self._gpu_controller.begin_inference("inference_voice_design_batch")
-            self._inference_limiter.acquire()
+            self._inference_limiter.acquire("inference_voice_design_batch")
         cache_key = self._acquire_shared_replica(VOICE_DESIGN_MODEL, "voice_design")
         try:
             try:
@@ -944,7 +998,9 @@ class InferenceManager:
                 self._mark_released(cache_key)
         finally:
             self._release_shared_replica(cache_key)
-            self._inference_limiter.release()
+            self._inference_limiter.release("inference_voice_design_batch")
+            if self._gpu_controller:
+                self._gpu_controller.end_inference()
 
     def generate_voice_design(
         self,
@@ -956,7 +1012,7 @@ class InferenceManager:
         with ops_log.operation("gpu_resource_wait", extra={"model": "voice_design"}):
             if self._gpu_controller:
                 self._gpu_controller.begin_inference("inference_voice_design")
-            self._inference_limiter.acquire()
+            self._inference_limiter.acquire("inference_voice_design")
         cache_key = self._acquire_shared_replica(VOICE_DESIGN_MODEL, "voice_design")
         try:
             try:
@@ -1010,7 +1066,9 @@ class InferenceManager:
                 self._mark_released(cache_key)
         finally:
             self._release_shared_replica(cache_key)
-            self._inference_limiter.release()
+            self._inference_limiter.release("inference_voice_design")
+            if self._gpu_controller:
+                self._gpu_controller.end_inference()
 
     # -- VoiceClone inference -------------------------------------------------
 
@@ -1048,7 +1106,7 @@ class InferenceManager:
         with ops_log.operation("gpu_resource_wait", extra={"model": "voice_clone"}):
             if self._gpu_controller:
                 self._gpu_controller.begin_inference("inference_voice_clone_flexible_batch")
-            self._inference_limiter.acquire()
+            self._inference_limiter.acquire("inference_voice_clone_flexible_batch")
         cache_key = self._acquire_shared_replica(VOICE_CLONE_MODEL, "voice_clone")
         try:
             with self._lock:
@@ -1114,7 +1172,7 @@ class InferenceManager:
                 self._mark_released(cache_key)
         finally:
             self._release_shared_replica(cache_key)
-            self._inference_limiter.release()
+            self._inference_limiter.release("inference_voice_clone_flexible_batch")
             if self._gpu_controller:
                 self._gpu_controller.end_inference()
 
