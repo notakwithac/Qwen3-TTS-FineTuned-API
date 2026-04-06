@@ -1500,7 +1500,6 @@ dependencies = [
     { name = "requests" },
     { name = "soundfile" },
     { name = "sox" },
-    { name = "tensorboard" },
     { name = "transformers" },
     { name = "uvicorn", extra = ["standard"] },
 ]
@@ -1514,6 +1513,9 @@ cu121 = [
 flash = [
     { name = "flash-attn", version = "2.8.3", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
     { name = "flash-attn", version = "2.8.3", source = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.5cxx11abiFALSE-cp311-cp311-linux_x86_64.whl" }, marker = "python_full_version == '3.11.*' and sys_platform == 'linux'" },
+]
+train = [
+    { name = "tensorboard" },
 ]
 
 [package.metadata]
@@ -1534,14 +1536,14 @@ requires-dist = [
     { name = "requests" },
     { name = "soundfile" },
     { name = "sox" },
-    { name = "tensorboard", specifier = ">=2.20.0" },
+    { name = "tensorboard", marker = "extra == 'train'", specifier = ">=2.20.0" },
     { name = "torch", marker = "extra == 'cu121'", specifier = "==2.5.1", index = "https://download.pytorch.org/whl/cu121", conflict = { package = "qwen-tts", extra = "cu121" } },
     { name = "torchaudio", marker = "extra == 'cu121'", specifier = "==2.5.1", index = "https://download.pytorch.org/whl/cu121", conflict = { package = "qwen-tts", extra = "cu121" } },
     { name = "torchvision", marker = "extra == 'cu121'", specifier = "==0.20.1", index = "https://download.pytorch.org/whl/cu121", conflict = { package = "qwen-tts", extra = "cu121" } },
     { name = "transformers", specifier = "==4.57.3" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.34.0" },
 ]
-provides-extras = ["cu121", "flash"]
+provides-extras = ["cu121", "flash", "train"]
 
 [[package]]
 name = "regex"
