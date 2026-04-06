@@ -11,8 +11,11 @@ import tempfile
 import time
 import uuid
 import asyncio
+import base64
+import torch
 from pathlib import Path
 from typing import Any, Optional
+from functools import partial
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, Request
 from fastapi.responses import JSONResponse, Response
@@ -205,11 +208,22 @@ async def log_requests(request: Request, call_next):
         raise
 
 # GPU configuration
+def _default_gpu_max_models() -> int:
+    if not torch.cuda.is_available():
+        return 1
+    total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    if total_vram_gb >= 47.0:
+        return 7
+    if total_vram_gb >= 23.0:
+        return 4
+    return 1
+
+
 DEVICE = os.environ.get("DEVICE", "cuda:0")
 USE_FLASH_ATTN = os.environ.get("USE_FLASH_ATTN", "1") == "1"
 GPU_IDLE_TIMEOUT = int(os.environ.get("GPU_IDLE_TIMEOUT", "600"))
 GPU_MAX_CONCURRENCY = int(os.environ.get("GPU_MAX_CONCURRENCY", "16"))
-GPU_MAX_MODELS = int(os.environ.get("GPU_MAX_MODELS", "4"))
+GPU_MAX_MODELS = int(os.environ.get("GPU_MAX_MODELS", str(_default_gpu_max_models())))
 GPU_BATCH_SIZE = int(os.environ.get("GPU_BATCH_SIZE", "32"))
 USE_TORCH_COMPILE = os.environ.get("USE_TORCH_COMPILE", "1") == "1"
 
@@ -225,7 +239,11 @@ gpu_controller = GPUResourceController(allow_concurrent=ALLOW_CONCURRENT)
 REPLICA_THRESHOLD = int(os.environ.get("REPLICA_THRESHOLD", "500"))
 MAX_REPLICAS_PER_MODEL = int(os.environ.get("MAX_REPLICAS_PER_MODEL", "4"))
 SESSION_TIMEOUT = int(os.environ.get("SESSION_TIMEOUT", "3600"))
-MAX_CONCURRENT_VOICE_DESIGNS = int(os.environ.get("MAX_CONCURRENT_VOICE_DESIGNS", "4"))
+MAX_CONCURRENT_VOICE_DESIGNS = int(os.environ.get("MAX_CONCURRENT_VOICE_DESIGNS", str(GPU_BATCH_SIZE)))
+BATCH_STORAGE_CONCURRENCY = int(os.environ.get("BATCH_STORAGE_CONCURRENCY", "8"))
+VOICE_DESIGN_REPLICAS = int(os.environ.get("VOICE_DESIGN_REPLICAS", "1"))
+VOICE_CLONE_REPLICAS = int(os.environ.get("VOICE_CLONE_REPLICAS", "1"))
+SHARED_MODEL_MIN_HEADROOM_GB = float(os.environ.get("SHARED_MODEL_MIN_HEADROOM_GB", "4"))
 
 logger.info(f"Loaded Configuration:")
 logger.info(f"  - DEVICE: {DEVICE}")
@@ -237,6 +255,10 @@ logger.info(f"  - GPU_BATCH_SIZE: {GPU_BATCH_SIZE}")
 logger.info(f"  - USE_TORCH_COMPILE: {USE_TORCH_COMPILE}")
 logger.info(f"  - REPLICA_THRESHOLD: {REPLICA_THRESHOLD}")
 logger.info(f"  - MAX_CONCURRENT_VOICE_DESIGNS: {MAX_CONCURRENT_VOICE_DESIGNS}")
+logger.info(f"  - BATCH_STORAGE_CONCURRENCY: {BATCH_STORAGE_CONCURRENCY}")
+logger.info(f"  - VOICE_DESIGN_REPLICAS: {VOICE_DESIGN_REPLICAS}")
+logger.info(f"  - VOICE_CLONE_REPLICAS: {VOICE_CLONE_REPLICAS}")
+logger.info(f"  - SHARED_MODEL_MIN_HEADROOM_GB: {SHARED_MODEL_MIN_HEADROOM_GB}")
 logger.info(f"  - MAX_REPLICAS_PER_MODEL: {MAX_REPLICAS_PER_MODEL}")
 logger.info(f"  - SESSION_TIMEOUT: {SESSION_TIMEOUT}s")
 
@@ -250,6 +272,11 @@ pipeline = Pipeline(
     max_models=GPU_MAX_MODELS,
     compile=USE_TORCH_COMPILE,
     gpu_controller=gpu_controller,
+    shared_model_replicas={
+        "voice_design": VOICE_DESIGN_REPLICAS,
+        "voice_clone": VOICE_CLONE_REPLICAS,
+    },
+    shared_model_min_headroom_gb=SHARED_MODEL_MIN_HEADROOM_GB,
 )
 
 # Session-based inference manager
@@ -387,6 +414,62 @@ def _sorted_clone_batch_results(results: list[dict[str, Any]]) -> list[dict[str,
             item.get("index") is None,
             item.get("index", 0),
             item.get("filename", ""),
+        ),
+    )
+
+
+def _chunked(items: list[Any], size: int) -> list[list[Any]]:
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
+
+def _build_voice_design_filename(item: "VoiceDesignBatchItem") -> str:
+    s3_filename = item.s3_filename
+    parts = []
+    if item.character_name:
+        safe_name = "".join(
+            c for c in item.character_name if c.isalnum() or c in ("-", "_", " ")
+        ).strip().replace(" ", "_")
+        if safe_name:
+            parts.append(safe_name)
+    if item.character_uuid:
+        parts.append(item.character_uuid)
+
+    if parts:
+        prefix = "_".join(parts)
+        if s3_filename:
+            if not s3_filename.startswith(prefix):
+                s3_filename = f"{prefix}_{s3_filename}"
+        else:
+            s3_filename = f"{prefix}.wav"
+    elif not s3_filename:
+        s3_filename = f"voice_design_{uuid.uuid4().hex[:8]}.wav"
+
+    return s3_filename
+
+
+async def _storage_object_exists_async(s3_key: str) -> bool:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, partial(storage.object_exists, s3_key))
+
+
+async def _upload_wav_async(
+    wav_bytes: bytes,
+    category: str,
+    *,
+    filename: Optional[str] = None,
+    prefix: Optional[str] = None,
+    model_id: str,
+) -> str:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        partial(
+            storage.upload_wav,
+            wav_bytes,
+            category,
+            filename=filename,
+            prefix=prefix,
+            model_id=model_id,
         ),
     )
 
@@ -1430,8 +1513,7 @@ async def voice_clone(req: VoiceCloneRequest):
 
     # Fast-path check
     if not req.overwrite and req.upload_to_s3 and storage.is_configured:
-        loop = asyncio.get_running_loop()
-        if await loop.run_in_executor(None, storage.object_exists, s3_key):
+        if await _storage_object_exists_async(s3_key):
             presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
             return {
                 "s3_url": storage._object_url(s3_key),
@@ -1454,11 +1536,12 @@ async def voice_clone(req: VoiceCloneRequest):
         raise HTTPException(status_code=500, detail=f"Voice clone failed: {str(e)}")
 
     if req.upload_to_s3:
-        loop = asyncio.get_running_loop()
-        from functools import partial
-        s3_url = await loop.run_in_executor(
-            None,
-            partial(storage.upload_wav, wav_bytes, "voice_clone", filename=filename, prefix=s3_prefix, model_id="voice_clone_qwen")
+        s3_url = await _upload_wav_async(
+            wav_bytes,
+            "voice_clone",
+            filename=filename,
+            prefix=s3_prefix,
+            model_id="voice_clone_qwen",
         )
         presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
         return {
@@ -1521,117 +1604,128 @@ async def voice_clone_batch(req: VoiceCloneBatchRequest):
     }
 
     async def run_batch_task():
-        concurrency_limit = asyncio.Semaphore(10)
         s3_prefix = f"audio/voice_clone/{session_id}"
-        
-        async def process_item(item: VoiceCloneBatchItem, index: int):
-            async with concurrency_limit:
-                filename = item.filename or f"clone_batch_{index:04d}.wav"
-                s3_key = f"{s3_prefix}/{filename}"
-                
-                # S3 fast-path
-                if not req.overwrite and req.upload_to_s3 and storage.is_configured:
-                    loop = asyncio.get_running_loop()
-                    if await loop.run_in_executor(None, storage.object_exists, s3_key):
-                        presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
+        try:
+            job = voice_clone_batch_jobs[session_id]
+            items_meta = [
+                {
+                    "index": index,
+                    "item": item,
+                    "filename": item.filename or f"clone_batch_{index:04d}.wav",
+                }
+                for index, item in enumerate(req.items)
+            ]
+            for meta in items_meta:
+                meta["s3_key"] = f"{s3_prefix}/{meta['filename']}"
+
+            pending_meta = list(items_meta)
+
+            if req.upload_to_s3 and not req.overwrite:
+                exists_limit = asyncio.Semaphore(BATCH_STORAGE_CONCURRENCY)
+
+                async def check_existing(meta: dict[str, Any]) -> bool:
+                    async with exists_limit:
+                        return await _storage_object_exists_async(meta["s3_key"])
+
+                existing_flags = await asyncio.gather(*(check_existing(meta) for meta in items_meta))
+                pending_meta = []
+                for meta, exists in zip(items_meta, existing_flags):
+                    if exists:
+                        presigned_url = storage.get_presigned_url(meta["s3_key"], expires_in=86400)
                         res = {
-                            "index": index,
-                            "s3_url": storage._object_url(s3_key),
+                            "index": meta["index"],
+                            "s3_url": storage._object_url(meta["s3_key"]),
                             "presigned_url": presigned_url,
-                            "s3_key": s3_key,
+                            "s3_key": meta["s3_key"],
                             "sample_rate": 24000,
-                            "text": item.text,
+                            "text": meta["item"].text,
                             "job_id": "voice_clone",
-                            "filename": filename,
+                            "filename": meta["filename"],
                             "status": "success",
                         }
-                        voice_clone_batch_jobs[session_id]["completed"] += 1
-                        voice_clone_batch_jobs[session_id]["results"].append(res)
-                        return
+                        job["completed"] += 1
+                        job["results"].append(res)
+                    else:
+                        pending_meta.append(meta)
 
-                # Generate via batcher
+            for chunk in _chunked(pending_meta, GPU_BATCH_SIZE):
+                loop = asyncio.get_running_loop()
                 try:
-                    wav_bytes, sr = await voice_clone_batcher.submit(
-                        texts=item.text,
-                        ref_audios=req.ref_audio_url,
-                        ref_texts=req.ref_text,
-                        languages=req.language,
-                        x_vector_only_modes=req.use_xvec,
+                    wavs_chunk, sr = await loop.run_in_executor(
+                        None,
+                        partial(
+                            pipeline.inference.generate_voice_clone_batch,
+                            texts=[meta["item"].text for meta in chunk],
+                            ref_audio=req.ref_audio_url,
+                            ref_text=req.ref_text,
+                            languages=[req.language] * len(chunk),
+                            x_vector_only_mode=req.use_xvec,
+                        ),
                     )
                 except Exception as e:
-                    logger.error(f"Voice clone batch item {index} failed: {e}")
-                    voice_clone_batch_jobs[session_id]["failed"] += 1
-                    voice_clone_batch_jobs[session_id]["results"].append({
-                        "index": index,
-                        "s3_url": "",
-                        "presigned_url": None,
-                        "s3_key": s3_key,
-                        "sample_rate": 0,
-                        "text": item.text,
-                        "job_id": "voice_clone",
-                        "filename": filename,
-                        "status": "failed",
-                        "error": str(e),
-                    })
-                    return
-
-                # Upload to S3
-                if req.upload_to_s3:
-                    try:
-                        loop = asyncio.get_running_loop()
-                        from functools import partial
-                        s3_url = await loop.run_in_executor(
-                            None,
-                            partial(storage.upload_wav, wav_bytes, "voice_clone", filename=filename, prefix=s3_prefix, model_id="voice_clone_qwen")
-                        )
-                        presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
-                        res = {
-                            "index": index,
-                            "s3_url": s3_url,
-                            "presigned_url": presigned_url,
-                            "s3_key": s3_key,
-                            "sample_rate": sr,
-                            "text": item.text,
-                            "job_id": "voice_clone",
-                            "filename": filename,
-                            "status": "success",
-                        }
-                        voice_clone_batch_jobs[session_id]["completed"] += 1
-                        voice_clone_batch_jobs[session_id]["results"].append(res)
-                    except Exception as e:
-                        logger.error(f"Voice clone S3 upload item {index} failed: {e}")
-                        voice_clone_batch_jobs[session_id]["failed"] += 1
-                        voice_clone_batch_jobs[session_id]["results"].append({
-                            "index": index,
+                    logger.error("Voice clone batch chunk failed: %s", e)
+                    for meta in chunk:
+                        job["failed"] += 1
+                        job["results"].append({
+                            "index": meta["index"],
                             "s3_url": "",
                             "presigned_url": None,
-                            "s3_key": s3_key,
+                            "s3_key": meta["s3_key"],
                             "sample_rate": 0,
-                            "text": item.text,
+                            "text": meta["item"].text,
                             "job_id": "voice_clone",
-                            "filename": filename,
+                            "filename": meta["filename"],
                             "status": "failed",
                             "error": str(e),
                         })
-                else:
-                    import base64
-                    res = {
-                        "index": index,
-                        "s3_url": "",
-                        "presigned_url": f"data:audio/wav;base64,{base64.b64encode(wav_bytes).decode('utf-8')}",
-                        "s3_key": filename,
-                        "sample_rate": sr,
-                        "text": item.text,
-                        "job_id": "voice_clone_local",
-                        "filename": filename,
-                        "status": "success",
-                    }
-                    voice_clone_batch_jobs[session_id]["completed"] += 1
-                    voice_clone_batch_jobs[session_id]["results"].append(res)
+                    continue
 
-        tasks = [process_item(item, i) for i, item in enumerate(req.items)]
-        try:
-            await asyncio.gather(*tasks)
+                if req.upload_to_s3:
+                    upload_limit = asyncio.Semaphore(BATCH_STORAGE_CONCURRENCY)
+
+                    async def upload_result(meta: dict[str, Any], wav_bytes: bytes) -> dict[str, Any]:
+                        async with upload_limit:
+                            s3_url = await _upload_wav_async(
+                                wav_bytes,
+                                "voice_clone",
+                                filename=meta["filename"],
+                                prefix=s3_prefix,
+                                model_id="voice_clone_qwen",
+                            )
+                        presigned_url = storage.get_presigned_url(meta["s3_key"], expires_in=86400)
+                        return {
+                            "index": meta["index"],
+                            "s3_url": s3_url,
+                            "presigned_url": presigned_url,
+                            "s3_key": meta["s3_key"],
+                            "sample_rate": sr,
+                            "text": meta["item"].text,
+                            "job_id": "voice_clone",
+                            "filename": meta["filename"],
+                            "status": "success",
+                        }
+
+                    uploaded_results = await asyncio.gather(
+                        *(upload_result(meta, wav_bytes) for meta, wav_bytes in zip(chunk, wavs_chunk))
+                    )
+                    for result in uploaded_results:
+                        job["completed"] += 1
+                        job["results"].append(result)
+                else:
+                    for meta, wav_bytes in zip(chunk, wavs_chunk):
+                        job["completed"] += 1
+                        job["results"].append({
+                            "index": meta["index"],
+                            "s3_url": "",
+                            "presigned_url": f"data:audio/wav;base64,{base64.b64encode(wav_bytes).decode('utf-8')}",
+                            "s3_key": meta["filename"],
+                            "sample_rate": sr,
+                            "text": meta["item"].text,
+                            "job_id": "voice_clone_local",
+                            "filename": meta["filename"],
+                            "status": "success",
+                        })
+
             job = voice_clone_batch_jobs[session_id]
             if job["completed"] + job["failed"] >= job["total"]:
                 job["status"] = "completed" if job["failed"] == 0 else "completed_with_errors"
@@ -1730,7 +1824,7 @@ async def voice_design(req: VoiceDesignRequest):
                 raise HTTPException(status_code=503, detail="Storage not configured.")
             
             s3_key = f"audio/voice_design/{req.s3_filename}"
-            if not req.overwrite and storage.object_exists(s3_key):
+            if not req.overwrite and await _storage_object_exists_async(s3_key):
                 presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
                 return {
                     "s3_url": storage._object_url(s3_key),
@@ -1756,7 +1850,12 @@ async def voice_design(req: VoiceDesignRequest):
         if not storage.is_configured:
             raise HTTPException(status_code=503, detail="Storage not configured.")
         with ops_log.operation("s3_upload", extra={"type": "voice_design"}):
-            s3_url = storage.upload_wav(wav_bytes, "voice_design", filename=req.s3_filename, model_id="voice_design_qwen")
+            s3_url = await _upload_wav_async(
+                wav_bytes,
+                "voice_design",
+                filename=req.s3_filename,
+                model_id="voice_design_qwen",
+            )
         s3_key = f"audio/voice_design/{req.s3_filename}" if req.s3_filename else s3_url.split(f"{storage.bucket}/")[-1]
         
         presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
@@ -1818,119 +1917,128 @@ async def voice_design_batch(req: VoiceDesignBatchRequest):
     if req.upload_to_s3 and not storage.is_configured:
         raise HTTPException(status_code=503, detail="Storage not configured.")
 
-    from functools import partial
-
-    concurrency_limit = asyncio.Semaphore(MAX_CONCURRENT_VOICE_DESIGNS)
-
-    async def process_item(item: VoiceDesignBatchItem, index: int):
-        async with concurrency_limit:
-            # Build S3 filename with character prefix (same logic as single endpoint)
-            s3_filename = item.s3_filename
-            parts = []
-            if item.character_name:
-                safe_name = "".join(
-                    c for c in item.character_name if c.isalnum() or c in ("-", "_", " ")
-                ).strip().replace(" ", "_")
-                if safe_name:
-                    parts.append(safe_name)
-            if item.character_uuid:
-                parts.append(item.character_uuid)
-
-            if parts:
-                prefix = "_".join(parts)
-                if s3_filename:
-                    if not s3_filename.startswith(prefix):
-                        s3_filename = f"{prefix}_{s3_filename}"
-                else:
-                    s3_filename = f"{prefix}.wav"
-            elif not s3_filename:
-                import uuid as _uuid
-                s3_filename = f"voice_design_{_uuid.uuid4().hex[:8]}.wav"
-
-            # S3 fast-path: skip if file already exists
-            if req.upload_to_s3 and not req.overwrite and storage.is_configured:
-                s3_key = f"audio/voice_design/{s3_filename}"
-                loop = asyncio.get_running_loop()
-                exists = await loop.run_in_executor(None, storage.object_exists, s3_key)
-                if exists:
-                    presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
-                    return {
-                        "index": index,
-                        "status": "skipped",
-                        "s3_url": storage._object_url(s3_key),
-                        "presigned_url": presigned_url,
-                        "s3_key": s3_key,
-                        "sample_rate": 24000,
-                        "text": item.text,
-                        "instruct": item.instruct,
-                        "character_name": item.character_name,
-                    }
-
-            # Generate via the existing batcher
-            try:
-                wav_bytes, sr = await voice_design_batcher.submit(
-                    texts=item.text,
-                    instructs=item.instruct,
-                    languages=item.language,
-                )
-            except Exception as e:
-                logger.error(f"Voice design batch item {index} failed: {e}")
-                return {
-                    "index": index,
-                    "status": "failed",
-                    "error": str(e),
-                    "text": item.text,
-                    "instruct": item.instruct,
-                    "character_name": item.character_name,
-                }
-
-            # Upload to S3
-            if req.upload_to_s3:
-                loop = asyncio.get_running_loop()
-                with ops_log.operation("s3_upload", extra={"type": "voice_design_batch"}):
-                    s3_url = await loop.run_in_executor(
-                        None,
-                        partial(storage.upload_wav, wav_bytes, "voice_design", filename=s3_filename, model_id="voice_design_qwen"),
-                    )
-                s3_key = f"audio/voice_design/{s3_filename}"
-                presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
-                return {
-                    "index": index,
-                    "status": "success",
-                    "s3_url": s3_url,
-                    "presigned_url": presigned_url,
-                    "s3_key": s3_key,
-                    "sample_rate": sr,
-                    "text": item.text,
-                    "instruct": item.instruct,
-                    "character_name": item.character_name,
-                }
-
-            # No S3 upload — encode WAV bytes as base64 for JSON response
-            import base64
-            return {
-                "index": index,
-                "status": "success",
-                "audio_base64": base64.b64encode(wav_bytes).decode(),
-                "sample_rate": sr,
-                "text": item.text,
-                "instruct": item.instruct,
-                "character_name": item.character_name,
-            }
+    items_meta = []
+    for index, item in enumerate(req.items):
+        s3_filename = _build_voice_design_filename(item)
+        items_meta.append({
+            "index": index,
+            "item": item,
+            "filename": s3_filename,
+            "s3_key": f"audio/voice_design/{s3_filename}",
+        })
 
     with ops_log.operation("voice_design_batch_api", extra={
         "item_count": len(req.items),
         "upload_to_s3": req.upload_to_s3,
     }):
-        tasks = [process_item(item, i) for i, item in enumerate(req.items)]
-        results = await asyncio.gather(*tasks)
+        results: list[Optional[dict[str, Any]]] = [None] * len(req.items)
+        pending_meta = list(items_meta)
+
+        if req.upload_to_s3 and not req.overwrite:
+            exists_limit = asyncio.Semaphore(BATCH_STORAGE_CONCURRENCY)
+
+            async def check_existing(meta: dict[str, Any]) -> bool:
+                async with exists_limit:
+                    return await _storage_object_exists_async(meta["s3_key"])
+
+            existing_flags = await asyncio.gather(*(check_existing(meta) for meta in items_meta))
+            pending_meta = []
+            for meta, exists in zip(items_meta, existing_flags):
+                item = meta["item"]
+                if exists:
+                    presigned_url = storage.get_presigned_url(meta["s3_key"], expires_in=86400)
+                    results[meta["index"]] = {
+                        "index": meta["index"],
+                        "status": "skipped",
+                        "s3_url": storage._object_url(meta["s3_key"]),
+                        "presigned_url": presigned_url,
+                        "s3_key": meta["s3_key"],
+                        "sample_rate": 24000,
+                        "text": item.text,
+                        "instruct": item.instruct,
+                        "character_name": item.character_name,
+                    }
+                else:
+                    pending_meta.append(meta)
+
+        for chunk in _chunked(pending_meta, GPU_BATCH_SIZE):
+            try:
+                loop = asyncio.get_running_loop()
+                wavs_chunk, sr = await loop.run_in_executor(
+                    None,
+                    partial(
+                        pipeline.inference.generate_voice_design_batch,
+                        texts=[meta["item"].text for meta in chunk],
+                        instructs=[meta["item"].instruct for meta in chunk],
+                        languages=[meta["item"].language for meta in chunk],
+                    ),
+                )
+            except Exception as e:
+                logger.error("Voice design batch chunk failed: %s", e)
+                for meta in chunk:
+                    item = meta["item"]
+                    results[meta["index"]] = {
+                        "index": meta["index"],
+                        "status": "failed",
+                        "error": str(e),
+                        "text": item.text,
+                        "instruct": item.instruct,
+                        "character_name": item.character_name,
+                    }
+                continue
+
+            if req.upload_to_s3:
+                upload_limit = asyncio.Semaphore(BATCH_STORAGE_CONCURRENCY)
+
+                async def upload_result(meta: dict[str, Any], wav_bytes: bytes) -> dict[str, Any]:
+                    async with upload_limit:
+                        with ops_log.operation("s3_upload", extra={"type": "voice_design_batch"}):
+                            s3_url = await _upload_wav_async(
+                                wav_bytes,
+                                "voice_design",
+                                filename=meta["filename"],
+                                model_id="voice_design_qwen",
+                            )
+                        item = meta["item"]
+                        presigned_url = storage.get_presigned_url(meta["s3_key"], expires_in=86400)
+                        return {
+                            "index": meta["index"],
+                            "status": "success",
+                            "s3_url": s3_url,
+                            "presigned_url": presigned_url,
+                            "s3_key": meta["s3_key"],
+                            "sample_rate": sr,
+                            "text": item.text,
+                            "instruct": item.instruct,
+                            "character_name": item.character_name,
+                        }
+
+                uploaded_results = await asyncio.gather(
+                    *(upload_result(meta, wav_bytes) for meta, wav_bytes in zip(chunk, wavs_chunk))
+                )
+                for uploaded in uploaded_results:
+                    results[uploaded["index"]] = uploaded
+            else:
+                for meta, wav_bytes in zip(chunk, wavs_chunk):
+                    item = meta["item"]
+                    results[meta["index"]] = {
+                        "index": meta["index"],
+                        "status": "success",
+                        "audio_base64": base64.b64encode(wav_bytes).decode(),
+                        "sample_rate": sr,
+                        "text": item.text,
+                        "instruct": item.instruct,
+                        "character_name": item.character_name,
+                    }
+
+    final_results = [result for result in results if result is not None]
 
     return {
-        "total": len(results),
-        "succeeded": sum(1 for r in results if r.get("status") == "success"),
-        "skipped": sum(1 for r in results if r.get("status") == "skipped"),
-        "failed": sum(1 for r in results if r.get("status") == "failed"),
-        "results": results,
+        "total": len(final_results),
+        "succeeded": sum(1 for r in final_results if r.get("status") == "success"),
+        "skipped": sum(1 for r in final_results if r.get("status") == "skipped"),
+        "failed": sum(1 for r in final_results if r.get("status") == "failed"),
+        "results": final_results,
     }
 
 

@@ -195,6 +195,8 @@ class Pipeline:
         max_models: int = 4,
         compile: bool = False,
         gpu_controller: Any = None,
+        shared_model_replicas: Optional[Dict[str, int]] = None,
+        shared_model_min_headroom_gb: float = 4.0,
     ):
         self.base_dir = Path(base_dir)
         self.jobs_dir = self.base_dir / jobs_dir
@@ -215,6 +217,8 @@ class Pipeline:
             max_models=max_models,
             compile=compile,
             gpu_controller=gpu_controller,
+            shared_model_replicas=shared_model_replicas,
+            shared_model_min_headroom_gb=shared_model_min_headroom_gb,
         )
         self._restore_locks: Dict[str, threading.Lock] = {}
 
