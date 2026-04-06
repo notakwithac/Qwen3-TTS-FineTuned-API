@@ -9,7 +9,7 @@ FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 
 # System dependencies required at runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libsndfile1 sox \
+    ffmpeg libsndfile1 sox \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -35,6 +35,8 @@ RUN pip install --no-cache-dir \
     librosa \
     soundfile \
     sox \
+    pydub \
+    whisperx \
     onnxruntime \
     "fastapi>=0.115.0" \
     "uvicorn[standard]>=0.34.0" \
