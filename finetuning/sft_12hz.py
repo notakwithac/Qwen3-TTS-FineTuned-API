@@ -179,6 +179,31 @@ def train():
             )
             break
         except RuntimeError as e:
+            err_str = str(e)
+            if attn_impl == "flash_attention_2" and any(
+                marker in err_str
+                for marker in [
+                    "FlashAttention2",
+                    "flash-attn",
+                    "flash_attn",
+                    "DLL load failed",
+                    "undefined symbol",
+                ]
+            ):
+                print(
+                    "Flash Attention failed to load during training startup. "
+                    f"Falling back to eager attention. Error: {err_str}"
+                )
+                qwen3tts = Qwen3TTSModel.from_pretrained(
+                    MODEL_PATH,
+                    torch_dtype=torch.bfloat16,
+                    attn_implementation="eager",
+                    config=config_override,
+                    low_cpu_mem_usage=True,
+                )
+                args.flash_attn = False
+                attn_impl = "eager"
+                break
             if "busy or unavailable" in str(e) and attempt < max_retries - 1:
                 print(f"CUDA device busy (attempt {attempt+1}/{max_retries}). Retrying in {retry_delay}s...")
                 time.sleep(retry_delay)

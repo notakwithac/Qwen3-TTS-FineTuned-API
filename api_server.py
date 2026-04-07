@@ -41,6 +41,29 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def _log_flash_attn_runtime_diagnostics() -> None:
+    torch_cuda = getattr(torch.version, "cuda", None)
+    torch_version = getattr(torch, "__version__", "unknown")
+    logger.info(
+        "Runtime diagnostics: torch=%s torch_cuda=%s cuda_available=%s",
+        torch_version,
+        torch_cuda,
+        torch.cuda.is_available(),
+    )
+    try:
+        import flash_attn  # type: ignore
+
+        flash_version = getattr(flash_attn, "__version__", "unknown")
+        flash_path = getattr(flash_attn, "__file__", "unknown")
+        logger.info(
+            "Runtime diagnostics: flash_attn=%s path=%s",
+            flash_version,
+            flash_path,
+        )
+    except Exception as exc:
+        logger.warning("Runtime diagnostics: flash_attn import failed: %s", exc)
+
 # --- Log Streaming & SSE Setup ---
 from sse_starlette.sse import EventSourceResponse
 from broadcaster import Broadcast
@@ -215,6 +238,7 @@ async def _lifespan(app):
     # Startup: start session cleanup loop and resource monitoring
     session_mgr.start_cleanup_loop()
     metrics_collector.start()
+    _log_flash_attn_runtime_diagnostics()
     await _startup_preload_shared_models()
     yield
     # Shutdown: disconnect broadcast
