@@ -14,13 +14,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+# Keep the runtime Torch stack aligned with the base image during all later pip
+# installs. If any dependency tries to pull a newer torch, the build should fail
+# instead of silently upgrading and breaking the flash-attn ABI.
+RUN printf "torch==2.5.1\ntorchvision==0.20.1\ntorchaudio==2.5.1\n" > /tmp/pytorch-constraints.txt
+
 # Copy project files
 COPY qwen_tts/ ./qwen_tts/
 COPY finetuning/ ./finetuning/
 COPY pyproject.toml ./
 
 # --- Layer 1: Core ML dependencies ---
-RUN pip install --no-cache-dir \
+RUN pip install --no-cache-dir -c /tmp/pytorch-constraints.txt \
     "numpy<2.0.0" \
     "transformers==4.57.3" \
     "accelerate==1.12.0" \
@@ -31,7 +36,7 @@ RUN pip install --no-cache-dir \
     nvidia-ml-py
 
 # --- Layer 2: Audio / media / API dependencies ---
-RUN pip install --no-cache-dir \
+RUN pip install --no-cache-dir -c /tmp/pytorch-constraints.txt \
     librosa \
     soundfile \
     sox \
@@ -45,8 +50,12 @@ RUN pip install --no-cache-dir \
     "python-multipart>=0.0.18"
 
 # --- Layer 3: flash-attn from pre-built wheel (own layer — GitHub can be slow) ---
-RUN pip install --no-cache-dir \
+RUN pip install --no-cache-dir --no-deps \
     "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.5cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
+
+# Fail the image build if the runtime drifted away from the flash-attn ABI this
+# image is built for.
+RUN python -c "import importlib.util, torch; print(f'Torch={torch.__version__} CUDA={torch.version.cuda}'); assert torch.__version__.startswith('2.5.1'), f'Expected torch 2.5.1, got {torch.__version__}'; spec = importlib.util.find_spec('flash_attn'); print(f'flash_attn={spec.origin if spec else \"missing\"}')"
 
 # Copy all API / pipeline and related files
 COPY *.py ./
