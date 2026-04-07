@@ -41,7 +41,13 @@ class GPUResourceController:
             return
         with self._lock:
             self._training_requested = True
-            logger.info(f"GPU: Training requested for job {job_id}. Waiting for active inferences to drain...")
+            logger.info(
+                "GPU: Training requested for job %s. Waiting for active inferences to drain... "
+                "(active_inferences=%d, training_active=%s)",
+                job_id,
+                self._inference_count,
+                self._training_active,
+            )
             while self._inference_count > 0 or self._training_active:
                 self._lock.wait()
             self._training_active = True

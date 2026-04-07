@@ -655,6 +655,27 @@ class Pipeline:
             job.progress = {"stage": "queued", "detail": "Waiting in queue for next available slot..."}
             
             self._training_queue.acquire()
+
+            # When training is exclusive, cached inference models should not keep
+            # occupying VRAM while we wait to enter the training section.
+            if self._gpu_controller and not self._gpu_controller.allow_concurrent:
+                try:
+                    unload_op = ops_log.start("training_pre_unload", job_id=job.job_id)
+                    loaded_before = self.inference.loaded_count
+                    if loaded_before > 0:
+                        logger.info(
+                            "Preparing exclusive training for job %s by unloading %d cached inference model(s).",
+                            job.job_id,
+                            loaded_before,
+                        )
+                        self.inference.unload()
+                    ops_log.end(unload_op, extra={"unloaded_models": loaded_before})
+                except Exception as unload_exc:
+                    logger.warning(
+                        "Failed to unload cached inference models before training job %s: %s",
+                        job.job_id,
+                        unload_exc,
+                    )
             
             if self._gpu_controller:
                 self._gpu_controller.begin_training(job.job_id)
