@@ -31,6 +31,7 @@ DEFAULT_REPLICA_THRESHOLD = 500   # Lines before adding a replica
 DEFAULT_MAX_REPLICAS = 4          # Max replicas of one model
 DEFAULT_SESSION_TIMEOUT = 3600    # Auto-cleanup after 1h idle
 MODEL_VRAM_GB = 5.5               # Measured per-model VRAM (bf16 weights + compiled overhead)
+DEFAULT_BATCH_TEXT_BUDGET = int(os.environ.get("SESSION_BATCH_MAX_CHARS", "4000"))
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +122,7 @@ class CharacterWorker:
         speaker_name: str,
         batch_size: int = 32,
         batch_timeout_ms: int = 100,
+        batch_text_budget: int = DEFAULT_BATCH_TEXT_BUDGET,
         storage=None,
         progress: Optional[CharacterProgress] = None,
     ):
@@ -132,11 +134,32 @@ class CharacterWorker:
         self.speaker_name = speaker_name
         self.batch_size = batch_size
         self.batch_timeout = batch_timeout_ms / 1000.0
+        self.batch_text_budget = max(0, int(batch_text_budget or 0))
         self.storage = storage
         self.progress = progress or CharacterProgress()
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self._in_batch = False
+
+    @staticmethod
+    def _message_text_cost(msg: InferenceMessage) -> int:
+        return max(1, len((msg.text or "").strip()))
+
+    def _should_defer_message(
+        self,
+        batch: List[InferenceMessage],
+        batch_text_cost: int,
+        msg: InferenceMessage,
+    ) -> bool:
+        if len(batch) >= self.batch_size:
+            return True
+        if self.batch_text_budget <= 0:
+            return False
+        msg_cost = self._message_text_cost(msg)
+        # Always allow the first item in a batch, even if it exceeds the budget.
+        if not batch:
+            return False
+        return (batch_text_cost + msg_cost) > self.batch_text_budget
 
     def start(self):
         """Start the worker coroutine."""
@@ -171,14 +194,21 @@ class CharacterWorker:
     async def _run(self):
         """Main worker loop: pull from queue → batch → infer → upload."""
         loop = asyncio.get_running_loop()
+        carryover_msg: Optional[InferenceMessage] = None
 
         while self._running:
             batch: List[InferenceMessage] = []
+            batch_text_cost = 0
 
             try:
                 # 1. Block until at least one item is available
-                msg = await asyncio.wait_for(self.queue.get(), timeout=5.0)
+                if carryover_msg is not None:
+                    msg = carryover_msg
+                    carryover_msg = None
+                else:
+                    msg = await asyncio.wait_for(self.queue.get(), timeout=5.0)
                 batch.append(msg)
+                batch_text_cost = self._message_text_cost(msg)
             except asyncio.TimeoutError:
                 continue  # No work, loop back
             except asyncio.CancelledError:
@@ -197,7 +227,11 @@ class CharacterWorker:
                             break
                         try:
                             msg = await asyncio.wait_for(self.queue.get(), timeout=remaining)
+                            if self._should_defer_message(batch, batch_text_cost, msg):
+                                carryover_msg = msg
+                                break
                             batch.append(msg)
+                            batch_text_cost += self._message_text_cost(msg)
                         except asyncio.TimeoutError:
                             break
                         except asyncio.CancelledError:
@@ -206,6 +240,13 @@ class CharacterWorker:
                     if batch:
                         await self._process_batch(batch, loop)
                         batch.clear()
+                        batch_text_cost = 0
+
+                    if carryover_msg is not None:
+                        batch.append(carryover_msg)
+                        batch_text_cost = self._message_text_cost(carryover_msg)
+                        carryover_msg = None
+                        continue
 
                     # Check if more items are queued
                     # Use a tiny timeout to briefly wait in case orchestrator is slightly behind,
@@ -213,6 +254,7 @@ class CharacterWorker:
                     try:
                         msg = await asyncio.wait_for(self.queue.get(), timeout=0.25)
                         batch.append(msg)
+                        batch_text_cost = self._message_text_cost(msg)
                     except (asyncio.TimeoutError, asyncio.CancelledError):
                         break  # Queue is empty, yield the semaphore slot
 
@@ -229,6 +271,7 @@ class CharacterWorker:
             op = ops_log.start("session_worker_batch", extra={
                 "worker_id": self.worker_id,
                 "batch_size": len(batch),
+                "batch_text_chars": sum(self._message_text_cost(msg) for msg in batch),
                 "cache_key": self.cache_key,
             })
 
@@ -425,6 +468,7 @@ class SessionManager:
         max_replicas: int = DEFAULT_MAX_REPLICAS,
         session_timeout: int = DEFAULT_SESSION_TIMEOUT,
         batch_size: int = 32,
+        batch_text_budget: int = DEFAULT_BATCH_TEXT_BUDGET,
     ):
         self.inference = inference_manager
         self.pipeline = pipeline
@@ -433,6 +477,7 @@ class SessionManager:
         self.max_replicas = max_replicas
         self.session_timeout = session_timeout
         self.batch_size = batch_size
+        self.batch_text_budget = max(0, int(batch_text_budget or 0))
         self.sessions: Dict[str, Session] = {}
 
         # Limit active workers to max_models to prevent cache thrashing
@@ -656,6 +701,7 @@ class SessionManager:
                     speaker_name=plan.character_name,
                     batch_size=self.batch_size,
                     batch_timeout_ms=100,
+                    batch_text_budget=self.batch_text_budget,
                     storage=self.storage,
                     progress=progress,
                 )

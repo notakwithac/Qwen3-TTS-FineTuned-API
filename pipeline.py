@@ -123,7 +123,9 @@ class Job:
         """Persist job state to disk."""
         if not self.job_dir:
             return
-        job_file = Path(self.job_dir) / "job.json"
+        job_dir = Path(self.job_dir)
+        job_dir.mkdir(parents=True, exist_ok=True)
+        job_file = job_dir / "job.json"
         try:
             with open(job_file, "w") as f:
                 json.dump(self.to_dict(), f, indent=2)

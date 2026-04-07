@@ -12,6 +12,7 @@ import time
 import uuid
 import asyncio
 import base64
+import threading
 import torch
 from pathlib import Path
 from typing import Any, Optional
@@ -264,6 +265,58 @@ app = FastAPI(
 # Global draining flag - when True, the API rejects new work but allows status checks.
 IS_DRAINING = False
 
+# Finetune requests can be polled by orchestrators before pipeline.create_job()
+# has finished downloading/extracting the dataset and persisting job metadata.
+# Track those accepted-but-not-yet-created jobs so GET /jobs/{job_id} can return
+# a stable queued status instead of a transient 404.
+_pending_finetune_jobs: dict[str, dict[str, Any]] = {}
+_pending_finetune_jobs_lock = threading.Lock()
+
+
+def _build_pending_finetune_job(job_id: str, req: Any) -> dict[str, Any]:
+    return {
+        "job_id": job_id,
+        "status": JobStatus.QUEUED,
+        "speaker_name": req.speaker_name,
+        "progress": {
+            "stage": "queued",
+            "detail": "Finetune request accepted; creating job metadata and preparing dataset.",
+        },
+        "checkpoint_path": None,
+        "error": None,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "finished_at": None,
+        "config": {
+            "num_epochs": req.num_epochs,
+            "batch_size": req.batch_size,
+            "lr": req.lr,
+            "flash_attn": USE_FLASH_ATTN,
+            "book_id": req.book_id,
+            "chapter_id": req.chapter_id,
+            "character_id": req.character_id,
+            "base_model_path": None,
+        },
+        "message": "Job accepted and queued for creation.",
+    }
+
+
+def _register_pending_finetune_job(job_id: str, req: Any) -> dict[str, Any]:
+    pending = _build_pending_finetune_job(job_id, req)
+    with _pending_finetune_jobs_lock:
+        _pending_finetune_jobs[job_id] = pending
+    return pending
+
+
+def _get_pending_finetune_job(job_id: str) -> Optional[dict[str, Any]]:
+    with _pending_finetune_jobs_lock:
+        pending = _pending_finetune_jobs.get(job_id)
+        return dict(pending) if pending else None
+
+
+def _clear_pending_finetune_job(job_id: str) -> None:
+    with _pending_finetune_jobs_lock:
+        _pending_finetune_jobs.pop(job_id, None)
+
 # ---------------------------------------------------------------------------
 # Middleware: Request Logging
 # ---------------------------------------------------------------------------
@@ -330,6 +383,7 @@ GPU_IDLE_TIMEOUT = int(os.environ.get("GPU_IDLE_TIMEOUT", "600"))
 GPU_MAX_CONCURRENCY = int(os.environ.get("GPU_MAX_CONCURRENCY", "16"))
 GPU_MAX_MODELS = int(os.environ.get("GPU_MAX_MODELS", str(_default_gpu_max_models())))
 GPU_BATCH_SIZE = int(os.environ.get("GPU_BATCH_SIZE", "32"))
+SESSION_BATCH_MAX_CHARS = int(os.environ.get("SESSION_BATCH_MAX_CHARS", "4000"))
 USE_TORCH_COMPILE = os.environ.get("USE_TORCH_COMPILE", "1") == "1"
 
 # Resource Isolation
@@ -358,6 +412,7 @@ logger.info(f"  - GPU_IDLE_TIMEOUT: {GPU_IDLE_TIMEOUT}s")
 logger.info(f"  - GPU_MAX_CONCURRENCY: {GPU_MAX_CONCURRENCY}")
 logger.info(f"  - GPU_MAX_MODELS: {GPU_MAX_MODELS}")
 logger.info(f"  - GPU_BATCH_SIZE: {GPU_BATCH_SIZE}")
+logger.info(f"  - SESSION_BATCH_MAX_CHARS: {SESSION_BATCH_MAX_CHARS}")
 logger.info(f"  - USE_TORCH_COMPILE: {USE_TORCH_COMPILE}")
 logger.info(f"  - REPLICA_THRESHOLD: {REPLICA_THRESHOLD}")
 logger.info(f"  - MAX_CONCURRENT_VOICE_DESIGNS: {MAX_CONCURRENT_VOICE_DESIGNS}")
@@ -395,6 +450,7 @@ session_mgr = SessionManager(
     max_replicas=MAX_REPLICAS_PER_MODEL,
     session_timeout=SESSION_TIMEOUT,
     batch_size=GPU_BATCH_SIZE,
+    batch_text_budget=SESSION_BATCH_MAX_CHARS,
 )
 
 # ---------------------------------------------------------------------------
@@ -1266,6 +1322,8 @@ def create_finetune_job(req: FinetuneRequest):
             detail="Speaker name cannot contain an underscore followed by a number (e.g. avoid 'Voice_1'). Use 'Voice1' instead."
         )
 
+    effective_job_id = req.job_id or uuid.uuid4().hex[:12]
+
     # Download dataset from S3 to a temporary file
     with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
         tmp_path = tmp.name
@@ -1290,6 +1348,14 @@ def create_finetune_job(req: FinetuneRequest):
 
         # If job_id is provided, check if it already exists
         if req.job_id:
+            pending_job = _get_pending_finetune_job(req.job_id)
+            if pending_job and not req.force:
+                logger.info(
+                    "Job %s is already pending local creation. Returning queued snapshot.",
+                    req.job_id,
+                )
+                return JSONResponse(content=pending_job, status_code=202)
+
             existing_job = pipeline.get_job(req.job_id)
             if existing_job:
                 # User refinement: Only return if status is QUEUED or TRAINING, 
@@ -1300,6 +1366,8 @@ def create_finetune_job(req: FinetuneRequest):
                     return JSONResponse(content=existing_job.to_dict(), status_code=200)
                 else:
                     logger.warning(f"Re-creating/Retrying job {req.job_id} (Status: {existing_job.status}, Force={req.force})")
+
+        _register_pending_finetune_job(effective_job_id, req)
 
         # Download the file from S3
         storage.download_file(req.dataset_s3_key, tmp_path)
@@ -1314,10 +1382,12 @@ def create_finetune_job(req: FinetuneRequest):
             chapter_id=req.chapter_id,
             character_id=req.character_id,
             base_model_path=base_model_path,
-            job_id=req.job_id,
+            job_id=effective_job_id,
         )
+        _clear_pending_finetune_job(effective_job_id)
         ops_log.end(op, extra={"job_id": job.job_id})
     except Exception as e:
+        _clear_pending_finetune_job(effective_job_id)
         ops_log.fail(op, str(e))
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
@@ -1341,12 +1411,22 @@ async def trigger_cleanup(threshold_gb: float = 40.0):
 @app.get("/jobs", summary="List all jobs")
 async def list_jobs():
     """List all fine-tuning jobs and their statuses."""
-    return pipeline.list_jobs()
+    jobs = pipeline.list_jobs()
+    with _pending_finetune_jobs_lock:
+        pending_jobs = [
+            dict(job)
+            for job_id, job in _pending_finetune_jobs.items()
+            if job_id not in {item.get("job_id") for item in jobs}
+        ]
+    return pending_jobs + jobs
 
 
 @app.get("/jobs/{job_id}", summary="Get job status", response_model=JobSummary)
 async def get_job(job_id: str):
     """Get the current status and progress of a fine-tuning job."""
+    pending_job = _get_pending_finetune_job(job_id)
+    if pending_job:
+        return pending_job
     loop = asyncio.get_running_loop()
     job = await loop.run_in_executor(None, pipeline.get_job, job_id)
     if not job:

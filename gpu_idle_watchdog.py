@@ -210,10 +210,6 @@ def upload_final_artifacts(instance_uuid: str, is_periodic: bool = False):
         "/tmp",    # Directory (for system logs)
     ]
     
-    # 2. Training/Jobs Outputs (if enabled)
-    if UPLOAD_OUTPUTS:
-        artifact_paths.extend(["output", "runs", "jobs"])
-    
     # Files to glob for in those paths
     log_patterns = ["*.log", "*.jsonl", "*.txt", "events.out.tfevents.*"]
     # Model patterns: include config/trainer state always, weights only for final upload
