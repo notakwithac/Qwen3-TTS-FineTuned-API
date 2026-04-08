@@ -1,4 +1,6 @@
 import asyncio
+import time
+from threading import Event
 
 import pytest
 
@@ -7,6 +9,9 @@ from session_manager import CharacterProgress, CharacterWorker, InferenceMessage
 
 class _StubInferenceManager:
     max_models = 1
+
+    def generate_batch(self, texts, checkpoint_path, speaker_name, languages=None, instructs=None):
+        return [b"wav" for _ in texts], 24000
 
 
 def _msg(text: str) -> InferenceMessage:
@@ -85,3 +90,40 @@ async def test_worker_allows_single_oversized_dialogue_as_its_own_batch():
     await asyncio.wait_for(worker._task, timeout=1.0)
 
     assert seen_batches == [["x" * 25], ["tail"]]
+
+
+@pytest.mark.asyncio
+async def test_worker_stop_waits_for_active_batch_completion():
+    queue = asyncio.Queue()
+    started = Event()
+
+    class _SlowInferenceManager(_StubInferenceManager):
+        def generate_batch(self, texts, checkpoint_path, speaker_name, languages=None, instructs=None):
+            started.set()
+            time.sleep(0.05)
+            return super().generate_batch(texts, checkpoint_path, speaker_name, languages, instructs)
+
+    worker = CharacterWorker(
+        worker_id="worker-3",
+        queue=queue,
+        inference_manager=_SlowInferenceManager(),
+        worker_semaphore=asyncio.Semaphore(1),
+        cache_key="checkpoint",
+        speaker_name="Narrator",
+        batch_size=10,
+        batch_timeout_ms=1,
+        batch_text_budget=100,
+        progress=CharacterProgress(),
+    )
+
+    await queue.put(_msg("wait for me"))
+
+    worker.start()
+    started_ok = await asyncio.to_thread(started.wait, 1.0)
+    assert started_ok
+
+    await worker.stop()
+
+    assert worker.progress.completed == 1
+    assert worker._task is not None
+    assert worker._task.done()

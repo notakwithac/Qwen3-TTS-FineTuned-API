@@ -180,9 +180,17 @@ class CharacterWorker:
                 
         if self._task and not self._task.done():
             # Only cancel if it's polling the queue and NOT in the middle of a GPU generation.
-            # Cancelling mid-generation drops the results and aborts the S3 upload.
-            if getattr(self, '_in_batch', False):
-                logger.info(f"Worker {self.worker_id} detaching to finish active batch in background")
+            # When a batch is active we must wait for inference + upload to complete; otherwise
+            # an eager session teardown can race the caller and make "submit then delete" lose audio.
+            if getattr(self, "_in_batch", False):
+                logger.info(
+                    "Worker %s waiting for active batch to finish before stopping",
+                    self.worker_id,
+                )
+                try:
+                    await self._task
+                except asyncio.CancelledError:
+                    pass
             else:
                 self._task.cancel()
                 try:
