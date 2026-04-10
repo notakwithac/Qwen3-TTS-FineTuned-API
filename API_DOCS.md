@@ -158,6 +158,29 @@ Content-Type: application/json
 ### POST /voice-clone/batch
 **Batch generate speech from a single reference audio (Zero-shot cloning).**
 
+### POST /dataset/prepare
+**Prepare raw finetuning dataset items from validated clone audio.**
+
+This endpoint now stops after creating raw `dataset_items` for review. It does not auto-package the final Qwen dataset, even if `approval_mode` is `"auto"`.
+
+Notes:
+- `approval_mode` is accepted for backward compatibility.
+- The response job reaches `phase="awaiting_approval"` when raw dataset items are ready.
+- `dataset_items` are candidate clips for approval/editing before packaging.
+
+### POST /dataset/package
+**Package approved dataset items into the final Qwen finetune zip.**
+
+This endpoint expects already-approved `dataset_items`.
+
+Notes:
+- The service trusts the incoming `dataset_items`.
+- If one item has `is_reference=true`, that clip becomes `data/ref_audio.wav`.
+- If none is marked, the service falls back to the last included clip.
+
+### GET /dataset/status/{job_id}
+**Get status for dataset preparation or packaging jobs.**
+
 ---
 
 ## Resource Monitoring & Diagnostics

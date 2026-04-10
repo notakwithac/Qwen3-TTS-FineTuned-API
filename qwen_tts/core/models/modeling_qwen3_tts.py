@@ -52,6 +52,21 @@ from .configuration_qwen3_tts import (Qwen3TTSConfig,
 logger = logging.get_logger(__name__)
 
 
+def _reshape_speaker_embed_for_prefix(speaker_embed: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """Normalize speaker embeddings to [batch=1, speaker_tokens, hidden]."""
+    if speaker_embed is None:
+        return None
+    if speaker_embed.dim() == 1:
+        return speaker_embed.unsqueeze(0).unsqueeze(0)
+    if speaker_embed.dim() == 2:
+        return speaker_embed.unsqueeze(0)
+    if speaker_embed.dim() == 3:
+        return speaker_embed
+    raise ValueError(
+        f"Unsupported speaker embedding shape for prefix construction: {tuple(speaker_embed.shape)}"
+    )
+
+
 def download_weights_from_hf_specific(
     model_name_or_path: str,
     cache_dir: str | None,
@@ -2136,6 +2151,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                     else:
                         speaker_embed = None
 
+                speaker_embed = _reshape_speaker_embed_for_prefix(speaker_embed)
+
                 assert language is not None
 
                 if language.lower() == "auto":
@@ -2189,7 +2206,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                                                     codec_input_emebdding_1], dim=1)
                 else:
                     codec_input_emebdding = torch.cat([codec_input_emebdding_0,
-                                                    speaker_embed.view(1, 1, -1),
+                                                    speaker_embed,
                                                     codec_input_emebdding_1], dim=1)
 
                 # tts_pad * 4 + tts_bos

@@ -181,6 +181,9 @@ class InferenceManager:
         self._idle_timeout = idle_timeout_seconds
         self._last_used: float = 0.0
         self._active_requests: int = 0
+        self._last_request_started_at: Optional[float] = None
+        self._last_request_finished_at: Optional[float] = None
+        self._idle_started_at: Optional[float] = time.time()
         self._idle_timer: Optional[threading.Timer] = None
         self._auto_unload_enabled = idle_timeout_seconds > 0
 
@@ -238,7 +241,11 @@ class InferenceManager:
                 "gpu_memory_free_gb": round(snapshot["free_gb"], 2),
             }
 
-        idle_seconds = time.time() - self._last_used if self._last_used > 0 else None
+        idle_seconds = (
+            round(time.time() - self._idle_started_at, 1)
+            if self._idle_started_at is not None and self._active_requests == 0
+            else None
+        )
 
         return {
             "model_loaded": self.is_loaded,
@@ -250,7 +257,11 @@ class InferenceManager:
             "inference_limiter": self._inference_limiter.snapshot(),
             "auto_unload_enabled": self._auto_unload_enabled,
             "idle_timeout_seconds": self._idle_timeout,
-            "idle_seconds": round(idle_seconds, 1) if idle_seconds else None,
+            "active_requests": self._active_requests,
+            "last_request_started_at": self._format_timestamp(self._last_request_started_at),
+            "last_request_finished_at": self._format_timestamp(self._last_request_finished_at),
+            "idle_started_at": self._format_timestamp(self._idle_started_at),
+            "idle_seconds": idle_seconds,
             "total_requests": self._total_requests,
             "total_loads": self._total_loads,
             "total_unloads": self._total_unloads,
@@ -290,6 +301,12 @@ class InferenceManager:
     def _touch(self):
         self._last_used = time.time()
         self._reset_idle_timer()
+
+    @staticmethod
+    def _format_timestamp(value: Optional[float]) -> Optional[str]:
+        if value is None:
+            return None
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(value))
 
     def _get_gpu_memory_snapshot(self) -> dict[str, float]:
         if not torch.cuda.is_available():
@@ -382,12 +399,19 @@ class InferenceManager:
     @contextlib.contextmanager
     def _track_active(self):
         with self._lock:
+            self._cancel_idle_timer()
             self._active_requests += 1
+            self._last_request_started_at = time.time()
+            self._idle_started_at = None
         try:
             yield
         finally:
             with self._lock:
                 self._active_requests -= 1
+                self._last_request_finished_at = time.time()
+                if self._active_requests <= 0:
+                    self._active_requests = 0
+                    self._idle_started_at = self._last_request_finished_at
                 self._touch()
 
     # -- Speaker name normalisation -------------------------------------------

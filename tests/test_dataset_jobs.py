@@ -114,3 +114,73 @@ def test_validate_and_crop_audio_retries_on_cpu_after_cuda_oom(monkeypatch):
     assert calls == [("cuda", "float16"), ("cpu", "int8")]
     assert result[0][3] is True
     assert result[0][4] == "major barry"
+
+
+def test_validate_and_crop_audio_splits_long_dominant_speaker_segments(monkeypatch):
+    class _FakeSlice:
+        def __init__(self, duration_ms: int):
+            self.duration_ms = duration_ms
+
+        def __len__(self):
+            return self.duration_ms
+
+        def export(self, buf, format="wav"):
+            buf.write(_make_wav_bytes(max(self.duration_ms / 1000.0, 0.1)))
+
+    class _FakeAudioSegment:
+        def __init__(self, duration_ms: int):
+            self.duration_ms = duration_ms
+
+        @classmethod
+        def from_wav(cls, _stream):
+            return cls(26_000)
+
+        def __len__(self):
+            return self.duration_ms
+
+        def __getitem__(self, key):
+            start = 0 if key.start is None else key.start
+            stop = self.duration_ms if key.stop is None else key.stop
+            return _FakeSlice(max(0, stop - start))
+
+    fake_torch = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(is_available=lambda: False, empty_cache=lambda: None),
+        serialization=types.SimpleNamespace(add_safe_globals=lambda _globals: None),
+    )
+
+    fake_whisperx = types.SimpleNamespace(
+        load_audio=lambda _path: "audio",
+        align=lambda segments, *_args, **_kwargs: {"segments": segments},
+        assign_word_speakers=lambda _diarized, result: result,
+    )
+    fake_pydub = types.SimpleNamespace(AudioSegment=_FakeAudioSegment)
+
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "whisperx", fake_whisperx)
+    monkeypatch.setitem(sys.modules, "pydub", fake_pydub)
+    monkeypatch.setattr(
+        dataset_jobs,
+        "_get_whisper_model",
+        lambda *_args, **_kwargs: types.SimpleNamespace(
+            transcribe=lambda _audio, batch_size=8: {
+                "language": "en",
+                "segments": [
+                    {"start": 0.0, "end": 6.0, "text": "one", "speaker": "SPEAKER_00"},
+                    {"start": 6.2, "end": 12.0, "text": "two", "speaker": "SPEAKER_00"},
+                    {"start": 12.2, "end": 18.0, "text": "three", "speaker": "SPEAKER_00"},
+                    {"start": 18.2, "end": 26.0, "text": "four", "speaker": "SPEAKER_00"},
+                ],
+            }
+        ),
+    )
+    monkeypatch.setattr(dataset_jobs, "_get_align_model", lambda *_args, **_kwargs: (object(), {}))
+    monkeypatch.setattr(dataset_jobs, "_get_diarization_pipeline", lambda *_args, **_kwargs: lambda *_a, **_k: [])
+
+    result = dataset_jobs._validate_and_crop_audio_sync(
+        [("clip.wav", _make_wav_bytes(26.0), "prompt-1")],
+        "Elena",
+    )
+
+    assert len(result) == 2
+    assert [item[0] for item in result] == ["clip__seg_000.wav", "clip__seg_001.wav"]
+    assert [item[4] for item in result] == ["one two", "three four"]

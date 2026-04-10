@@ -405,6 +405,10 @@ class Session:
         self.last_active = time.time()
 
     @property
+    def queued_items(self) -> int:
+        return sum(q.qsize() for q in self.character_queues.values())
+
+    @property
     def completed_lines(self) -> int:
         return sum(p.completed for p in self.character_progress.values())
 
@@ -838,7 +842,36 @@ class SessionManager:
                 "total_lines": s.total_lines,
                 "completed_lines": s.completed_lines,
                 "progress_pct": s.progress_pct,
+                "queued_items": s.queued_items,
                 "created_at": s.created_at,
             }
             for s in self.sessions.values()
         ]
+
+    def scheduler_snapshot(self) -> dict:
+        """Aggregate session backlog and runtime state for GPU schedulers."""
+        status_counts = {status.value: 0 for status in SessionStatus}
+        queued_session_items = 0
+        active_sessions = 0
+        active_workers = 0
+
+        for session in self.sessions.values():
+            status_counts[session.status.value] = status_counts.get(session.status.value, 0) + 1
+            queued_session_items += session.queued_items
+            active_workers += sum(
+                1 for worker in session.workers if getattr(worker, "_running", False)
+            )
+            if session.status in {
+                SessionStatus.PREPARING,
+                SessionStatus.READY,
+                SessionStatus.PROCESSING,
+            }:
+                active_sessions += 1
+
+        return {
+            "total_sessions": len(self.sessions),
+            "active_sessions": active_sessions,
+            "queued_session_items": queued_session_items,
+            "active_workers": active_workers,
+            "status_counts": status_counts,
+        }

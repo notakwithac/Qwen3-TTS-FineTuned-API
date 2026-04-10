@@ -56,10 +56,10 @@ include-package-data = true
 qwen_tts = ["py.typed", "**/*.npz"]
 
 [project.optional-dependencies]
-cu121 = [
-  "torch==2.5.1",
-  "torchvision==0.20.1",
-  "torchaudio==2.5.1",
+cu128 = [
+  "torch==2.8.0",
+  "torchvision==0.23.0",
+  "torchaudio==2.8.0",
 ]
 
 flash = [
@@ -72,22 +72,22 @@ train = [
 
 [tool.uv.sources]
 torch = [
-  { index = "pytorch-cu121", extra = "cu121" },
+  { index = "pytorch-cu128", extra = "cu128" },
 ]
 torchvision = [
-  { index = "pytorch-cu121", extra = "cu121" },
+  { index = "pytorch-cu128", extra = "cu128" },
 ]
 torchaudio = [
-  { index = "pytorch-cu121", extra = "cu121" },
+  { index = "pytorch-cu128", extra = "cu128" },
 ]
 flash-attn = [
-  { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.5cxx11abiFALSE-cp311-cp311-linux_x86_64.whl", marker = "sys_platform == 'linux'" }
+  { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl", marker = "sys_platform == 'linux'" }
 ]
 
 [tool.uv.extra-build-dependencies]
 flash-attn = ["torch"]
 
 [[tool.uv.index]]
-name = "pytorch-cu121"
-url = "https://download.pytorch.org/whl/cu121"
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true

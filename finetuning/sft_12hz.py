@@ -239,12 +239,7 @@ def train():
     dataset = TTSDataset(train_data, qwen3tts.processor, config)
     train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate_fn)
 
-    # Freeze text embeddings to maintain base intelligence and grammatical consistency
-    for name, param in qwen3tts.model.named_parameters():
-        if "text_embedding" in name or "text_projection" in name:
-            param.requires_grad = False
-
-    optimizer = AdamW((p for p in qwen3tts.model.parameters() if p.requires_grad), lr=args.lr, weight_decay=0.01)
+    optimizer = AdamW(qwen3tts.model.parameters(), lr=args.lr, weight_decay=0.01)
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / grad_accum_steps)
     max_train_steps = args.num_epochs * num_update_steps_per_epoch
     warmup_steps = args.warmup_steps
@@ -317,6 +312,11 @@ def train():
         unwrapped_model = accelerator.unwrap_model(model)
         state_dict = {k: v.detach().to("cpu") for k, v in unwrapped_model.state_dict().items()}
 
+        drop_prefix = "speaker_encoder"
+        keys_to_drop = [k for k in state_dict.keys() if k.startswith(drop_prefix)]
+        for k in keys_to_drop:
+            del state_dict[k]
+
         weight = state_dict['talker.model.codec_embedding.weight']
         state_dict['talker.model.codec_embedding.weight'][3000] = target_speaker_embedding[0].detach().to(weight.device).to(weight.dtype)
         save_path = os.path.join(output_dir, "model.safetensors")
@@ -374,12 +374,12 @@ def train():
                 )
 
                 hidden_states = outputs.hidden_states[0][-1]
-                talker_hidden_states = hidden_states[codec_mask[:, 1:]]
+                talker_hidden_states = hidden_states[codec_mask[:, :-1]]
                 talker_codec_ids = codec_ids[codec_mask]
 
                 sub_talker_logits, sub_talker_loss = model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
 
-                loss = outputs.loss + sub_talker_loss
+                loss = outputs.loss + 0.3 * sub_talker_loss
 
                 accelerator.backward(loss)
 
@@ -554,12 +554,7 @@ def train_programmatic(
     dataset = TTSDataset(train_data, qwen3tts.processor, model_config)
     train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate_fn)
 
-    # Freeze text embeddings to maintain base intelligence and grammatical consistency
-    for name, param in qwen3tts.model.named_parameters():
-        if "text_embedding" in name or "text_projection" in name:
-            param.requires_grad = False
-
-    optimizer = AdamW((p for p in qwen3tts.model.parameters() if p.requires_grad), lr=args.lr, weight_decay=0.01)
+    optimizer = AdamW(qwen3tts.model.parameters(), lr=args.lr, weight_decay=0.01)
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / grad_accum_steps)
     max_train_steps = args.num_epochs * num_update_steps_per_epoch
     warmup_steps = args.warmup_steps
@@ -633,6 +628,12 @@ def train_programmatic(
 
         unwrapped_model = accelerator.unwrap_model(model)
         state_dict = {k: v.detach().to("cpu") for k, v in unwrapped_model.state_dict().items()}
+
+        drop_prefix = "speaker_encoder"
+        keys_to_drop = [k for k in state_dict.keys() if k.startswith(drop_prefix)]
+        for k in keys_to_drop:
+            del state_dict[k]
+
         weight = state_dict['talker.model.codec_embedding.weight']
         state_dict['talker.model.codec_embedding.weight'][3000] = target_speaker_embedding[0].detach().to(weight.device).to(weight.dtype)
         save_path = os.path.join(output_dir, "model.safetensors")
@@ -681,10 +682,10 @@ def train_programmatic(
                     output_hidden_states=True
                 )
                 hidden_states = outputs.hidden_states[0][-1]
-                talker_hidden_states = hidden_states[codec_mask[:, 1:]]
+                talker_hidden_states = hidden_states[codec_mask[:, :-1]]
                 talker_codec_ids = codec_ids[codec_mask]
                 sub_talker_logits, sub_talker_loss = model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
-                loss = outputs.loss + sub_talker_loss
+                loss = outputs.loss + 0.3 * sub_talker_loss
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:

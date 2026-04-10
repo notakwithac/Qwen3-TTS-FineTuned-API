@@ -1,5 +1,6 @@
 import sys
 import types
+from datetime import datetime, timezone
 
 from fastapi.testclient import TestClient
 
@@ -73,6 +74,11 @@ class StubInference:
                 "holders": {},
                 "waiting": {},
             },
+            "active_requests": 0,
+            "last_request_started_at": None,
+            "last_request_finished_at": None,
+            "idle_started_at": "2026-04-11T00:00:00Z",
+            "idle_seconds": 60.0,
             "gpu_memory_total_gb": 48.0,
             "gpu_memory_allocated_gb": 0.0,
             "gpu_memory_reserved_gb": 0.0,
@@ -122,6 +128,85 @@ def _patch_startup_dependencies(monkeypatch):
     monkeypatch.setattr(api_server.session_mgr, "start_cleanup_loop", lambda: None)
     monkeypatch.setattr(api_server.metrics_collector, "start", lambda: None)
     monkeypatch.setattr(api_server.metrics_collector, "stop", lambda: None)
+
+
+def test_gpu_status_reports_scheduler_idle_and_cooldown_fields(monkeypatch):
+    inference = StubInference()
+    monkeypatch.setattr(api_server, "pipeline", StubPipeline(inference))
+    _patch_startup_dependencies(monkeypatch)
+    monkeypatch.setattr(
+        api_server.session_mgr,
+        "scheduler_snapshot",
+        lambda: {
+            "total_sessions": 1,
+            "active_sessions": 0,
+            "queued_session_items": 0,
+            "active_workers": 0,
+            "status_counts": {
+                "preparing": 0,
+                "ready": 0,
+                "processing": 0,
+                "completed": 1,
+                "failed": 0,
+                "cancelled": 0,
+            },
+        },
+    )
+    monkeypatch.setattr(api_server.ops_log, "get_running", lambda: [])
+    monkeypatch.setattr(api_server, "GPU_COOLDOWN_SECONDS", 1200)
+    monkeypatch.setattr(
+        api_server.time,
+        "time",
+        lambda: datetime(2026, 4, 11, 0, 30, tzinfo=timezone.utc).timestamp(),
+    )
+
+    with TestClient(api_server.app) as client:
+        response = client.get("/gpu/status")
+
+    body = response.json()
+    assert response.status_code == 200
+    assert body["is_idle"] is True
+    assert body["queued_requests"] == 0
+    assert body["cooldown_seconds"] == 1200
+    assert body["cooldown_ready"] is True
+    assert body["active_sessions"] == 0
+    assert body["running_operations"] == 0
+
+
+def test_gpu_status_hides_idle_window_when_backlog_exists(monkeypatch):
+    inference = StubInference()
+    monkeypatch.setattr(api_server, "pipeline", StubPipeline(inference))
+    _patch_startup_dependencies(monkeypatch)
+    monkeypatch.setattr(
+        api_server.session_mgr,
+        "scheduler_snapshot",
+        lambda: {
+            "total_sessions": 1,
+            "active_sessions": 1,
+            "queued_session_items": 4,
+            "active_workers": 1,
+            "status_counts": {
+                "preparing": 0,
+                "ready": 0,
+                "processing": 1,
+                "completed": 0,
+                "failed": 0,
+                "cancelled": 0,
+            },
+        },
+    )
+    monkeypatch.setattr(api_server.ops_log, "get_running", lambda: [{"op_name": "session_worker_batch"}])
+
+    with TestClient(api_server.app) as client:
+        response = client.get("/gpu/status")
+
+    body = response.json()
+    assert response.status_code == 200
+    assert body["is_idle"] is False
+    assert body["queued_requests"] == 4
+    assert body["idle_started_at"] is None
+    assert body["idle_seconds"] is None
+    assert body["cooldown_ready"] is False
 
 
 def test_get_gpu_concurrency_returns_effective_runtime_config(monkeypatch):

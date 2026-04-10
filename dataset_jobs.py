@@ -15,6 +15,10 @@ log = logging.getLogger(__name__)
 
 _whisper_cache: dict[str, Any] = {}
 _cache_lock = threading.Lock()
+DATASET_SAMPLE_MIN_SEC = 10.0
+DATASET_SAMPLE_TARGET_SEC = 15.0
+DATASET_SAMPLE_MAX_SEC = 30.0
+DATASET_MERGE_GAP_SEC = 0.75
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -23,6 +27,112 @@ def _env_flag(name: str, default: str = "0") -> bool:
 
 def _join_segment_text(segments: list[dict[str, Any]]) -> str:
     return " ".join(seg.get("text", "").strip() for seg in segments if seg.get("text", "").strip()).strip()
+
+
+def _segmented_filename(filename: str, segment_index: int, total_segments: int) -> str:
+    if total_segments <= 1:
+        return filename
+    stem, dot, ext = filename.rpartition(".")
+    if not dot:
+        stem = filename
+        ext = ""
+    suffix = f"__seg_{segment_index:03d}"
+    return f"{stem}{suffix}.{ext}" if ext else f"{stem}{suffix}"
+
+
+def _chunk_segments(
+    segments: list[dict[str, Any]],
+    *,
+    main_speaker: str,
+) -> list[list[dict[str, Any]]]:
+    speaker_segments: list[dict[str, Any]] = []
+    for seg in segments:
+        if seg.get("speaker") != main_speaker:
+            continue
+        text = seg.get("text", "").strip()
+        start = float(seg.get("start", 0.0) or 0.0)
+        end = float(seg.get("end", 0.0) or 0.0)
+        if end <= start or not text:
+            continue
+        speaker_segments.append({"start": start, "end": end, "text": text})
+
+    if not speaker_segments:
+        return []
+
+    chunks: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    current_start = 0.0
+    current_end = 0.0
+
+    for seg in speaker_segments:
+        if not current:
+            current = [seg]
+            current_start = seg["start"]
+            current_end = seg["end"]
+            continue
+
+        gap = max(0.0, seg["start"] - current_end)
+        proposed_duration = seg["end"] - current_start
+        current_duration = current_end - current_start
+
+        should_merge = False
+        if gap <= DATASET_MERGE_GAP_SEC and proposed_duration <= DATASET_SAMPLE_TARGET_SEC:
+            should_merge = True
+        elif current_duration < DATASET_SAMPLE_MIN_SEC and proposed_duration <= DATASET_SAMPLE_MAX_SEC:
+            should_merge = True
+
+        if should_merge:
+            current.append(seg)
+            current_end = seg["end"]
+            continue
+
+        chunks.append(current)
+        current = [seg]
+        current_start = seg["start"]
+        current_end = seg["end"]
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
+def _build_split_results(
+    filename: str,
+    wav_bytes: bytes,
+    prompt_id: str,
+    segments: list[dict[str, Any]],
+    *,
+    main_speaker: str,
+):
+    from pydub import AudioSegment
+
+    audio_segment = AudioSegment.from_wav(io.BytesIO(wav_bytes))
+    chunks = _chunk_segments(segments, main_speaker=main_speaker)
+    if not chunks:
+        return []
+
+    results: list[tuple[str, bytes, str, bool, str, str | None]] = []
+    for idx, chunk in enumerate(chunks):
+        start_ms = max(0, int(chunk[0]["start"] * 1000) - 100)
+        end_ms = min(len(audio_segment), int(chunk[-1]["end"] * 1000) + 100)
+        cropped = audio_segment[start_ms:end_ms]
+        transcript = _join_segment_text(chunk)
+        if len(cropped) <= 0 or not transcript:
+            continue
+        out_buf = io.BytesIO()
+        cropped.export(out_buf, format="wav")
+        results.append(
+            (
+                _segmented_filename(filename, idx, len(chunks)),
+                out_buf.getvalue(),
+                prompt_id,
+                True,
+                transcript,
+                None,
+            )
+        )
+    return results
 
 
 def _is_cuda_oom_error(exc: BaseException) -> bool:
@@ -251,7 +361,6 @@ def _validate_and_crop_audio_sync(
 ) -> list[tuple[str, bytes, str, bool, str, str | None]]:
     import torch
     import whisperx
-    from pydub import AudioSegment
 
     try:
         try:
@@ -455,31 +564,22 @@ def _validate_and_crop_audio_sync(
 
                 main_speaker = max(speaker_durations.items(), key=lambda item: item[1])[0]
 
-                audio_segment = AudioSegment.from_wav(io.BytesIO(wav_bytes))
-                cropped = AudioSegment.empty()
-                transcript_parts: list[str] = []
-
-                for seg in segments:
-                    if seg.get("speaker") != main_speaker:
-                        continue
-                    start_ms = max(0, int(seg.get("start", 0.0) * 1000) - 100)
-                    end_ms = min(len(audio_segment), int(seg.get("end", 0.0) * 1000) + 100)
-                    cropped += audio_segment[start_ms:end_ms]
-                    text = seg.get("text", "").strip()
-                    if text:
-                        transcript_parts.append(text)
-
-                transcript = " ".join(transcript_parts).strip()
-                if len(cropped) > 0 and transcript:
-                    out_buf = io.BytesIO()
-                    cropped.export(out_buf, format="wav")
-                    results.append((filename, out_buf.getvalue(), prompt_id, True, transcript, None))
+                split_results = _build_split_results(
+                    filename,
+                    wav_bytes,
+                    prompt_id,
+                    segments,
+                    main_speaker=main_speaker,
+                )
+                if split_results:
+                    results.extend(split_results)
                     log.info(
-                        "[%s] Clip %d/%d: PASS — kept speaker %s, total %.1fs",
+                        "[%s] Clip %d/%d: PASS — kept speaker %s and produced %d sample(s), total %.1fs",
                         char_name,
                         clip_idx,
                         total_clips,
                         main_speaker,
+                        len(split_results),
                         _time.monotonic() - clip_start,
                     )
                 else:
@@ -591,7 +691,6 @@ async def prepare_dataset_items(
         detail = "; ".join(failure_reasons[:3]) if failure_reasons else "all clips failed validation"
         raise RuntimeError(f"No valid segments available for finetuning dataset. {detail}")
 
-    ref_idx = min(7, len(final_train_segments) - 1)
     dataset_items: list[dict[str, Any]] = []
 
     for idx, (filename, wav_bytes) in enumerate(final_train_segments):
@@ -614,7 +713,7 @@ async def prepare_dataset_items(
                 "url": storage.get_presigned_url(item_key, expires_in=86400 * 7),
                 "s3_url": s3_url,
                 "text": transcript,
-                "is_reference": idx == ref_idx,
+                "is_reference": False,
                 "included": True,
             }
         )

@@ -17,8 +17,8 @@ else
 fi
 . .venv/bin/activate
 
-echo "=== [3/6] Syncing stable CUDA 12.1 deps ==="
-uv sync --extra cu121
+echo "=== [3/6] Syncing CUDA 12.8 deps ==="
+uv sync --extra cu128
 
 echo "=== [4/6] Limiting build to A100 arch ==="
 export TORCH_CUDA_ARCH_LIST="8.0"
@@ -27,7 +27,7 @@ export GPU_MAX_MODELS="${GPU_MAX_MODELS:-4}"
 
 echo "=== [5/6] Installing flash-attn ==="
 if ! python -c "import flash_attn" &> /dev/null; then
-    uv pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.5cxx11abiFALSE-cp311-cp311-linux_x86_64.whl
+    uv pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl
 else
     echo "flash-attn is already installed, skipping."
 fi

@@ -294,3 +294,24 @@ def test_load_model_into_cache_logs_failure_context(monkeypatch):
     assert extra["cache_key"].endswith("::replica-0")
     assert extra["stage"] == "load_model_into_cache"
     assert "gpu_memory" in extra
+
+
+def test_stats_report_true_idle_window_from_request_lifecycle():
+    manager = InferenceManager(device="cpu", idle_timeout_seconds=600)
+
+    initial = manager.stats
+    assert initial["active_requests"] == 0
+    assert initial["idle_started_at"] is not None
+
+    with manager._track_active():
+        active = manager.stats
+        assert active["active_requests"] == 1
+        assert active["idle_started_at"] is None
+        assert active["idle_seconds"] is None
+        assert active["last_request_started_at"] is not None
+
+    finished = manager.stats
+    assert finished["active_requests"] == 0
+    assert finished["last_request_finished_at"] is not None
+    assert finished["idle_started_at"] is not None
+    assert finished["idle_seconds"] is not None

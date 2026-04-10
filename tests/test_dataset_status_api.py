@@ -5,6 +5,8 @@ import types
 
 from fastapi.testclient import TestClient
 
+import dataset_jobs
+
 
 class _DummyBroadcast:
     def __init__(self, *_args, **_kwargs):
@@ -117,7 +119,7 @@ def test_post_dataset_prepare_creates_job_and_status(monkeypatch):
                 "url": "https://signed/item.wav",
                 "s3_url": "s3://bucket/datasets/book-1/items/char-1_clone_0001.wav",
                 "text": "hello there",
-                "is_reference": True,
+                "is_reference": False,
                 "included": True,
             }
         ]
@@ -143,6 +145,7 @@ def test_post_dataset_prepare_creates_job_and_status(monkeypatch):
     assert body["kind"] == "prepare"
     assert body["status"] == "completed"
     assert body["dataset_items"][0]["id"] == "clone_0001.wav"
+    assert body["dataset_items"][0]["is_reference"] is False
 
 
 def test_post_dataset_prepare_reuses_existing_job(monkeypatch):
@@ -215,6 +218,96 @@ def test_post_dataset_package_creates_job_and_status(monkeypatch):
     assert body["kind"] == "package"
     assert body["dataset_s3_key"] == "datasets/book-1/dataset_char-1_job-package-1.zip"
     assert body["dataset_s3_url"].endswith("dataset_char-1_job-package-1.zip")
+
+
+def test_prepare_job_no_longer_auto_packages(monkeypatch):
+    _patch_startup_dependencies(monkeypatch)
+    _configure_storage(monkeypatch)
+    api_server.dataset_jobs.clear()
+
+    async def fake_prepare(*_args, **_kwargs):
+        return [
+            {
+                "id": "clone_0001.wav",
+                "url": "https://signed/item.wav",
+                "s3_url": "s3://bucket/datasets/book-1/items/char-1_clone_0001.wav",
+                "text": "hello there",
+                "is_reference": False,
+                "included": True,
+            }
+        ]
+
+    monkeypatch.setattr(api_server, "prepare_dataset_items", fake_prepare)
+
+    payload = _prepare_payload("job-prepare-auto")
+    payload["approval_mode"] = "auto"
+
+    with TestClient(api_server.app) as client:
+        response = client.post("/dataset/prepare", json=payload)
+        assert response.status_code == 200
+
+        for _ in range(20):
+            status_response = client.get("/dataset/status/job-prepare-auto")
+            if status_response.json()["status"] == "completed":
+                break
+            time.sleep(0.01)
+
+    body = status_response.json()
+    assert body["kind"] == "prepare"
+    assert body["phase"] == "awaiting_approval"
+    assert body["dataset_s3_key"] is None
+    assert body["dataset_s3_url"] is None
+
+
+def test_package_dataset_falls_back_when_no_reference_marked(monkeypatch):
+    _patch_startup_dependencies(monkeypatch)
+    _configure_storage(monkeypatch)
+
+    downloaded = []
+
+    async def fake_download(_storage, ref):
+        downloaded.append(ref)
+        return f"bytes-for:{ref}".encode("utf-8")
+
+    async def fake_upload(_storage, payload, key, **_kwargs):
+        assert payload
+        return f"https://bucket/{key}"
+
+    monkeypatch.setattr(dataset_jobs, "_download_bytes", fake_download)
+    monkeypatch.setattr(dataset_jobs, "_upload_bytes", fake_upload)
+
+    async def fake_exists(*_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr(dataset_jobs, "_object_exists", fake_exists)
+
+    package = asyncio.run(
+        dataset_jobs.package_dataset(
+            api_server.storage,
+            book_id="book-1",
+            character_id="char-1",
+            job_id="job-package-fallback",
+            dataset_items=[
+                {
+                    "id": "clip-1.wav",
+                    "s3_url": "s3://bucket/clip-1.wav",
+                    "text": "hello",
+                    "is_reference": False,
+                    "included": True,
+                },
+                {
+                    "id": "clip-2.wav",
+                    "s3_url": "s3://bucket/clip-2.wav",
+                    "text": "world",
+                    "is_reference": False,
+                    "included": True,
+                },
+            ],
+        )
+    )
+
+    assert package["dataset_s3_key"] == "datasets/book-1/dataset_char-1_job-package-fallback.zip"
+    assert downloaded == ["s3://bucket/clip-1.wav", "s3://bucket/clip-2.wav"]
 
 
 def test_get_dataset_status_404_for_missing_job(monkeypatch):

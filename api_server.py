@@ -14,6 +14,7 @@ import asyncio
 import base64
 import threading
 import torch
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 from functools import partial
@@ -179,6 +180,73 @@ def _startup_preload_snapshot() -> dict[str, Any]:
             "free_gb": stats.get("gpu_memory_free_gb"),
         },
     }
+
+
+GPU_COOLDOWN_SECONDS = int(os.getenv("GPU_COOLDOWN_SECONDS", "1200"))
+
+
+def _format_utc_ts(value: Optional[float]) -> Optional[str]:
+    if value is None:
+        return None
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(value))
+
+
+def _parse_utc_ts(value: Optional[str]) -> Optional[float]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def _gpu_scheduler_status() -> dict[str, Any]:
+    stats = dict(pipeline.inference.stats)
+    session_snapshot = session_mgr.scheduler_snapshot()
+    limiter = stats.get("inference_limiter", {})
+    limiter_waiting = sum((limiter.get("waiting") or {}).values())
+    running_operations = ops_log.get_running()
+
+    active_requests = int(stats.get("active_requests") or 0)
+    queued_session_items = int(session_snapshot.get("queued_session_items") or 0)
+    queued_requests = queued_session_items + limiter_waiting
+    is_idle = active_requests == 0 and queued_requests == 0
+
+    idle_started_at = stats.get("idle_started_at") if is_idle else None
+    idle_started_epoch = _parse_utc_ts(idle_started_at)
+    idle_seconds = None
+    cooldown_deadline_at = None
+    cooldown_remaining_seconds = None
+    cooldown_ready = False
+
+    if idle_started_epoch is not None:
+        now = time.time()
+        idle_seconds = round(max(now - idle_started_epoch, 0.0), 1)
+        cooldown_deadline_epoch = idle_started_epoch + GPU_COOLDOWN_SECONDS
+        cooldown_deadline_at = _format_utc_ts(cooldown_deadline_epoch)
+        cooldown_remaining_seconds = max(round(cooldown_deadline_epoch - now, 1), 0.0)
+        cooldown_ready = cooldown_remaining_seconds == 0.0
+
+    stats.update(
+        {
+            "active_sessions": session_snapshot["active_sessions"],
+            "total_sessions": session_snapshot["total_sessions"],
+            "active_workers": session_snapshot["active_workers"],
+            "queued_session_items": queued_session_items,
+            "limiter_waiting_requests": limiter_waiting,
+            "queued_requests": queued_requests,
+            "running_operations": len(running_operations),
+            "session_status_counts": session_snapshot["status_counts"],
+            "is_idle": is_idle,
+            "idle_started_at": idle_started_at,
+            "idle_seconds": idle_seconds,
+            "cooldown_seconds": GPU_COOLDOWN_SECONDS,
+            "cooldown_deadline_at": cooldown_deadline_at,
+            "cooldown_remaining_seconds": cooldown_remaining_seconds,
+            "cooldown_ready": cooldown_ready,
+        }
+    )
+    return stats
 
 
 async def _startup_preload_shared_models() -> None:
@@ -2161,19 +2229,6 @@ async def _run_dataset_prepare_job(job_id: str, req: DatasetPrepareRequest) -> N
             job["dataset_items"] = dataset_items
             job["phase"] = "awaiting_approval"
             job["status"] = "completed"
-
-            if req.approval_mode == "auto":
-                job["phase"] = "packaging"
-                packaged = await package_dataset(
-                    storage,
-                    book_id=req.book_id,
-                    character_id=req.character_id,
-                    job_id=job_id,
-                    dataset_items=dataset_items,
-                )
-                job["dataset_s3_key"] = packaged["dataset_s3_key"]
-                job["dataset_s3_url"] = packaged["dataset_s3_url"]
-                job["phase"] = "packaged"
         except Exception as exc:
             logger.exception("Dataset prepare job %s failed", job_id)
             job["status"] = "failed"
@@ -2619,8 +2674,8 @@ async def voice_design_batch(req: VoiceDesignBatchRequest):
 
 @app.get("/gpu/status", summary="GPU and model status")
 async def gpu_status():
-    """Get GPU memory usage, model load state, and idle timer info."""
-    return pipeline.inference.stats
+    """Get GPU memory usage, model load state, and scheduler-facing idle/cooldown info."""
+    return _gpu_scheduler_status()
 
 
 @app.post("/gpu/unload", summary="Manually unload model from GPU")
