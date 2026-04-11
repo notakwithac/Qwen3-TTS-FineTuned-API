@@ -8,7 +8,7 @@
 FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime
 
 # System dependencies required at runtime
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y --no-install-recommends && apt install -y nvidia-container-toolkit \
     ffmpeg libsndfile1 sox \
     && rm -rf /var/lib/apt/lists/*
 
