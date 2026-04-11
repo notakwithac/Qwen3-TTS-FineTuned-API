@@ -1,4 +1,5 @@
 import sys
+import threading
 import types
 from datetime import datetime, timezone
 
@@ -342,3 +343,25 @@ def test_lifespan_logs_preload_failure_and_continues_boot(monkeypatch):
     ]
     assert events[1]["extra"]["continue_boot"] is True
     assert events[1]["extra"]["error"] == "voice design preload failed"
+
+
+def test_gpu_status_is_available_while_startup_preload_runs(monkeypatch):
+    inference = StubInference()
+    allow_preload_finish = threading.Event()
+    preload_started = threading.Event()
+
+    monkeypatch.setattr(api_server, "pipeline", StubPipeline(inference))
+    _patch_startup_dependencies(monkeypatch)
+
+    async def slow_preload():
+        preload_started.set()
+        await api_server.asyncio.to_thread(allow_preload_finish.wait, 2.0)
+
+    monkeypatch.setattr(api_server, "_startup_preload_shared_models", slow_preload)
+
+    with TestClient(api_server.app) as client:
+        assert preload_started.wait(timeout=1.0) is True
+        response = client.get("/gpu/status")
+        assert response.status_code == 200
+        assert response.json()["startup_preload"]["in_progress"] is True
+        allow_preload_finish.set()

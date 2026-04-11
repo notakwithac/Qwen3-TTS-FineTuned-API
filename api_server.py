@@ -293,6 +293,37 @@ async def _startup_preload_shared_models() -> None:
                 },
             )
 
+
+def _set_startup_preload_state(
+    *,
+    in_progress: Optional[bool] = None,
+    last_error: Optional[str] = None,
+    completed_at: Optional[str] = None,
+) -> None:
+    if in_progress is not None:
+        app.state.startup_preload_in_progress = in_progress
+    if last_error is not None:
+        app.state.startup_preload_last_error = last_error
+    if completed_at is not None:
+        app.state.startup_preload_completed_at = completed_at
+
+
+async def _background_startup_preload_shared_models() -> None:
+    _set_startup_preload_state(in_progress=True, last_error="", completed_at=None)
+    try:
+        await _startup_preload_shared_models()
+    except Exception as exc:
+        logger.warning("Background startup preload crashed unexpectedly.", exc_info=True)
+        _set_startup_preload_state(last_error=str(exc))
+        raise
+    else:
+        _set_startup_preload_state(last_error="")
+    finally:
+        _set_startup_preload_state(
+            in_progress=False,
+            completed_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        )
+
 @asynccontextmanager
 async def _lifespan(app):
     # Startup: connect to broadcast
@@ -308,7 +339,7 @@ async def _lifespan(app):
     session_mgr.start_cleanup_loop()
     metrics_collector.start()
     _log_flash_attn_runtime_diagnostics()
-    await _startup_preload_shared_models()
+    app.state.startup_preload_task = asyncio.create_task(_background_startup_preload_shared_models())
     yield
     # Shutdown: disconnect broadcast
     await broadcast.disconnect()
@@ -316,6 +347,9 @@ async def _lifespan(app):
     sys.stdout = sys.__stdout__
     # Shutdown: stop metrics collector and wait for any in-progress S3 uploads
     metrics_collector.stop()
+    preload_task = getattr(app.state, "startup_preload_task", None)
+    if preload_task is not None:
+        await preload_task
     logger.info("Server shutting down — waiting for pending S3 uploads...")
     await asyncio.get_event_loop().run_in_executor(None, pipeline.shutdown)
     logger.info("Shutdown complete.")
@@ -2675,7 +2709,13 @@ async def voice_design_batch(req: VoiceDesignBatchRequest):
 @app.get("/gpu/status", summary="GPU and model status")
 async def gpu_status():
     """Get GPU memory usage, model load state, and scheduler-facing idle/cooldown info."""
-    return _gpu_scheduler_status()
+    status = _gpu_scheduler_status()
+    status["startup_preload"] = {
+        "in_progress": bool(getattr(app.state, "startup_preload_in_progress", False)),
+        "last_error": getattr(app.state, "startup_preload_last_error", ""),
+        "completed_at": getattr(app.state, "startup_preload_completed_at", None),
+    }
+    return status
 
 
 @app.post("/gpu/unload", summary="Manually unload model from GPU")

@@ -29,6 +29,33 @@ VOICE_DESIGN_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
 # Default Base model from HuggingFace
 VOICE_CLONE_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 
+_CUDA_BUSY_ERROR_PATTERNS = (
+    "busy or unavailable",
+    "device(s) is/are busy",
+    "devices are busy",
+    "device busy",
+    "cuda-capable device",
+)
+
+
+def _iter_exception_chain(exc: BaseException):
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def _is_retryable_cuda_busy_error(exc: BaseException) -> bool:
+    for candidate in _iter_exception_chain(exc):
+        message = str(candidate).lower()
+        if "cuda" not in message:
+            continue
+        if any(pattern in message for pattern in _CUDA_BUSY_ERROR_PATTERNS):
+            return True
+    return False
+
 
 class RuntimeAdjustableLimiter:
     """Thread-safe limiter whose capacity can be changed at runtime."""
@@ -515,8 +542,8 @@ class InferenceManager:
                                 break
                             raise e
                         raise e
-                except RuntimeError as re_err:
-                    if "busy or unavailable" in str(re_err) and attempt < max_retries - 1:
+                except Exception as load_err:
+                    if _is_retryable_cuda_busy_error(load_err) and attempt < max_retries - 1:
                         retry_context = self._build_runtime_diagnostics_locked(
                             cache_key=cache_key,
                             path=source_path,
@@ -527,7 +554,7 @@ class InferenceManager:
                             attempt=attempt_number,
                             max_retries=max_retries,
                             stage="retry_after_cuda_busy",
-                            error=str(re_err),
+                            error=str(load_err),
                         )
                         ops_log.log_event(
                             "model_load_retry",
@@ -541,7 +568,7 @@ class InferenceManager:
                         time.sleep(retry_delay)
                         retry_delay *= 2
                     else:
-                        raise re_err
+                        raise load_err
 
             if self._compile:
                 with ops_log.operation("model_compile", extra={"path": source_path, "cache_key": cache_key}):

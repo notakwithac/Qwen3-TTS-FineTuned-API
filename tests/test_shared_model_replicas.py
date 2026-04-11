@@ -296,6 +296,49 @@ def test_load_model_into_cache_logs_failure_context(monkeypatch):
     assert "gpu_memory" in extra
 
 
+def test_load_model_into_cache_retries_on_wrapped_cuda_busy_error(monkeypatch):
+    manager = InferenceManager(device="cpu")
+    attempts = []
+    retry_events = []
+
+    class _StubQwen3TTSModel:
+        @staticmethod
+        def from_pretrained(*_args, **_kwargs):
+            attempts.append(len(attempts) + 1)
+            if len(attempts) == 1:
+                try:
+                    raise RuntimeError("CUDA error: all CUDA-capable devices are busy")
+                except RuntimeError as inner:
+                    raise ValueError("processor load failed while model init was in progress") from inner
+            return types.SimpleNamespace(model=object())
+
+    stub_module = types.ModuleType("qwen_tts")
+    stub_module.Qwen3TTSModel = _StubQwen3TTSModel
+
+    monkeypatch.setitem(sys.modules, "qwen_tts", stub_module)
+    monkeypatch.setattr(inference_manager.time, "sleep", lambda *_args, **_kwargs: None)
+
+    def _capture_event(event_name, job_id=None, extra=None, level=logging.INFO):
+        if event_name == "model_load_retry":
+            retry_events.append((extra, level))
+
+    monkeypatch.setattr(inference_manager.ops_log, "log_event", _capture_event)
+
+    model = manager._load_model_into_cache(
+        cache_key=f"{VOICE_DESIGN_MODEL}::replica-0",
+        source_path=VOICE_DESIGN_MODEL,
+        model_type="voice_design",
+    )
+
+    assert model is manager._models[f"{VOICE_DESIGN_MODEL}::replica-0"][0]
+    assert len(attempts) == 2
+    assert retry_events
+    extra, level = retry_events[-1]
+    assert level == logging.WARNING
+    assert extra["stage"] == "retry_after_cuda_busy"
+    assert "processor load failed" in extra["error"]
+
+
 def test_stats_report_true_idle_window_from_request_lifecycle():
     manager = InferenceManager(device="cpu", idle_timeout_seconds=600)
 
