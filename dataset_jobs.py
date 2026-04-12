@@ -378,7 +378,7 @@ def _validate_and_crop_audio_sync(
         compute_type = "float16" if device == "cuda" else "int8"
         hf_token = os.environ.get("HF_TOKEN")
         skip_validation = _env_flag("SKIP_WHISPER_VALIDATION")
-        model_name = (os.environ.get("DATASET_WHISPER_MODEL", "large-v3") or "large-v3").strip()
+        model_name = (os.environ.get("DATASET_WHISPER_MODEL", "turbo") or "turbo").strip()
 
         try:
             model = _get_whisper_model(model_name, device=device, compute_type=compute_type)

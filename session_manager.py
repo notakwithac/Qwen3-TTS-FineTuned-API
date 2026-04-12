@@ -32,6 +32,7 @@ DEFAULT_MAX_REPLICAS = 4          # Max replicas of one model
 DEFAULT_SESSION_TIMEOUT = 3600    # Auto-cleanup after 1h idle
 MODEL_VRAM_GB = 5.5               # Measured per-model VRAM (bf16 weights + compiled overhead)
 DEFAULT_BATCH_TEXT_BUDGET = int(os.environ.get("SESSION_BATCH_MAX_CHARS", "4000"))
+DEFAULT_BATCH_PADDED_TEXT_BUDGET = int(os.environ.get("SESSION_BATCH_MAX_PADDED_CHARS", "0"))
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +124,7 @@ class CharacterWorker:
         batch_size: int = 32,
         batch_timeout_ms: int = 100,
         batch_text_budget: int = DEFAULT_BATCH_TEXT_BUDGET,
+        batch_padded_text_budget: int = DEFAULT_BATCH_PADDED_TEXT_BUDGET,
         storage=None,
         progress: Optional[CharacterProgress] = None,
     ):
@@ -135,6 +137,7 @@ class CharacterWorker:
         self.batch_size = batch_size
         self.batch_timeout = batch_timeout_ms / 1000.0
         self.batch_text_budget = max(0, int(batch_text_budget or 0))
+        self.batch_padded_text_budget = max(0, int(batch_padded_text_budget or 0))
         self.storage = storage
         self.progress = progress or CharacterProgress()
         self._task: Optional[asyncio.Task] = None
@@ -143,23 +146,38 @@ class CharacterWorker:
 
     @staticmethod
     def _message_text_cost(msg: InferenceMessage) -> int:
-        return max(1, len((msg.text or "").strip()))
+        return max(
+            1,
+            len((msg.text or "").strip()) + len((msg.instruct or "").strip()),
+        )
+
+    @staticmethod
+    def _estimate_padded_batch_cost(batch_size: int, batch_max_text_cost: int) -> int:
+        if batch_size <= 0 or batch_max_text_cost <= 0:
+            return 0
+        return batch_size * batch_max_text_cost
 
     def _should_defer_message(
         self,
         batch: List[InferenceMessage],
         batch_text_cost: int,
+        batch_max_text_cost: int,
         msg: InferenceMessage,
     ) -> bool:
         if len(batch) >= self.batch_size:
             return True
-        if self.batch_text_budget <= 0:
-            return False
         msg_cost = self._message_text_cost(msg)
         # Always allow the first item in a batch, even if it exceeds the budget.
         if not batch:
             return False
-        return (batch_text_cost + msg_cost) > self.batch_text_budget
+        if self.batch_text_budget > 0 and (batch_text_cost + msg_cost) > self.batch_text_budget:
+            return True
+        if self.batch_padded_text_budget > 0:
+            next_max_text_cost = max(batch_max_text_cost, msg_cost)
+            next_padded_cost = self._estimate_padded_batch_cost(len(batch) + 1, next_max_text_cost)
+            if next_padded_cost > self.batch_padded_text_budget:
+                return True
+        return False
 
     def start(self):
         """Start the worker coroutine."""
@@ -207,6 +225,7 @@ class CharacterWorker:
         while self._running:
             batch: List[InferenceMessage] = []
             batch_text_cost = 0
+            batch_max_text_cost = 0
 
             try:
                 # 1. Block until at least one item is available
@@ -217,6 +236,7 @@ class CharacterWorker:
                     msg = await asyncio.wait_for(self.queue.get(), timeout=5.0)
                 batch.append(msg)
                 batch_text_cost = self._message_text_cost(msg)
+                batch_max_text_cost = batch_text_cost
             except asyncio.TimeoutError:
                 continue  # No work, loop back
             except asyncio.CancelledError:
@@ -235,11 +255,13 @@ class CharacterWorker:
                             break
                         try:
                             msg = await asyncio.wait_for(self.queue.get(), timeout=remaining)
-                            if self._should_defer_message(batch, batch_text_cost, msg):
+                            if self._should_defer_message(batch, batch_text_cost, batch_max_text_cost, msg):
                                 carryover_msg = msg
                                 break
                             batch.append(msg)
-                            batch_text_cost += self._message_text_cost(msg)
+                            msg_cost = self._message_text_cost(msg)
+                            batch_text_cost += msg_cost
+                            batch_max_text_cost = max(batch_max_text_cost, msg_cost)
                         except asyncio.TimeoutError:
                             break
                         except asyncio.CancelledError:
@@ -249,10 +271,12 @@ class CharacterWorker:
                         await self._process_batch(batch, loop)
                         batch.clear()
                         batch_text_cost = 0
+                        batch_max_text_cost = 0
 
                     if carryover_msg is not None:
                         batch.append(carryover_msg)
                         batch_text_cost = self._message_text_cost(carryover_msg)
+                        batch_max_text_cost = batch_text_cost
                         carryover_msg = None
                         continue
 
@@ -263,6 +287,7 @@ class CharacterWorker:
                         msg = await asyncio.wait_for(self.queue.get(), timeout=0.25)
                         batch.append(msg)
                         batch_text_cost = self._message_text_cost(msg)
+                        batch_max_text_cost = batch_text_cost
                     except (asyncio.TimeoutError, asyncio.CancelledError):
                         break  # Queue is empty, yield the semaphore slot
 
@@ -280,6 +305,11 @@ class CharacterWorker:
                 "worker_id": self.worker_id,
                 "batch_size": len(batch),
                 "batch_text_chars": sum(self._message_text_cost(msg) for msg in batch),
+                "batch_max_text_chars": max(self._message_text_cost(msg) for msg in batch),
+                "batch_padded_text_chars": self._estimate_padded_batch_cost(
+                    len(batch),
+                    max(self._message_text_cost(msg) for msg in batch),
+                ),
                 "cache_key": self.cache_key,
             })
 
@@ -481,6 +511,7 @@ class SessionManager:
         session_timeout: int = DEFAULT_SESSION_TIMEOUT,
         batch_size: int = 32,
         batch_text_budget: int = DEFAULT_BATCH_TEXT_BUDGET,
+        batch_padded_text_budget: int = DEFAULT_BATCH_PADDED_TEXT_BUDGET,
     ):
         self.inference = inference_manager
         self.pipeline = pipeline
@@ -490,6 +521,7 @@ class SessionManager:
         self.session_timeout = session_timeout
         self.batch_size = batch_size
         self.batch_text_budget = max(0, int(batch_text_budget or 0))
+        self.batch_padded_text_budget = max(0, int(batch_padded_text_budget or 0))
         self.sessions: Dict[str, Session] = {}
 
         # Limit active workers to max_models to prevent cache thrashing
@@ -714,6 +746,7 @@ class SessionManager:
                     batch_size=self.batch_size,
                     batch_timeout_ms=100,
                     batch_text_budget=self.batch_text_budget,
+                    batch_padded_text_budget=self.batch_padded_text_budget,
                     storage=self.storage,
                     progress=progress,
                 )

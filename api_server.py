@@ -486,6 +486,15 @@ GPU_MAX_CONCURRENCY = int(os.environ.get("GPU_MAX_CONCURRENCY", "16"))
 GPU_MAX_MODELS = int(os.environ.get("GPU_MAX_MODELS", str(_default_gpu_max_models())))
 GPU_BATCH_SIZE = int(os.environ.get("GPU_BATCH_SIZE", "32"))
 SESSION_BATCH_MAX_CHARS = int(os.environ.get("SESSION_BATCH_MAX_CHARS", "4000"))
+CUSTOM_VOICE_SESSION_BATCH_SIZE = int(
+    os.environ.get("CUSTOM_VOICE_SESSION_BATCH_SIZE", str(max(1, GPU_BATCH_SIZE // 2)))
+)
+CUSTOM_VOICE_SESSION_BATCH_PADDED_CHARS = int(
+    os.environ.get(
+        "CUSTOM_VOICE_SESSION_BATCH_PADDED_CHARS",
+        str(max(1, SESSION_BATCH_MAX_CHARS // 2)),
+    )
+)
 USE_TORCH_COMPILE = os.environ.get("USE_TORCH_COMPILE", "1") == "1"
 
 # Resource Isolation
@@ -515,6 +524,10 @@ logger.info(f"  - GPU_MAX_CONCURRENCY: {GPU_MAX_CONCURRENCY}")
 logger.info(f"  - GPU_MAX_MODELS: {GPU_MAX_MODELS}")
 logger.info(f"  - GPU_BATCH_SIZE: {GPU_BATCH_SIZE}")
 logger.info(f"  - SESSION_BATCH_MAX_CHARS: {SESSION_BATCH_MAX_CHARS}")
+logger.info(f"  - CUSTOM_VOICE_SESSION_BATCH_SIZE: {CUSTOM_VOICE_SESSION_BATCH_SIZE}")
+logger.info(
+    f"  - CUSTOM_VOICE_SESSION_BATCH_PADDED_CHARS: {CUSTOM_VOICE_SESSION_BATCH_PADDED_CHARS}"
+)
 logger.info(f"  - USE_TORCH_COMPILE: {USE_TORCH_COMPILE}")
 logger.info(f"  - REPLICA_THRESHOLD: {REPLICA_THRESHOLD}")
 logger.info(f"  - MAX_CONCURRENT_VOICE_DESIGNS: {MAX_CONCURRENT_VOICE_DESIGNS}")
@@ -551,8 +564,9 @@ session_mgr = SessionManager(
     replica_threshold=REPLICA_THRESHOLD,
     max_replicas=MAX_REPLICAS_PER_MODEL,
     session_timeout=SESSION_TIMEOUT,
-    batch_size=GPU_BATCH_SIZE,
+    batch_size=CUSTOM_VOICE_SESSION_BATCH_SIZE,
     batch_text_budget=SESSION_BATCH_MAX_CHARS,
+    batch_padded_text_budget=CUSTOM_VOICE_SESSION_BATCH_PADDED_CHARS,
 )
 
 # ---------------------------------------------------------------------------

@@ -59,6 +59,42 @@ async def test_worker_groups_messages_until_text_budget_is_reached():
 
 
 @pytest.mark.asyncio
+async def test_worker_splits_when_padded_batch_cost_exceeds_budget():
+    queue = asyncio.Queue()
+    worker = CharacterWorker(
+        worker_id="worker-pad",
+        queue=queue,
+        inference_manager=_StubInferenceManager(),
+        worker_semaphore=asyncio.Semaphore(1),
+        cache_key="checkpoint",
+        speaker_name="Narrator",
+        batch_size=10,
+        batch_timeout_ms=1,
+        batch_text_budget=100,
+        batch_padded_text_budget=12,
+        progress=CharacterProgress(),
+    )
+
+    seen_batches: list[list[str]] = []
+
+    async def _capture(batch, _loop):
+        seen_batches.append([msg.text for msg in batch])
+        if len(seen_batches) >= 2:
+            worker._running = False
+
+    worker._process_batch = _capture  # type: ignore[method-assign]
+
+    await queue.put(_msg("aaaaaa"))
+    await queue.put(_msg("bb"))
+    await queue.put(_msg("cc"))
+
+    worker.start()
+    await asyncio.wait_for(worker._task, timeout=1.0)
+
+    assert seen_batches == [["aaaaaa", "bb"], ["cc"]]
+
+
+@pytest.mark.asyncio
 async def test_worker_allows_single_oversized_dialogue_as_its_own_batch():
     queue = asyncio.Queue()
     worker = CharacterWorker(
@@ -71,6 +107,7 @@ async def test_worker_allows_single_oversized_dialogue_as_its_own_batch():
         batch_size=10,
         batch_timeout_ms=1,
         batch_text_budget=10,
+        batch_padded_text_budget=10,
         progress=CharacterProgress(),
     )
 
