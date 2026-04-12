@@ -165,6 +165,7 @@ class InferenceManager:
         gpu_controller: Any = None,
         shared_model_replicas: Optional[Dict[str, int]] = None,
         shared_model_min_headroom_gb: float = 4.0,
+        custom_voice_max_new_tokens: Optional[int] = None,
     ):
         self._device = device
         self._attn_impl = "flash_attention_2" if use_flash_attn else "eager"
@@ -194,6 +195,11 @@ class InferenceManager:
                 self._shared_model_replicas[model_type] = max(1, int(count))
         self._shared_model_min_headroom_gb = float(shared_model_min_headroom_gb)
         self._estimated_model_vram_gb = 5.5
+        self._custom_voice_max_new_tokens = (
+            max(1, int(custom_voice_max_new_tokens))
+            if custom_voice_max_new_tokens is not None
+            else None
+        )
 
         # Session pinning: models pinned by active sessions won't be LRU evicted
         # Dict[cache_key, set[session_id]]
@@ -877,12 +883,18 @@ class InferenceManager:
         speaker_name: str,
         languages: list[str] = None,
         instructs: list[str] = None,
+        max_new_tokens: Optional[int] = None,
     ) -> tuple[list[bytes], int]:
         """Generate speech for multiple texts using CustomVoice model."""
         if not languages:
             languages = ["English"] * len(texts)
         if not instructs:
             instructs = [""] * len(texts)
+        effective_max_new_tokens = (
+            max_new_tokens
+            if max_new_tokens is not None
+            else self._custom_voice_max_new_tokens
+        )
 
         # Acquire semaphore FIRST to limit concurrent model usage to max_models
         with ops_log.operation("gpu_resource_wait", extra={"checkpoint": checkpoint_path}):
@@ -894,23 +906,32 @@ class InferenceManager:
                 model, spk = self._get_model(checkpoint_path, "custom_voice", speaker_name)
                 self._mark_in_use(checkpoint_path)
                 self._total_requests += len(texts)
+            model_lock = self._get_execution_lock(checkpoint_path)
 
             try:
                 with self._track_active():
                     op = ops_log.start("inference_custom_voice_batch", extra={
                         "batch_size": len(texts),
                         "speaker": spk,
+                        "max_new_tokens": effective_max_new_tokens,
                     })
-                    logger.info(f"Speaker '{spk}' started saying {len(texts)} texts.")
+                    logger.info(
+                        "Speaker '%s' started saying %s texts (max_new_tokens=%s).",
+                        spk,
+                        len(texts),
+                        effective_max_new_tokens,
+                    )
                     try:
                         speakers = [self._normalize_speaker_name(spk) if spk else spk] * len(texts)
 
-                        wavs_list, sr = model.generate_custom_voice(
-                            text=texts,
-                            language=languages,
-                            speaker=speakers,
-                            instruct=instructs,
-                        )
+                        with model_lock:
+                            wavs_list, sr = model.generate_custom_voice(
+                                text=texts,
+                                language=languages,
+                                speaker=speakers,
+                                instruct=instructs,
+                                max_new_tokens=effective_max_new_tokens,
+                            )
 
                         # Encode WAVs in parallel on CPU threads (frees GPU thread)
                         results = list(self._wav_pool.map(
@@ -937,8 +958,14 @@ class InferenceManager:
         speaker_name: str,
         language: str = "English",
         instruct: str = "",
+        max_new_tokens: Optional[int] = None,
     ) -> tuple[bytes, int]:
         """Generate speech using CustomVoice model. Auto-loads if not in cache."""
+        effective_max_new_tokens = (
+            max_new_tokens
+            if max_new_tokens is not None
+            else self._custom_voice_max_new_tokens
+        )
         with ops_log.operation("gpu_resource_wait", extra={"checkpoint": checkpoint_path}):
             if self._gpu_controller:
                 self._gpu_controller.begin_inference("inference_custom_voice")
@@ -948,6 +975,7 @@ class InferenceManager:
                 model, spk = self._get_model(checkpoint_path, "custom_voice", speaker_name)
                 self._mark_in_use(checkpoint_path)
                 self._total_requests += 1
+            model_lock = self._get_execution_lock(checkpoint_path)
 
             try:
                 with self._track_active():
@@ -955,15 +983,23 @@ class InferenceManager:
                         "text_length": len(text),
                         "language": language,
                         "speaker": spk,
+                        "max_new_tokens": effective_max_new_tokens,
                     })
-                    logger.info(f"Speaker '{spk}' started saying text: '{text[:50]}...'")
+                    logger.info(
+                        "Speaker '%s' started saying text: '%s...' (max_new_tokens=%s)",
+                        spk,
+                        text[:50],
+                        effective_max_new_tokens,
+                    )
                     try:
-                        wavs, sr = model.generate_custom_voice(
-                            text=text,
-                            language=language,
-                            speaker=self._normalize_speaker_name(spk) if spk else spk,
-                            instruct=instruct if instruct else None,
-                        )
+                        with model_lock:
+                            wavs, sr = model.generate_custom_voice(
+                                text=text,
+                                language=language,
+                                speaker=self._normalize_speaker_name(spk) if spk else spk,
+                                instruct=instruct if instruct else None,
+                                max_new_tokens=effective_max_new_tokens,
+                            )
 
                         result = self._encode_wav(wavs[0], sr)
                         ops_log.end(op, extra={"audio_bytes": len(result), "sample_rate": sr})

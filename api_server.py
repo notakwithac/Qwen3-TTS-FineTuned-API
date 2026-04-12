@@ -495,6 +495,7 @@ CUSTOM_VOICE_SESSION_BATCH_PADDED_CHARS = int(
         str(max(1, SESSION_BATCH_MAX_CHARS // 2)),
     )
 )
+CUSTOM_VOICE_MAX_NEW_TOKENS = int(os.environ.get("CUSTOM_VOICE_MAX_NEW_TOKENS", "2048"))
 USE_TORCH_COMPILE = os.environ.get("USE_TORCH_COMPILE", "1") == "1"
 
 # Resource Isolation
@@ -528,6 +529,7 @@ logger.info(f"  - CUSTOM_VOICE_SESSION_BATCH_SIZE: {CUSTOM_VOICE_SESSION_BATCH_S
 logger.info(
     f"  - CUSTOM_VOICE_SESSION_BATCH_PADDED_CHARS: {CUSTOM_VOICE_SESSION_BATCH_PADDED_CHARS}"
 )
+logger.info(f"  - CUSTOM_VOICE_MAX_NEW_TOKENS: {CUSTOM_VOICE_MAX_NEW_TOKENS}")
 logger.info(f"  - USE_TORCH_COMPILE: {USE_TORCH_COMPILE}")
 logger.info(f"  - REPLICA_THRESHOLD: {REPLICA_THRESHOLD}")
 logger.info(f"  - MAX_CONCURRENT_VOICE_DESIGNS: {MAX_CONCURRENT_VOICE_DESIGNS}")
@@ -554,6 +556,7 @@ pipeline = Pipeline(
         "voice_clone": VOICE_CLONE_REPLICAS,
     },
     shared_model_min_headroom_gb=SHARED_MODEL_MIN_HEADROOM_GB,
+    custom_voice_max_new_tokens=CUSTOM_VOICE_MAX_NEW_TOKENS,
 )
 
 # Session-based inference manager

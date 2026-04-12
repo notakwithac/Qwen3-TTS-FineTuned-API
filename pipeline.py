@@ -199,6 +199,7 @@ class Pipeline:
         gpu_controller: Any = None,
         shared_model_replicas: Optional[Dict[str, int]] = None,
         shared_model_min_headroom_gb: float = 4.0,
+        custom_voice_max_new_tokens: Optional[int] = None,
     ):
         self.base_dir = Path(base_dir)
         self.jobs_dir = self.base_dir / jobs_dir
@@ -221,6 +222,7 @@ class Pipeline:
             gpu_controller=gpu_controller,
             shared_model_replicas=shared_model_replicas,
             shared_model_min_headroom_gb=shared_model_min_headroom_gb,
+            custom_voice_max_new_tokens=custom_voice_max_new_tokens,
         )
         self._restore_locks: Dict[str, threading.Lock] = {}
 
