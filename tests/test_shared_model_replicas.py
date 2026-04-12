@@ -6,7 +6,7 @@ import time
 import types
 
 import pytest
-from inference_manager import InferenceManager, VOICE_DESIGN_MODEL
+from inference_manager import InferenceManager, VOICE_CLONE_MODEL, VOICE_DESIGN_MODEL
 
 
 def test_shared_replica_keys_are_distinct():
@@ -83,6 +83,62 @@ def test_runtime_shared_replica_update_changes_targets():
         f"{VOICE_DESIGN_MODEL}::replica-1",
         f"{VOICE_DESIGN_MODEL}::replica-2",
     ]
+
+
+def test_load_voice_clone_preloads_replica_zero_for_shared_reuse(monkeypatch):
+    manager = InferenceManager(device="cpu")
+    loads = []
+
+    class _StubQwen3TTSModel:
+        @staticmethod
+        def from_pretrained(*args, **kwargs):
+            loads.append((args, kwargs))
+            return types.SimpleNamespace(model=object())
+
+    stub_module = types.ModuleType("qwen_tts")
+    stub_module.Qwen3TTSModel = _StubQwen3TTSModel
+
+    monkeypatch.setitem(sys.modules, "qwen_tts", stub_module)
+    monkeypatch.setattr(inference_manager.ops_log, "log_event", lambda *args, **kwargs: None)
+
+    manager.load_voice_clone()
+
+    replica_key = f"{VOICE_CLONE_MODEL}::replica-0"
+    assert manager.loaded_paths == [replica_key]
+
+    selected = manager._acquire_shared_replica(VOICE_CLONE_MODEL, "voice_clone")
+    assert selected == replica_key
+
+    model, _speaker = manager._get_model_by_cache_key(selected, VOICE_CLONE_MODEL, "voice_clone")
+    assert model is manager._models[replica_key][0]
+    assert len(loads) == 1
+
+
+def test_load_voice_clone_relabels_existing_plain_cache_key_without_reloading():
+    manager = InferenceManager(device="cpu")
+    existing_model = object()
+    plain_key = VOICE_CLONE_MODEL
+    replica_key = f"{VOICE_CLONE_MODEL}::replica-0"
+    existing_lock = threading.Lock()
+
+    manager._models[plain_key] = (existing_model, "voice_clone", None)
+    manager._models_in_use[plain_key] = 2
+    manager._execution_locks[plain_key] = existing_lock
+    manager._shared_replica_loads[plain_key] = 1
+    manager._session_pins[plain_key] = {"session-1"}
+    manager._last_path = plain_key
+    manager._last_type = "voice_clone"
+
+    manager.load_voice_clone()
+
+    assert plain_key not in manager._models
+    assert manager.loaded_paths == [replica_key]
+    assert manager._models[replica_key][0] is existing_model
+    assert manager._models_in_use[replica_key] == 2
+    assert manager._execution_locks[replica_key] is existing_lock
+    assert manager._shared_replica_loads[replica_key] == 1
+    assert manager._session_pins[replica_key] == {"session-1"}
+    assert manager._last_path == replica_key
 
 
 def test_shared_replica_headroom_uses_driver_free_memory(monkeypatch):

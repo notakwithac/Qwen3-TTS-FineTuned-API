@@ -669,6 +669,27 @@ class InferenceManager:
     def _build_shared_replica_key(self, source_path: str, replica_index: int) -> str:
         return f"{source_path}::replica-{replica_index}"
 
+    def _move_cache_entry_locked(self, old_key: str, new_key: str) -> bool:
+        """Rename a cached model entry without reloading the weights."""
+        if old_key == new_key or old_key not in self._models or new_key in self._models:
+            return False
+
+        model_tuple = self._models.pop(old_key)
+        self._models[new_key] = model_tuple
+
+        if old_key in self._models_in_use:
+            self._models_in_use[new_key] = self._models_in_use.pop(old_key)
+        if old_key in self._execution_locks:
+            self._execution_locks[new_key] = self._execution_locks.pop(old_key)
+        if old_key in self._shared_replica_loads:
+            self._shared_replica_loads[new_key] = self._shared_replica_loads.pop(old_key)
+        if old_key in self._session_pins:
+            self._session_pins[new_key] = self._session_pins.pop(old_key)
+        if self._last_path == old_key:
+            self._last_path = new_key
+
+        return True
+
     def _shared_replica_keys(self, source_path: str, model_type: str) -> list[str]:
         replica_count = max(1, int(self._shared_model_replicas.get(model_type, 1)))
         return [self._build_shared_replica_key(source_path, idx) for idx in range(replica_count)]
@@ -740,18 +761,46 @@ class InferenceManager:
     def load_voice_design(self, model_path: str = VOICE_DESIGN_MODEL):
         """Load the VoiceDesign model."""
         with self._lock:
-            if self._last_type == "voice_design" and self._last_path == model_path:
+            replica_key = self._build_shared_replica_key(model_path, 0)
+            if replica_key in self._models:
+                self._models.move_to_end(replica_key)
+                self._last_path = replica_key
+                self._last_type = "voice_design"
+                self._last_speaker = None
                 self._touch()
-                return  # Already loaded
-            self._load_model(model_path, "voice_design")
+                return
+            if self._move_cache_entry_locked(model_path, replica_key):
+                self._last_type = "voice_design"
+                self._last_speaker = None
+                self._touch()
+                return
+            self._load_model_into_cache(
+                cache_key=replica_key,
+                source_path=model_path,
+                model_type="voice_design",
+            )
 
     def load_voice_clone(self, model_path: str = VOICE_CLONE_MODEL):
         """Load the Base model for zero-shot voice cloning."""
         with self._lock:
-            if self._last_type == "voice_clone" and self._last_path == model_path:
+            replica_key = self._build_shared_replica_key(model_path, 0)
+            if replica_key in self._models:
+                self._models.move_to_end(replica_key)
+                self._last_path = replica_key
+                self._last_type = "voice_clone"
+                self._last_speaker = None
                 self._touch()
-                return  # Already loaded
-            self._load_model(model_path, "voice_clone")
+                return
+            if self._move_cache_entry_locked(model_path, replica_key):
+                self._last_type = "voice_clone"
+                self._last_speaker = None
+                self._touch()
+                return
+            self._load_model_into_cache(
+                cache_key=replica_key,
+                source_path=model_path,
+                model_type="voice_clone",
+            )
 
     def _unload_all_unsafe(self):
         count = len(self._models)

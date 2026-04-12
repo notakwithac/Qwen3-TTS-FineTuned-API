@@ -39,6 +39,52 @@ except Exception:
     SummaryWriter = None
 
 target_speaker_embedding = None
+
+
+def _ensure_local_model_path(model_path: str) -> str:
+    if os.path.exists(model_path):
+        return model_path
+
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(model_path)
+
+
+def _copy_checkpoint_assets(
+    source_model_path: str,
+    output_dir: str,
+    speaker_name: str,
+    fallback_model_path: str = "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+) -> str:
+    os.makedirs(output_dir, exist_ok=True)
+
+    source_config_path = _ensure_local_model_path(source_model_path)
+    if not os.path.exists(os.path.join(source_config_path, "speech_tokenizer")):
+        source_config_path = _ensure_local_model_path(fallback_model_path)
+
+    for item in os.listdir(source_config_path):
+        s = os.path.join(source_config_path, item)
+        d = os.path.join(output_dir, item)
+        if os.path.isfile(s) and not item.endswith((".safetensors", ".bin", ".pt", ".ckpt")):
+            shutil.copy2(s, d)
+        elif os.path.isdir(s):
+            shutil.copytree(s, d, dirs_exist_ok=True)
+
+    input_config_file = os.path.join(source_config_path, "config.json")
+    output_config_file = os.path.join(output_dir, "config.json")
+    with open(input_config_file, "r", encoding="utf-8") as f:
+        config_dict = json.load(f)
+    config_dict["tts_model_type"] = "custom_voice"
+    talker_config = config_dict.get("talker_config", {})
+    talker_config["spk_id"] = {speaker_name: 3000}
+    talker_config["spk_is_dialect"] = {speaker_name: False}
+    config_dict["talker_config"] = talker_config
+    with open(output_config_file, "w", encoding="utf-8") as f:
+        json.dump(config_dict, f, indent=2, ensure_ascii=False)
+
+    return source_config_path
+
+
 def train():
     global target_speaker_embedding
 
@@ -283,31 +329,11 @@ def train():
 
     def _save_checkpoint(epoch_idx: int):
         output_dir = os.path.join(args.output_model_path, f"checkpoint-epoch-{epoch_idx}")
-        # Only copy essential config/tokenizer files, NOT the massive weights
-        os.makedirs(output_dir, exist_ok=True)
-        for item in os.listdir(MODEL_PATH):
-            s = os.path.join(MODEL_PATH, item)
-            d = os.path.join(output_dir, item)
-            # Skip weight files (.safetensors, .bin, .pt, .ckpt) to save space
-            if os.path.isfile(s) and not item.endswith(('.safetensors', '.bin', '.pt', '.ckpt')):
-                shutil.copy2(s, d)
-
-        input_config_file = os.path.join(MODEL_PATH, "config.json")
-        output_config_file = os.path.join(output_dir, "config.json")
-        with open(input_config_file, 'r', encoding='utf-8') as f:
-            config_dict = json.load(f)
-        config_dict["tts_model_type"] = "custom_voice"
-        talker_config = config_dict.get("talker_config", {})
-        talker_config["spk_id"] = {
-            args.speaker_name: 3000
-        }
-        talker_config["spk_is_dialect"] = {
-            args.speaker_name: False
-        }
-        config_dict["talker_config"] = talker_config
-
-        with open(output_config_file, 'w', encoding='utf-8') as f:
-            json.dump(config_dict, f, indent=2, ensure_ascii=False)
+        _copy_checkpoint_assets(
+            source_model_path=MODEL_PATH,
+            output_dir=output_dir,
+            speaker_name=args.speaker_name,
+        )
 
         unwrapped_model = accelerator.unwrap_model(model)
         state_dict = {k: v.detach().to("cpu") for k, v in unwrapped_model.state_dict().items()}
@@ -598,33 +624,11 @@ def train_programmatic(
 
     def _save_ckpt(epoch_idx):
         output_dir = os.path.join(args.output_model_path, f"checkpoint-epoch-{epoch_idx}")
-        # Only copy essential config/tokenizer files, NOT the massive weights
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Fallback to copy configuration from the base model if the source is an older incomplete checkpoint
-        source_config_path = MODEL_PATH
-        if not os.path.exists(os.path.join(source_config_path, "speech_tokenizer")):
-            source_config_path = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
-
-        for item in os.listdir(source_config_path):
-            s = os.path.join(source_config_path, item)
-            d = os.path.join(output_dir, item)
-            if os.path.isfile(s) and not item.endswith(('.safetensors', '.bin', '.pt', '.ckpt')):
-                shutil.copy2(s, d)
-            elif os.path.isdir(s):
-                shutil.copytree(s, d, dirs_exist_ok=True)
-                
-        input_config_file = os.path.join(source_config_path, "config.json")
-        output_config_file = os.path.join(output_dir, "config.json")
-        with open(input_config_file, 'r', encoding='utf-8') as f:
-            config_dict = json.load(f)
-        config_dict["tts_model_type"] = "custom_voice"
-        talker_config = config_dict.get("talker_config", {})
-        talker_config["spk_id"] = {args.speaker_name: 3000}
-        talker_config["spk_is_dialect"] = {args.speaker_name: False}
-        config_dict["talker_config"] = talker_config
-        with open(output_config_file, 'w', encoding='utf-8') as f:
-            json.dump(config_dict, f, indent=2, ensure_ascii=False)
+        _copy_checkpoint_assets(
+            source_model_path=MODEL_PATH,
+            output_dir=output_dir,
+            speaker_name=args.speaker_name,
+        )
 
         unwrapped_model = accelerator.unwrap_model(model)
         state_dict = {k: v.detach().to("cpu") for k, v in unwrapped_model.state_dict().items()}
