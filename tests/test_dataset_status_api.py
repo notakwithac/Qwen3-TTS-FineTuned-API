@@ -1,7 +1,10 @@
 import asyncio
+import io
+import json
 import sys
 import time
 import types
+import zipfile
 
 from fastapi.testclient import TestClient
 
@@ -259,11 +262,12 @@ def test_prepare_job_no_longer_auto_packages(monkeypatch):
     assert body["dataset_s3_url"] is None
 
 
-def test_package_dataset_falls_back_when_no_reference_marked(monkeypatch):
+def test_package_dataset_uses_reference_item_without_training_on_it(monkeypatch):
     _patch_startup_dependencies(monkeypatch)
     _configure_storage(monkeypatch)
 
     downloaded = []
+    uploaded_payloads = []
 
     async def fake_download(_storage, ref):
         downloaded.append(ref)
@@ -271,6 +275,7 @@ def test_package_dataset_falls_back_when_no_reference_marked(monkeypatch):
 
     async def fake_upload(_storage, payload, key, **_kwargs):
         assert payload
+        uploaded_payloads.append((key, payload))
         return f"https://bucket/{key}"
 
     monkeypatch.setattr(dataset_jobs, "_download_bytes", fake_download)
@@ -286,8 +291,15 @@ def test_package_dataset_falls_back_when_no_reference_marked(monkeypatch):
             api_server.storage,
             book_id="book-1",
             character_id="char-1",
-            job_id="job-package-fallback",
+            job_id="job-package-ref",
             dataset_items=[
+                {
+                    "id": "ref_audio.wav",
+                    "s3_url": "s3://bucket/ref.wav",
+                    "text": "reference text",
+                    "is_reference": True,
+                    "included": True,
+                },
                 {
                     "id": "clip-1.wav",
                     "s3_url": "s3://bucket/clip-1.wav",
@@ -306,8 +318,15 @@ def test_package_dataset_falls_back_when_no_reference_marked(monkeypatch):
         )
     )
 
-    assert package["dataset_s3_key"] == "datasets/book-1/dataset_char-1_job-package-fallback.zip"
-    assert downloaded == ["s3://bucket/clip-1.wav", "s3://bucket/clip-2.wav"]
+    assert package["dataset_s3_key"] == "datasets/book-1/dataset_char-1_job-package-ref.zip"
+    assert downloaded == ["s3://bucket/ref.wav", "s3://bucket/clip-1.wav", "s3://bucket/clip-2.wav"]
+
+    assert len(uploaded_payloads) == 1
+    _key, payload = uploaded_payloads[0]
+    with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+        train_rows = [json.loads(line) for line in zf.read("train.jsonl").decode("utf-8").splitlines()]
+
+    assert [row["audio"] for row in train_rows] == ["./data/clip-1.wav", "./data/clip-2.wav"]
 
 
 def test_get_dataset_status_404_for_missing_job(monkeypatch):

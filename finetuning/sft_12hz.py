@@ -39,6 +39,22 @@ except Exception:
     SummaryWriter = None
 
 target_speaker_embedding = None
+DEFAULT_SAVE_FROM_EPOCH = 6
+
+
+def _should_save_epoch(epoch_idx: int, save_from_epoch: int = DEFAULT_SAVE_FROM_EPOCH) -> bool:
+    return epoch_idx >= max(save_from_epoch, 0)
+
+
+def _needs_final_checkpoint(
+    final_epoch: int,
+    start_epoch: int,
+    save_last: bool,
+    save_from_epoch: int = DEFAULT_SAVE_FROM_EPOCH,
+) -> bool:
+    if not save_last or final_epoch < start_epoch:
+        return False
+    return not _should_save_epoch(final_epoch, save_from_epoch=save_from_epoch)
 
 
 def _ensure_local_model_path(model_path: str) -> str:
@@ -97,6 +113,12 @@ def train():
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--speaker_name", type=str, default="speaker_test")
     parser.add_argument("--save_interval", type=int, default=1, help="Save a checkpoint every N epochs.")
+    parser.add_argument(
+        "--save_from_epoch",
+        type=int,
+        default=DEFAULT_SAVE_FROM_EPOCH,
+        help="Save every checkpoint from this zero-based epoch onward.",
+    )
     parser.add_argument("--save_last/--no-save_last", dest="save_last", default=True, action=argparse.BooleanOptionalAction, help="Always save the final epoch checkpoint.")
     parser.add_argument("--log_interval", type=int, default=10, help="Log loss every N steps.")
     parser.add_argument("--logging_dir", type=str, default=None, help="Accelerate logging directory (e.g., runs/run1/logs).")
@@ -338,10 +360,6 @@ def train():
         unwrapped_model = accelerator.unwrap_model(model)
         state_dict = {k: v.detach().to("cpu") for k, v in unwrapped_model.state_dict().items()}
 
-        drop_prefix = "speaker_encoder"
-        keys_to_drop = [k for k in state_dict.keys() if k.startswith(drop_prefix)]
-        for k in keys_to_drop:
-            del state_dict[k]
 
         weight = state_dict['talker.model.codec_embedding.weight']
         state_dict['talker.model.codec_embedding.weight'][3000] = target_speaker_embedding[0].detach().to(weight.device).to(weight.dtype)
@@ -393,15 +411,16 @@ def train():
                     input_embeddings = input_embeddings + codec_i_embedding
 
                 outputs = model.talker(
-                    inputs_embeds=input_embeddings[:, :-1, :],
-                    attention_mask=attention_mask[:, :-1],
-                    labels=codec_0_labels[:, 1:],
+                    inputs_embeds=input_embeddings,
+                    attention_mask=attention_mask,
+                    labels=codec_0_labels,
                     output_hidden_states=True
                 )
-
+                # Sub-talker loss: hidden_states shape [B, T, D]，codec_mask shape [B, T]
                 hidden_states = outputs.hidden_states[0][-1]
-                talker_hidden_states = hidden_states[codec_mask[:, :-1]]
-                talker_codec_ids = codec_ids[codec_mask]
+                target_codec_mask = codec_mask[:, 1:]
+                talker_hidden_states = hidden_states[:, :-1][target_codec_mask]
+                talker_codec_ids = codec_ids[:, 1:][target_codec_mask]
 
                 sub_talker_logits, sub_talker_loss = model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
 
@@ -424,12 +443,17 @@ def train():
                     tb_writer.add_scalar("train/loss", loss.item(), global_step)
                     tb_writer.add_scalar("train/lr", lr_scheduler.get_last_lr()[0], global_step)
 
-        if accelerator.is_main_process and (epoch % args.save_interval == 0):
+        if accelerator.is_main_process and _should_save_epoch(epoch, save_from_epoch=args.save_from_epoch):
             _save_checkpoint(epoch)
 
-    if accelerator.is_main_process and args.save_last:
+    if accelerator.is_main_process:
         final_epoch = num_epochs - 1
-        if final_epoch >= start_epoch and (final_epoch % args.save_interval != 0):
+        if _needs_final_checkpoint(
+            final_epoch,
+            start_epoch,
+            args.save_last,
+            save_from_epoch=args.save_from_epoch,
+        ):
             _save_checkpoint(final_epoch)
 
     if tb_writer is not None:
@@ -449,7 +473,7 @@ def train_programmatic(
     Args:
         config: Dict with keys matching CLI args:
             init_model_path, output_model_path, train_jsonl, batch_size,
-            lr, num_epochs, speaker_name, save_interval, log_interval,
+            lr, num_epochs, speaker_name, save_interval, save_from_epoch, log_interval,
             flash_attn, lr_scheduler, warmup_steps, warmup_ratio, resume.
         on_progress: Optional callback(info_dict) called each log_interval.
             info_dict has: epoch, step, loss, status ("training"|"saving"|"done").
@@ -465,6 +489,7 @@ def train_programmatic(
         "num_epochs": 3,
         "speaker_name": "speaker_test",
         "save_interval": 1,
+        "save_from_epoch": DEFAULT_SAVE_FROM_EPOCH,
         "save_last": True,
         "log_interval": 10,
         "logging_dir": None,
@@ -680,14 +705,16 @@ def train_programmatic(
                     input_embeddings = input_embeddings + codec_i_embedding
 
                 outputs = model.talker(
-                    inputs_embeds=input_embeddings[:, :-1, :],
-                    attention_mask=attention_mask[:, :-1],
-                    labels=codec_0_labels[:, 1:],
+                    inputs_embeds=input_embeddings,
+                    attention_mask=attention_mask,
+                    labels=codec_0_labels,
                     output_hidden_states=True
                 )
+                # Sub-talker loss: hidden_states shape [B, T, D]，codec_mask shape [B, T]
                 hidden_states = outputs.hidden_states[0][-1]
-                talker_hidden_states = hidden_states[codec_mask[:, :-1]]
-                talker_codec_ids = codec_ids[codec_mask]
+                target_codec_mask = codec_mask[:, 1:]
+                talker_hidden_states = hidden_states[:, :-1][target_codec_mask]
+                talker_codec_ids = codec_ids[:, 1:][target_codec_mask]
                 sub_talker_logits, sub_talker_loss = model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
                 loss = outputs.loss + 0.3 * sub_talker_loss
                 accelerator.backward(loss)
@@ -715,14 +742,19 @@ def train_programmatic(
                         "global_step": global_step,
                     })
 
-        if accelerator.is_main_process and (epoch % args.save_interval == 0):
+        if accelerator.is_main_process and _should_save_epoch(epoch, save_from_epoch=args.save_from_epoch):
             if on_progress:
                 on_progress({"status": "saving", "epoch": epoch, "total_epochs": num_epochs})
             _save_ckpt(epoch)
 
-    if accelerator.is_main_process and args.save_last:
+    if accelerator.is_main_process:
         final_epoch = num_epochs - 1
-        if final_epoch >= start_epoch and (final_epoch % args.save_interval != 0):
+        if _needs_final_checkpoint(
+            final_epoch,
+            start_epoch,
+            args.save_last,
+            save_from_epoch=args.save_from_epoch,
+        ):
             _save_ckpt(final_epoch)
 
     if tb_writer is not None:

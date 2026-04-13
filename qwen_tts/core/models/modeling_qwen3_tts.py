@@ -1254,7 +1254,12 @@ class Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(Qwen3TTSPreTraine
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            import torch.nn.functional as F
+            loss = F.cross_entropy(
+                logits.reshape(-1, self.config.vocab_size),
+                labels.reshape(-1),
+                ignore_index=-100,
+            )
 
         return Qwen3TTSTalkerCodePredictorOutputWithPast(
             loss=loss,
@@ -1743,7 +1748,12 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            import torch.nn.functional as F
+            loss = F.cross_entropy(
+                logits.reshape(-1, self.config.vocab_size),
+                labels.reshape(-1),
+                ignore_index=-100,
+            )
 
 
         return Qwen3TTSTalkerOutputWithPast(
@@ -2043,7 +2053,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         languages: list[str] = None,
         speakers: list[str] = None,
         non_streaming_mode = False,
-        max_new_tokens: int = 4096,
+        max_new_tokens: Optional[int] = None,
         do_sample: bool = True,
         top_k: int = 50,
         top_p: float = 1.0,
@@ -2057,7 +2067,6 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         **kwargs,
     ):
         talker_kwargs = {
-            "max_new_tokens": max_new_tokens,
             "min_new_tokens": 2,
             "do_sample": do_sample,
             "top_k": top_k,
@@ -2079,6 +2088,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             "output_hidden_states": getattr(kwargs, "output_hidden_states", True),
             "return_dict_in_generate": getattr(kwargs, "return_dict_in_generate", True)
         }
+        if max_new_tokens is not None:
+            talker_kwargs["max_new_tokens"] = max_new_tokens
         
         talker_input_embeds = [[] for _ in range(len(input_ids))]
 

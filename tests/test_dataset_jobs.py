@@ -2,6 +2,7 @@ import io
 import sys
 import types
 import wave
+import asyncio
 
 import dataset_jobs
 
@@ -184,3 +185,55 @@ def test_validate_and_crop_audio_splits_long_dominant_speaker_segments(monkeypat
     assert len(result) == 2
     assert [item[0] for item in result] == ["clip__seg_000.wav", "clip__seg_001.wav"]
     assert [item[4] for item in result] == ["one two", "three four"]
+
+
+def test_prepare_dataset_items_preserves_reference_item(monkeypatch):
+    uploaded: list[tuple[str, bytes]] = []
+
+    async def fake_download(_storage, ref):
+        return f"bytes-for:{ref}".encode("utf-8")
+
+    async def fake_apply(audio_bytes, **_kwargs):
+        return audio_bytes
+
+    async def fake_validate(_segments, _character_name):
+        return [
+            ("clip-1.wav", b"clip-1-bytes", "prompt-1", True, "hello there", None),
+            ("clip-2.wav", b"clip-2-bytes", "prompt-2", True, "general kenobi", None),
+        ]
+
+    async def fake_upload(_storage, payload, key, **_kwargs):
+        uploaded.append((key, payload))
+        return f"https://bucket/{key}"
+
+    storage = types.SimpleNamespace(
+        get_presigned_url=lambda key, expires_in=0: f"https://signed/{key}",
+    )
+
+    monkeypatch.setattr(dataset_jobs, "_download_bytes", fake_download)
+    monkeypatch.setattr(dataset_jobs, "apply_audio_fx", fake_apply)
+    monkeypatch.setattr(dataset_jobs, "validate_and_crop_audio", fake_validate)
+    monkeypatch.setattr(dataset_jobs, "_upload_bytes", fake_upload)
+
+    items = asyncio.run(
+        dataset_jobs.prepare_dataset_items(
+            storage,
+            book_id="book-1",
+            character_id="char-1",
+            character_name="Elena",
+            job_id="job-1",
+            ref_audio_url="s3://bucket/ref.wav",
+            ref_text="reference text",
+            items=[
+                {"filename": "clone-1.wav", "prompt_id": "prompt-1", "text": "hello there", "s3_url": "s3://bucket/clone-1.wav"},
+                {"filename": "clone-2.wav", "prompt_id": "prompt-2", "text": "general kenobi", "s3_url": "s3://bucket/clone-2.wav"},
+            ],
+        )
+    )
+
+    assert items[0]["id"] == "ref_audio.wav"
+    assert items[0]["is_reference"] is True
+    assert items[0]["text"] == "reference text"
+    assert [item["id"] for item in items[1:]] == ["clip-1.wav", "clip-2.wav"]
+    assert sum(1 for item in items if item["is_reference"]) == 1
+    assert uploaded[0][0].endswith("_ref_audio.wav")

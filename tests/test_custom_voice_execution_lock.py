@@ -136,8 +136,8 @@ def test_custom_voice_single_generation_is_serialized_per_checkpoint(monkeypatch
     assert counters["max_active"] == 1
 
 
-def test_custom_voice_batch_generation_passes_runtime_max_new_tokens(monkeypatch):
-    manager = InferenceManager(device="cpu", max_models=2, custom_voice_max_new_tokens=2048)
+def test_custom_voice_batch_generation_does_not_force_max_new_tokens(monkeypatch):
+    manager = InferenceManager(device="cpu", max_models=2)
     calls = []
     model = _StubCustomVoiceModel(
         threading.Event(),
@@ -157,11 +157,11 @@ def test_custom_voice_batch_generation_passes_runtime_max_new_tokens(monkeypatch
 
     assert result == [b"wav", b"wav"]
     assert sr == 24000
-    assert calls[-1]["max_new_tokens"] == 2048
+    assert calls[-1]["max_new_tokens"] is None
 
 
-def test_custom_voice_single_generation_passes_runtime_max_new_tokens(monkeypatch):
-    manager = InferenceManager(device="cpu", max_models=2, custom_voice_max_new_tokens=1536)
+def test_custom_voice_single_generation_does_not_force_max_new_tokens(monkeypatch):
+    manager = InferenceManager(device="cpu", max_models=2)
     calls = []
     model = _StubCustomVoiceModel(
         threading.Event(),
@@ -181,4 +181,29 @@ def test_custom_voice_single_generation_passes_runtime_max_new_tokens(monkeypatc
 
     assert result == b"wav"
     assert sr == 24000
-    assert calls[-1]["max_new_tokens"] == 1536
+    assert calls[-1]["max_new_tokens"] is None
+
+
+def test_custom_voice_single_generation_passes_explicit_max_new_tokens(monkeypatch):
+    manager = InferenceManager(device="cpu", max_models=2)
+    calls = []
+    model = _StubCustomVoiceModel(
+        threading.Event(),
+        threading.Event(),
+        {"active": 0, "max_active": 0, "lock": threading.Lock()},
+        calls=calls,
+    )
+
+    monkeypatch.setattr(manager, "_get_model", lambda *_args, **_kwargs: (model, "Narrator"))
+    monkeypatch.setattr(manager, "_encode_wav", lambda *_args, **_kwargs: b"wav")
+
+    result, sr = manager.generate(
+        text="hello",
+        checkpoint_path="/tmp/custom-voice",
+        speaker_name="Narrator",
+        max_new_tokens=3072,
+    )
+
+    assert result == b"wav"
+    assert sr == 24000
+    assert calls[-1]["max_new_tokens"] == 3072

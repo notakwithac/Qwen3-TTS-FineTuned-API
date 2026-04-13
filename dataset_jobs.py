@@ -771,8 +771,6 @@ async def package_dataset(
     chosen_ref_audio: bytes | None = None
 
     for item in dataset_items:
-        if not item.get("included", True):
-            continue
         ref = item.get("s3_url") or item.get("url")
         if not ref:
             continue
@@ -783,8 +781,6 @@ async def package_dataset(
             continue
         final_train_segments.append((filename, wav_bytes))
         final_transcripts.append(transcript)
-        if item.get("is_reference"):
-            chosen_ref_audio = wav_bytes
 
     if not final_train_segments:
         raise RuntimeError("No dataset items available to package.")

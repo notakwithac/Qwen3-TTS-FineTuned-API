@@ -360,7 +360,8 @@ class Qwen3TTSModel:
         Rule:
           - If the user explicitly passes a value (not None), use it.
           - Otherwise, use the value from generate_config.json if present.
-          - Otherwise, fall back to the hard defaults.
+          - Otherwise, fall back to the hard defaults for common sampling args.
+          - `max_new_tokens` is only forwarded when the caller or checkpoint sets it.
 
         Args:
             do_sample, top_k, top_p, temperature, repetition_penalty,
@@ -382,7 +383,6 @@ class Qwen3TTSModel:
             subtalker_top_k=50,
             subtalker_top_p=1.0,
             subtalker_temperature=0.9,
-            max_new_tokens=2048,
         )
 
         def pick(name: str, user_val: Any) -> Any:
@@ -403,8 +403,11 @@ class Qwen3TTSModel:
             subtalker_top_k=pick("subtalker_top_k", subtalker_top_k),
             subtalker_top_p=pick("subtalker_top_p", subtalker_top_p),
             subtalker_temperature=pick("subtalker_temperature", subtalker_temperature),
-            max_new_tokens=pick("max_new_tokens", max_new_tokens),
         )
+        if max_new_tokens is not None:
+            merged["max_new_tokens"] = max_new_tokens
+        elif "max_new_tokens" in self.generate_defaults:
+            merged["max_new_tokens"] = self.generate_defaults["max_new_tokens"]
         return merged
 
     # voice clone model

@@ -495,7 +495,6 @@ CUSTOM_VOICE_SESSION_BATCH_PADDED_CHARS = int(
         str(max(1, SESSION_BATCH_MAX_CHARS // 2)),
     )
 )
-CUSTOM_VOICE_MAX_NEW_TOKENS = int(os.environ.get("CUSTOM_VOICE_MAX_NEW_TOKENS", "2048"))
 USE_TORCH_COMPILE = os.environ.get("USE_TORCH_COMPILE", "1") == "1"
 
 # Resource Isolation
@@ -529,7 +528,6 @@ logger.info(f"  - CUSTOM_VOICE_SESSION_BATCH_SIZE: {CUSTOM_VOICE_SESSION_BATCH_S
 logger.info(
     f"  - CUSTOM_VOICE_SESSION_BATCH_PADDED_CHARS: {CUSTOM_VOICE_SESSION_BATCH_PADDED_CHARS}"
 )
-logger.info(f"  - CUSTOM_VOICE_MAX_NEW_TOKENS: {CUSTOM_VOICE_MAX_NEW_TOKENS}")
 logger.info(f"  - USE_TORCH_COMPILE: {USE_TORCH_COMPILE}")
 logger.info(f"  - REPLICA_THRESHOLD: {REPLICA_THRESHOLD}")
 logger.info(f"  - MAX_CONCURRENT_VOICE_DESIGNS: {MAX_CONCURRENT_VOICE_DESIGNS}")
@@ -556,7 +554,6 @@ pipeline = Pipeline(
         "voice_clone": VOICE_CLONE_REPLICAS,
     },
     shared_model_min_headroom_gb=SHARED_MODEL_MIN_HEADROOM_GB,
-    custom_voice_max_new_tokens=CUSTOM_VOICE_MAX_NEW_TOKENS,
 )
 
 # Session-based inference manager
@@ -666,14 +663,15 @@ voice_clone_batcher = DynamicBatcher(
     max_workers=1
 )
 
-custom_voice_batchers = {}  # Map job_id -> DynamicBatcher
+custom_voice_batchers = {}  # Map (job_id, checkpoint_path) -> DynamicBatcher
 voice_clone_batch_jobs = {} # session_id -> {status, completed, total, results, error, ...}
 dataset_jobs = {}  # job_id -> {kind, status, total, completed, failed, ...}
 dataset_job_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DATASET_JOBS)
 
 
 def get_custom_voice_batcher(job_id: str, checkpoint_path: str, speaker_name: str) -> DynamicBatcher:
-    if job_id not in custom_voice_batchers:
+    batcher_key = (job_id, checkpoint_path)
+    if batcher_key not in custom_voice_batchers:
         def process_fn(texts: list[str], languages: list[str], instructs: list[str]):
             return pipeline.inference.generate_batch(
                 texts=texts,
@@ -682,13 +680,13 @@ def get_custom_voice_batcher(job_id: str, checkpoint_path: str, speaker_name: st
                 languages=languages,
                 instructs=instructs
             )
-        custom_voice_batchers[job_id] = DynamicBatcher(
+        custom_voice_batchers[batcher_key] = DynamicBatcher(
             batch_size=GPU_BATCH_SIZE,
             timeout_ms=100,
             process_fn=process_fn,
             max_workers=1  # Always 1 worker per job/model to ensure thread-safety
         )
-    return custom_voice_batchers[job_id]
+    return custom_voice_batchers[batcher_key]
 
 
 def _sorted_clone_batch_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -839,6 +837,7 @@ class AudioS3Result(APIModel):
     sample_rate: int
     text: str
     job_id: str
+    checkpoint_epoch: Optional[int] = None
     status: str = "success"
 
 
@@ -1035,6 +1034,7 @@ class InferRequest(APIModel):
     text: str
     language: str = "English"
     instruct: str = ""
+    checkpoint_epoch: Optional[int] = None
     upload_to_s3: bool = True  # Now default to True
     s3_filename: Optional[str] = None
     book_id: Optional[str] = None
@@ -1069,6 +1069,13 @@ class InferRequest(APIModel):
     @classmethod
     def validate_ids(cls, value: Optional[str], info) -> Optional[str]:
         return _normalize_optional_id(value, info.field_name)
+
+    @field_validator("checkpoint_epoch")
+    @classmethod
+    def validate_checkpoint_epoch(cls, value: Optional[int]) -> Optional[int]:
+        if value is not None and value < 0:
+            raise ValueError("checkpoint_epoch must be >= 0")
+        return value
 
 
 class BatchInferItem(APIModel):
@@ -1109,6 +1116,7 @@ class BatchInferRequest(APIModel):
     """Generate multiple audio files in one call, all uploaded to S3."""
     items: list[BatchInferItem]
     language: str = "English"
+    checkpoint_epoch: Optional[int] = None
     book_id: Optional[str] = None
     chapter_id: Optional[str] = None
     character_id: Optional[str] = None
@@ -1128,6 +1136,13 @@ class BatchInferRequest(APIModel):
     def validate_language(cls, value: str) -> str:
         return _normalize_language(value)
 
+    @field_validator("checkpoint_epoch")
+    @classmethod
+    def validate_checkpoint_epoch(cls, value: Optional[int]) -> Optional[int]:
+        if value is not None and value < 0:
+            raise ValueError("checkpoint_epoch must be >= 0")
+        return value
+
 
 class JobSummary(APIModel):
     job_id: str
@@ -1139,6 +1154,7 @@ class JobSummary(APIModel):
     created_at: str
     finished_at: Optional[str] = None
     config: dict[str, Any] = Field(default_factory=dict)
+    available_checkpoint_epochs: list[int] = Field(default_factory=list)
     inference_url: Optional[str] = None
     message: Optional[str] = None
 
@@ -1686,24 +1702,22 @@ async def infer(job_id: str, req: InferRequest):
             "sample_rate": 24000,
             "text": req.text,
             "job_id": job_id,
+            "checkpoint_epoch": req.checkpoint_epoch,
         }
 
     try:
-        checkpoint_path = str(job.checkpoint_path) if job.checkpoint_path else None
-        # Resolve to absolute path — relative paths (e.g. "jobs/id/output/ckpt") cause
-        # HuggingFace from_pretrained to misinterpret them as Hub repo IDs.
-        if checkpoint_path and not os.path.isabs(checkpoint_path):
-            checkpoint_path = str(Path(checkpoint_path).resolve())
-        # If checkpoint is missing locally, restore from S3
-        if not checkpoint_path or not os.path.exists(checkpoint_path):
-            if job.s3_model_key:
-                checkpoint_path = pipeline._restore_checkpoint_from_s3(job)
-            else:
-                raise HTTPException(status_code=500, detail=f"Job {job_id} has no checkpoint and no S3 backup")
+        checkpoint_path, resolved_epoch = await loop.run_in_executor(
+            None,
+            pipeline.resolve_checkpoint_path,
+            job,
+            req.checkpoint_epoch,
+        )
         batcher = get_custom_voice_batcher(job_id, checkpoint_path, job.speaker_name)
         
         with ops_log.operation("inference_api", job_id=job_id, extra={
-            "text_length": len(req.text), "upload_to_s3": req.upload_to_s3,
+            "text_length": len(req.text),
+            "upload_to_s3": req.upload_to_s3,
+            "checkpoint_epoch": resolved_epoch,
         }):
             wav_bytes, sr = await batcher.submit(
                 texts=req.text,
@@ -1746,6 +1760,7 @@ async def infer(job_id: str, req: InferRequest):
             "sample_rate": sr,
             "text": req.text,
             "job_id": job_id,
+            "checkpoint_epoch": resolved_epoch,
         }
 
     # Otherwise return raw audio (if user explicitly set upload_to_s3=False)
@@ -1805,6 +1820,16 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
     pipeline.touch_job(job_id)
     pipeline._cleanup_disk_lru(30.0)
 
+    try:
+        resolved_checkpoint_path, resolved_epoch = await loop.run_in_executor(
+            None,
+            pipeline.resolve_checkpoint_path,
+            job,
+            req.checkpoint_epoch,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Inference failed: {str(e)}")
+
     from functools import partial
 
     # Create a Semaphore to limit concurrent S3 checks and generation launching
@@ -1851,31 +1876,13 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
                     "sample_rate": 24000,
                     "text": text,
                     "job_id": job_id,
+                    "checkpoint_epoch": resolved_epoch,
                 }
 
             # Run generation using the local batcher (fuses multiple requests into one GPU pass)
             try:
                 loop = asyncio.get_running_loop()
-
-                # Resolve to absolute path — prevents HF from_pretrained treating a relative
-                # path like 'jobs/id/output/checkpoint-epoch-14' as a Hub repo ID.
-                checkpoint_path = str(job.checkpoint_path) if job.checkpoint_path else None
-                if checkpoint_path and not os.path.isabs(checkpoint_path):
-                    checkpoint_path = str(Path(checkpoint_path).resolve())
-
-                # If the local epoch folder was LRU-evicted or never restored, fall back to S3.
-                if not checkpoint_path or not os.path.exists(checkpoint_path):
-                    if job.s3_model_key:
-                        logger.info(f"Batch infer: checkpoint missing locally for job {job_id}, restoring from S3...")
-                        checkpoint_path = await loop.run_in_executor(
-                            None, pipeline._restore_checkpoint_from_s3, job
-                        )
-                    else:
-                        raise RuntimeError(
-                            f"Job {job_id} has no local checkpoint and no S3 backup to restore from."
-                        )
-
-                batcher = get_custom_voice_batcher(job_id, checkpoint_path, job.speaker_name)
+                batcher = get_custom_voice_batcher(job_id, resolved_checkpoint_path, job.speaker_name)
                 
                 wav_bytes, sr = await batcher.submit(
                     texts=text,
@@ -1902,6 +1909,7 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
                     "sample_rate": sr,
                     "text": text,
                     "job_id": job_id,
+                    "checkpoint_epoch": resolved_epoch,
                 }
             except Exception as e:
                 logger.error(f"Inference failed for item {index}: {e}")
