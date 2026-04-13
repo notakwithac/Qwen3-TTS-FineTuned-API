@@ -117,6 +117,59 @@ def test_validate_and_crop_audio_retries_on_cpu_after_cuda_oom(monkeypatch):
     assert result[0][4] == "major barry"
 
 
+def test_validate_and_crop_audio_auto_uses_cpu_when_cuda_headroom_is_too_low(monkeypatch):
+    fake_torch = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(
+            is_available=lambda: True,
+            empty_cache=lambda: None,
+            mem_get_info=lambda *_args, **_kwargs: (4 * 1024**3, 24 * 1024**3),
+        ),
+        serialization=types.SimpleNamespace(add_safe_globals=lambda _globals: None),
+    )
+    fake_whisperx = types.SimpleNamespace(
+        load_audio=lambda _path: "audio",
+        align=lambda segments, *_args, **_kwargs: {"segments": segments},
+    )
+    fake_pydub = types.SimpleNamespace(AudioSegment=object)
+
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "whisperx", fake_whisperx)
+    monkeypatch.setitem(sys.modules, "pydub", fake_pydub)
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.delenv("DATASET_PREP_DEVICE", raising=False)
+    monkeypatch.setenv("DATASET_WHISPER_MODEL", "large-v3")
+    calls: list[tuple[str, str]] = []
+
+    def fake_get_whisper_model(model_name, *, device=None, compute_type=None):
+        calls.append((device or "", compute_type or ""))
+        return types.SimpleNamespace(
+            transcribe=lambda _audio, batch_size=8: {
+                "language": "en",
+                "segments": [
+                    {"start": 0.0, "end": 0.4, "text": "narrator"},
+                    {"start": 0.4, "end": 0.8, "text": "line"},
+                ],
+            }
+        )
+
+    monkeypatch.setattr(dataset_jobs, "_get_whisper_model", fake_get_whisper_model)
+    monkeypatch.setattr(dataset_jobs, "_get_align_model", lambda *_args, **_kwargs: (object(), {}))
+    monkeypatch.setattr(
+        dataset_jobs,
+        "_get_diarization_pipeline",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("HF_TOKEN is required for dataset diarization.")),
+    )
+
+    result = dataset_jobs._validate_and_crop_audio_sync(
+        [("clip.wav", _make_wav_bytes(), "prompt-1")],
+        "Narrator",
+    )
+
+    assert calls == [("cpu", "int8")]
+    assert result[0][3] is True
+    assert result[0][4] == "narrator line"
+
+
 def test_validate_and_crop_audio_splits_long_dominant_speaker_segments(monkeypatch):
     class _FakeSlice:
         def __init__(self, duration_ms: int):

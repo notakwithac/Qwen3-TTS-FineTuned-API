@@ -152,6 +152,69 @@ def _clear_torch_cuda_cache() -> None:
         pass
 
 
+def _get_cuda_free_memory_gb() -> float | None:
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+
+        mem_get_info = getattr(torch.cuda, "mem_get_info", None)
+        if mem_get_info is None:
+            return None
+
+        try:
+            free_bytes, _total_bytes = mem_get_info(0)
+        except TypeError:
+            free_bytes, _total_bytes = mem_get_info()
+        return max(float(free_bytes), 0.0) / (1024 ** 3)
+    except Exception:
+        return None
+
+
+def _dataset_whisper_min_free_gb(model_name: str) -> float:
+    override = (os.environ.get("DATASET_PREP_CUDA_MIN_FREE_GB", "") or "").strip()
+    if override:
+        try:
+            return max(float(override), 0.0)
+        except ValueError:
+            log.warning("Ignoring invalid DATASET_PREP_CUDA_MIN_FREE_GB=%r", override)
+
+    normalized = (model_name or "").strip().lower()
+    thresholds = {
+        "tiny": 1.0,
+        "base": 1.5,
+        "small": 2.5,
+        "medium": 4.0,
+        "turbo": 6.0,
+        "large": 10.0,
+        "large-v2": 10.0,
+        "large-v3": 10.0,
+    }
+    return thresholds.get(normalized, 6.0)
+
+
+def _resolve_dataset_prep_device(configured_device: str, model_name: str) -> str:
+    import torch
+
+    if configured_device in {"cpu", "cuda"}:
+        return configured_device
+    if not torch.cuda.is_available():
+        return "cpu"
+
+    free_gb = _get_cuda_free_memory_gb()
+    min_free_gb = _dataset_whisper_min_free_gb(model_name)
+    if free_gb is not None and free_gb < min_free_gb:
+        log.info(
+            "Dataset prep auto-selected CPU for WhisperX %s: free CUDA memory %.1f GB below %.1f GB threshold.",
+            model_name,
+            free_gb,
+            min_free_gb,
+        )
+        return "cpu"
+    return "cuda"
+
+
 def dataset_manifest_key(book_id: str, character_id: str, job_id: str) -> str:
     safe_book = (book_id or "unknown-book").strip() or "unknown-book"
     safe_character = (character_id or "unknown-character").strip() or "unknown-character"
@@ -371,14 +434,11 @@ def _validate_and_crop_audio_sync(
             pass
 
         configured_device = (os.environ.get("DATASET_PREP_DEVICE", "auto") or "auto").strip().lower()
-        if configured_device in {"cpu", "cuda"}:
-            device = configured_device
-        else:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-        compute_type = "float16" if device == "cuda" else "int8"
         hf_token = os.environ.get("HF_TOKEN")
         skip_validation = _env_flag("SKIP_WHISPER_VALIDATION")
         model_name = (os.environ.get("DATASET_WHISPER_MODEL", "turbo") or "turbo").strip()
+        device = _resolve_dataset_prep_device(configured_device, model_name)
+        compute_type = "float16" if device == "cuda" else "int8"
 
         try:
             model = _get_whisper_model(model_name, device=device, compute_type=compute_type)
