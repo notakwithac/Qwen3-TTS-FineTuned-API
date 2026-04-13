@@ -560,7 +560,7 @@ class Pipeline:
             pass
         return total
 
-    def _cleanup_disk_lru(self, threshold_gb: float = 40.0):
+    def _cleanup_disk_lru(self, threshold_gb: float = 200.0):
         """Delete oldest jobs if disk usage exceeds threshold.
         
         For S3-backed jobs: only deletes the heavy checkpoint files, keeping

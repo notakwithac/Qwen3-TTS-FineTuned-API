@@ -1676,7 +1676,7 @@ async def infer(job_id: str, req: InferRequest):
             )
 
     pipeline.touch_job(job_id) # Update LRU timestamp
-    pipeline._cleanup_disk_lru(30.0) # Background check usage
+    pipeline._cleanup_disk_lru(200.0) # Background check usage
 
     # Enhanced Fast-path check
     s3_key_found = None
@@ -1818,7 +1818,7 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
             )
 
     pipeline.touch_job(job_id)
-    pipeline._cleanup_disk_lru(30.0)
+    pipeline._cleanup_disk_lru(200.0)
 
     try:
         resolved_checkpoint_path, resolved_epoch = await loop.run_in_executor(
