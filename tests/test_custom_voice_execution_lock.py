@@ -18,6 +18,7 @@ class _StubCustomVoiceModel:
         speaker=None,
         instruct=None,
         max_new_tokens=None,
+        **kwargs,
     ):
         with self._counters["lock"]:
             self._counters["active"] += 1
@@ -32,6 +33,7 @@ class _StubCustomVoiceModel:
                 "speaker": speaker,
                 "instruct": instruct,
                 "max_new_tokens": max_new_tokens,
+                "kwargs": kwargs,
             }
         )
         self._started_event.set()

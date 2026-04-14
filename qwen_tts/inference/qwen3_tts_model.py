@@ -410,6 +410,62 @@ class Qwen3TTSModel:
             merged["max_new_tokens"] = self.generate_defaults["max_new_tokens"]
         return merged
 
+    @staticmethod
+    def _generated_token_count(audio_codes: Any) -> int:
+        if audio_codes is None:
+            return 0
+        if hasattr(audio_codes, "shape") and len(audio_codes.shape) > 0:
+            return int(audio_codes.shape[0])
+        try:
+            return len(audio_codes)
+        except TypeError:
+            return 0
+
+    @staticmethod
+    def _text_preview(text: Optional[str], limit: int = 80) -> str:
+        normalized = (text or "").strip().replace("\n", " ")
+        if len(normalized) <= limit:
+            return normalized
+        return normalized[: limit - 3] + "..."
+
+    def _log_custom_voice_generation_stats(
+        self,
+        *,
+        texts: List[str],
+        speakers: List[str],
+        languages: List[str],
+        instructs: List[str],
+        talker_codes_list: List[Any],
+        gen_kwargs: Dict[str, Any],
+    ) -> None:
+        effective_max_new_tokens = gen_kwargs.get("max_new_tokens")
+        do_sample = gen_kwargs.get("do_sample")
+        subtalker_dosample = gen_kwargs.get("subtalker_dosample")
+
+        for idx, codes in enumerate(talker_codes_list):
+            actual_new_tokens = self._generated_token_count(codes)
+            cap_reached = (
+                effective_max_new_tokens is not None
+                and actual_new_tokens >= int(effective_max_new_tokens)
+            )
+            logger.info(
+                "CustomVoice generation stats | idx=%s | speaker=%s | language=%s | "
+                "text_chars=%s | instruct_chars=%s | actual_new_tokens=%s | "
+                "effective_max_new_tokens=%s | cap_reached=%s | do_sample=%s | "
+                "subtalker_dosample=%s | text_preview=%r",
+                idx,
+                speakers[idx],
+                languages[idx],
+                len(texts[idx]),
+                len(instructs[idx] or ""),
+                actual_new_tokens,
+                effective_max_new_tokens,
+                cap_reached,
+                do_sample,
+                subtalker_dosample,
+                self._text_preview(texts[idx]),
+            )
+
     # voice clone model
     @torch.inference_mode()
     def create_voice_clone_prompt(
@@ -892,6 +948,15 @@ class Qwen3TTSModel:
             speakers=speakers,
             non_streaming_mode=non_streaming_mode,
             **gen_kwargs,
+        )
+
+        self._log_custom_voice_generation_stats(
+            texts=texts,
+            speakers=speakers,
+            languages=languages,
+            instructs=instructs,
+            talker_codes_list=talker_codes_list,
+            gen_kwargs=gen_kwargs,
         )
 
         wavs, fs = self.model.speech_tokenizer.decode([{"audio_codes": c} for c in talker_codes_list])

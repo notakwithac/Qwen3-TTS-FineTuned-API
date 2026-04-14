@@ -33,6 +33,15 @@ DEFAULT_SESSION_TIMEOUT = 3600    # Auto-cleanup after 1h idle
 MODEL_VRAM_GB = 5.5               # Measured per-model VRAM (bf16 weights + compiled overhead)
 DEFAULT_BATCH_TEXT_BUDGET = int(os.environ.get("SESSION_BATCH_MAX_CHARS", "4000"))
 DEFAULT_BATCH_PADDED_TEXT_BUDGET = int(os.environ.get("SESSION_BATCH_MAX_PADDED_CHARS", "0"))
+DEFAULT_CUSTOM_SESSION_MAX_NEW_TOKENS = int(
+    os.environ.get("CUSTOM_VOICE_SESSION_MAX_NEW_TOKENS", "1536")
+)
+DEFAULT_CUSTOM_SESSION_MIN_NEW_TOKENS = int(
+    os.environ.get("CUSTOM_VOICE_SESSION_MIN_NEW_TOKENS", "512")
+)
+DEFAULT_CUSTOM_SESSION_MAX_NEW_TOKENS_PER_CHAR = int(
+    os.environ.get("CUSTOM_VOICE_SESSION_MAX_NEW_TOKENS_PER_CHAR", "4")
+)
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +55,14 @@ class SessionStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+class DuplicateActiveSessionError(ValueError):
+    """Raised when the same chapter/job workload is already active."""
+
+    def __init__(self, message: str, active_session_id: str):
+        super().__init__(message)
+        self.active_session_id = active_session_id
 
 
 @dataclass
@@ -126,6 +143,10 @@ class CharacterWorker:
         batch_text_budget: int = DEFAULT_BATCH_TEXT_BUDGET,
         batch_padded_text_budget: int = DEFAULT_BATCH_PADDED_TEXT_BUDGET,
         initial_batch_size: int = 1,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
+        min_new_tokens: int = DEFAULT_CUSTOM_SESSION_MIN_NEW_TOKENS,
+        max_new_tokens: int = DEFAULT_CUSTOM_SESSION_MAX_NEW_TOKENS,
+        max_new_tokens_per_char: int = DEFAULT_CUSTOM_SESSION_MAX_NEW_TOKENS_PER_CHAR,
         storage=None,
         progress: Optional[CharacterProgress] = None,
     ):
@@ -140,6 +161,10 @@ class CharacterWorker:
         self.batch_text_budget = max(0, int(batch_text_budget or 0))
         self.batch_padded_text_budget = max(0, int(batch_padded_text_budget or 0))
         self.initial_batch_size = max(1, min(int(initial_batch_size or batch_size), batch_size))
+        self.generation_kwargs = dict(generation_kwargs or {})
+        self.min_new_tokens = max(0, int(min_new_tokens or 0))
+        self.max_new_tokens = max(0, int(max_new_tokens or 0))
+        self.max_new_tokens_per_char = max(0, int(max_new_tokens_per_char or 0))
         self.storage = storage
         self.progress = progress or CharacterProgress()
         self._task: Optional[asyncio.Task] = None
@@ -187,6 +212,26 @@ class CharacterWorker:
         if self._first_batch_pending:
             return self.initial_batch_size
         return self.batch_size
+
+    @staticmethod
+    def _message_output_text_chars(msg: InferenceMessage) -> int:
+        return max(1, len((msg.text or "").strip()))
+
+    def _build_generation_kwargs(self, batch: List[InferenceMessage]) -> Dict[str, Any]:
+        kwargs = dict(self.generation_kwargs)
+        if batch and (self.max_new_tokens > 0 or self.max_new_tokens_per_char > 0):
+            max_text_chars = max(self._message_output_text_chars(msg) for msg in batch)
+            derived_limit = self.min_new_tokens
+            if self.max_new_tokens_per_char > 0:
+                derived_limit = max(
+                    derived_limit,
+                    max_text_chars * self.max_new_tokens_per_char,
+                )
+            if self.max_new_tokens > 0:
+                derived_limit = min(derived_limit, self.max_new_tokens)
+            if derived_limit > 0:
+                kwargs["max_new_tokens"] = derived_limit
+        return kwargs
 
     def start(self):
         """Start the worker coroutine."""
@@ -316,6 +361,7 @@ class CharacterWorker:
             texts = [m.text for m in batch]
             languages = [m.language for m in batch]
             instructs = [m.instruct for m in batch]
+            generation_kwargs = self._build_generation_kwargs(batch)
 
             op = ops_log.start("session_worker_batch", extra={
                 "worker_id": self.worker_id,
@@ -328,6 +374,8 @@ class CharacterWorker:
                 ),
                 "cache_key": self.cache_key,
                 "first_batch_mode": self._first_batch_pending,
+                "max_new_tokens": generation_kwargs.get("max_new_tokens"),
+                "do_sample": generation_kwargs.get("do_sample"),
             })
 
             try:
@@ -340,6 +388,7 @@ class CharacterWorker:
                         speaker_name=self.speaker_name,
                         languages=languages,
                         instructs=instructs,
+                        **generation_kwargs,
                     )
                 )
 
@@ -431,10 +480,12 @@ class Session:
         session_id: str,
         book_id: str = "",
         chapter_id: str = "",
+        requested_job_ids: Optional[List[str]] = None,
     ):
         self.session_id = session_id
         self.book_id = book_id
         self.chapter_id = chapter_id
+        self.requested_job_ids = tuple(sorted(requested_job_ids or []))
         self.status = SessionStatus.PREPARING
         self.created_at = time.time()
         self.last_active = time.time()
@@ -499,6 +550,7 @@ class Session:
             "characters": characters,
             "error": self.error,
             "created_at": self.created_at,
+            "requested_job_ids": list(self.requested_job_ids),
         }
 
     def get_all_results(self) -> list:
@@ -531,6 +583,10 @@ class SessionManager:
         batch_size: int = 32,
         batch_text_budget: int = DEFAULT_BATCH_TEXT_BUDGET,
         batch_padded_text_budget: int = DEFAULT_BATCH_PADDED_TEXT_BUDGET,
+        custom_generation_kwargs: Optional[Dict[str, Any]] = None,
+        custom_min_new_tokens: int = DEFAULT_CUSTOM_SESSION_MIN_NEW_TOKENS,
+        custom_max_new_tokens: int = DEFAULT_CUSTOM_SESSION_MAX_NEW_TOKENS,
+        custom_max_new_tokens_per_char: int = DEFAULT_CUSTOM_SESSION_MAX_NEW_TOKENS_PER_CHAR,
     ):
         self.inference = inference_manager
         self.pipeline = pipeline
@@ -541,6 +597,10 @@ class SessionManager:
         self.batch_size = batch_size
         self.batch_text_budget = max(0, int(batch_text_budget or 0))
         self.batch_padded_text_budget = max(0, int(batch_padded_text_budget or 0))
+        self.custom_generation_kwargs = dict(custom_generation_kwargs or {})
+        self.custom_min_new_tokens = max(0, int(custom_min_new_tokens or 0))
+        self.custom_max_new_tokens = max(0, int(custom_max_new_tokens or 0))
+        self.custom_max_new_tokens_per_char = max(0, int(custom_max_new_tokens_per_char or 0))
         self.sessions: Dict[str, Session] = {}
 
         # Limit active workers to max_models to prevent cache thrashing
@@ -670,6 +730,37 @@ class SessionManager:
                 return 0.0
         return 0.0
 
+    @staticmethod
+    def _is_active_status(status: SessionStatus) -> bool:
+        return status in (
+            SessionStatus.PREPARING,
+            SessionStatus.READY,
+            SessionStatus.PROCESSING,
+        )
+
+    def _find_duplicate_active_session(
+        self,
+        *,
+        session_id: str,
+        book_id: str,
+        chapter_id: str,
+        requested_job_ids: tuple[str, ...],
+    ) -> Optional[Session]:
+        if not book_id or not chapter_id or not requested_job_ids:
+            return None
+
+        for existing in self.sessions.values():
+            if existing.session_id == session_id:
+                continue
+            if not self._is_active_status(existing.status):
+                continue
+            if existing.book_id != book_id or existing.chapter_id != chapter_id:
+                continue
+            if existing.requested_job_ids != requested_job_ids:
+                continue
+            return existing
+        return None
+
     # -- Session Lifecycle ----------------------------------------------------
 
     async def prepare_session(
@@ -689,6 +780,22 @@ class SessionManager:
 
         Returns: Session object with model plan
         """
+        requested_job_ids = tuple(sorted({c["job_id"] for c in characters}))
+        duplicate = self._find_duplicate_active_session(
+            session_id=session_id,
+            book_id=book_id,
+            chapter_id=chapter_id,
+            requested_job_ids=requested_job_ids,
+        )
+        if duplicate is not None:
+            raise DuplicateActiveSessionError(
+                (
+                    "A matching session is already active for this chapter workload "
+                    f"({duplicate.session_id})."
+                ),
+                active_session_id=duplicate.session_id,
+            )
+
         if session_id in self.sessions:
             existing = self.sessions[session_id]
             if existing.status in (SessionStatus.PREPARING, SessionStatus.PROCESSING):
@@ -696,7 +803,12 @@ class SessionManager:
             # Teardown old session first
             await self.teardown_session(session_id)
 
-        session = Session(session_id=session_id, book_id=book_id, chapter_id=chapter_id)
+        session = Session(
+            session_id=session_id,
+            book_id=book_id,
+            chapter_id=chapter_id,
+            requested_job_ids=list(requested_job_ids),
+        )
         self.sessions[session_id] = session
 
         op = ops_log.start("session_prepare", extra={
@@ -820,6 +932,10 @@ class SessionManager:
                         batch_text_budget=self.batch_text_budget,
                         batch_padded_text_budget=self.batch_padded_text_budget,
                         initial_batch_size=1,
+                        generation_kwargs=self.custom_generation_kwargs,
+                        min_new_tokens=self.custom_min_new_tokens,
+                        max_new_tokens=self.custom_max_new_tokens,
+                        max_new_tokens_per_char=self.custom_max_new_tokens_per_char,
                         storage=self.storage,
                         progress=progress,
                     )

@@ -46,6 +46,7 @@ broadcast_module.Broadcast = _DummyBroadcast
 sys.modules["broadcaster"] = broadcast_module
 
 import api_server
+from session_manager import DuplicateActiveSessionError
 
 
 class StubInference:
@@ -256,6 +257,45 @@ def test_post_gpu_concurrency_updates_runtime_config(monkeypatch):
         "voice_clone": 2,
     }
     assert inference.stats["shared_model_min_headroom_gb"] == 4.0
+
+
+def test_session_prepare_returns_conflict_for_duplicate_active_session(monkeypatch):
+    inference = StubInference()
+    monkeypatch.setattr(api_server, "pipeline", StubPipeline(inference))
+    _patch_startup_dependencies(monkeypatch)
+
+    async def _raise_duplicate(**_kwargs):
+        raise DuplicateActiveSessionError(
+            "A matching session is already active for this chapter workload (session-1).",
+            active_session_id="session-1",
+        )
+
+    monkeypatch.setattr(api_server.session_mgr, "prepare_session", _raise_duplicate)
+
+    with TestClient(api_server.app) as client:
+        response = client.post(
+            "/session/prepare",
+            json={
+                "session_id": "session-2",
+                "book_id": "book-1",
+                "chapter_id": "chapter-1",
+                "characters": [
+                    {
+                        "job_id": "job-1",
+                        "character_name": "Narrator",
+                        "line_count": 17,
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "message": "A matching session is already active for this chapter workload (session-1).",
+            "active_session_id": "session-1",
+        }
+    }
 
 
 def test_post_gpu_concurrency_rejects_invalid_payload(monkeypatch):

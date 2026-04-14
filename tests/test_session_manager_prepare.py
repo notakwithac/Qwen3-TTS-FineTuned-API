@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 import session_manager
-from session_manager import SessionManager
+from session_manager import DuplicateActiveSessionError, SessionManager
 
 
 class _StubJob:
@@ -137,3 +137,62 @@ def test_calculate_replicas_respects_available_replica_slots():
         "job-1": 2,
         "job-2": 1,
     }
+
+
+@pytest.mark.asyncio
+async def test_prepare_session_rejects_duplicate_active_chapter_workload(monkeypatch, tmp_path):
+    checkpoint_path = tmp_path / "checkpoint-epoch-14"
+    checkpoint_path.mkdir()
+    (checkpoint_path / "config.json").write_text("{}", encoding="utf-8")
+
+    inference = _StubInferenceManager(loaded_count=2, max_models=4)
+    pipeline = _StubPipeline({"job-1": _StubJob("job-1", checkpoint_path)})
+    manager = SessionManager(
+        inference_manager=inference,
+        pipeline=pipeline,
+        storage=None,
+        replica_threshold=500,
+        max_replicas=4,
+        batch_size=1,
+    )
+
+    monkeypatch.setattr(manager, "_get_available_vram", lambda: 40.0)
+    monkeypatch.setattr(
+        session_manager.CharacterWorker,
+        "start",
+        lambda self: setattr(self, "_running", True),
+    )
+
+    async def _stop(self):
+        self._running = False
+
+    monkeypatch.setattr(session_manager.CharacterWorker, "stop", _stop)
+
+    await manager.prepare_session(
+        session_id="session-1",
+        characters=[
+            {
+                "job_id": "job-1",
+                "character_name": "Narrator",
+                "line_count": 17,
+            }
+        ],
+        book_id="book-1",
+        chapter_id="chapter-1",
+    )
+
+    with pytest.raises(DuplicateActiveSessionError) as excinfo:
+        await manager.prepare_session(
+            session_id="session-2",
+            characters=[
+                {
+                    "job_id": "job-1",
+                    "character_name": "Narrator",
+                    "line_count": 17,
+                }
+            ],
+            book_id="book-1",
+            chapter_id="chapter-1",
+        )
+
+    assert excinfo.value.active_session_id == "session-1"

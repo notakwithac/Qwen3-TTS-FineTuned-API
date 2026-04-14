@@ -26,7 +26,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pipeline import Pipeline, JobStatus
 from storage import storage
 from ops_logger import ops_log
-from session_manager import SessionManager, SessionStatus
+from session_manager import DuplicateActiveSessionError, SessionManager, SessionStatus
 from metrics_collector import metrics_collector
 from gpu_resource_controller import GPUResourceController
 from dataset_jobs import (
@@ -498,6 +498,29 @@ CUSTOM_VOICE_SESSION_BATCH_PADDED_CHARS = int(
         str(max(1, SESSION_BATCH_MAX_CHARS // 2)),
     )
 )
+CUSTOM_VOICE_SESSION_DO_SAMPLE = os.environ.get(
+    "CUSTOM_VOICE_SESSION_DO_SAMPLE",
+    "1",
+) == "1"
+CUSTOM_VOICE_SESSION_SUBTALKER_DO_SAMPLE = os.environ.get(
+    "CUSTOM_VOICE_SESSION_SUBTALKER_DO_SAMPLE",
+    "1" if CUSTOM_VOICE_SESSION_DO_SAMPLE else "0",
+) == "1"
+CUSTOM_VOICE_SESSION_TEMPERATURE = float(
+    os.environ.get("CUSTOM_VOICE_SESSION_TEMPERATURE", "0.7")
+)
+CUSTOM_VOICE_SESSION_TOP_P = float(
+    os.environ.get("CUSTOM_VOICE_SESSION_TOP_P", "0.85")
+)
+CUSTOM_VOICE_SESSION_MAX_NEW_TOKENS = int(
+    os.environ.get("CUSTOM_VOICE_SESSION_MAX_NEW_TOKENS", "4096")
+)
+CUSTOM_VOICE_SESSION_MIN_NEW_TOKENS = int(
+    os.environ.get("CUSTOM_VOICE_SESSION_MIN_NEW_TOKENS", "512")
+)
+CUSTOM_VOICE_SESSION_MAX_NEW_TOKENS_PER_CHAR = int(
+    os.environ.get("CUSTOM_VOICE_SESSION_MAX_NEW_TOKENS_PER_CHAR", "4")
+)
 USE_TORCH_COMPILE = os.environ.get("USE_TORCH_COMPILE", "1") == "1"
 
 # Resource Isolation
@@ -531,6 +554,18 @@ logger.info(f"  - CUSTOM_VOICE_SESSION_BATCH_SIZE: {CUSTOM_VOICE_SESSION_BATCH_S
 logger.info(f"  - CUSTOM_VOICE_API_BATCH_SIZE: {CUSTOM_VOICE_API_BATCH_SIZE}")
 logger.info(
     f"  - CUSTOM_VOICE_SESSION_BATCH_PADDED_CHARS: {CUSTOM_VOICE_SESSION_BATCH_PADDED_CHARS}"
+)
+logger.info(f"  - CUSTOM_VOICE_SESSION_DO_SAMPLE: {CUSTOM_VOICE_SESSION_DO_SAMPLE}")
+logger.info(
+    f"  - CUSTOM_VOICE_SESSION_SUBTALKER_DO_SAMPLE: {CUSTOM_VOICE_SESSION_SUBTALKER_DO_SAMPLE}"
+)
+logger.info(f"  - CUSTOM_VOICE_SESSION_TEMPERATURE: {CUSTOM_VOICE_SESSION_TEMPERATURE}")
+logger.info(f"  - CUSTOM_VOICE_SESSION_TOP_P: {CUSTOM_VOICE_SESSION_TOP_P}")
+logger.info(f"  - CUSTOM_VOICE_SESSION_MAX_NEW_TOKENS: {CUSTOM_VOICE_SESSION_MAX_NEW_TOKENS}")
+logger.info(f"  - CUSTOM_VOICE_SESSION_MIN_NEW_TOKENS: {CUSTOM_VOICE_SESSION_MIN_NEW_TOKENS}")
+logger.info(
+    f"  - CUSTOM_VOICE_SESSION_MAX_NEW_TOKENS_PER_CHAR: "
+    f"{CUSTOM_VOICE_SESSION_MAX_NEW_TOKENS_PER_CHAR}"
 )
 logger.info(f"  - USE_TORCH_COMPILE: {USE_TORCH_COMPILE}")
 logger.info(f"  - REPLICA_THRESHOLD: {REPLICA_THRESHOLD}")
@@ -571,6 +606,15 @@ session_mgr = SessionManager(
     batch_size=CUSTOM_VOICE_SESSION_BATCH_SIZE,
     batch_text_budget=SESSION_BATCH_MAX_CHARS,
     batch_padded_text_budget=CUSTOM_VOICE_SESSION_BATCH_PADDED_CHARS,
+    custom_generation_kwargs={
+        "do_sample": CUSTOM_VOICE_SESSION_DO_SAMPLE,
+        "subtalker_dosample": CUSTOM_VOICE_SESSION_SUBTALKER_DO_SAMPLE,
+        "temperature": CUSTOM_VOICE_SESSION_TEMPERATURE,
+        "top_p": CUSTOM_VOICE_SESSION_TOP_P,
+    },
+    custom_min_new_tokens=CUSTOM_VOICE_SESSION_MIN_NEW_TOKENS,
+    custom_max_new_tokens=CUSTOM_VOICE_SESSION_MAX_NEW_TOKENS,
+    custom_max_new_tokens_per_char=CUSTOM_VOICE_SESSION_MAX_NEW_TOKENS_PER_CHAR,
 )
 
 # ---------------------------------------------------------------------------
@@ -667,14 +711,24 @@ voice_clone_batcher = DynamicBatcher(
     max_workers=1
 )
 
-custom_voice_batchers = {}  # Map (job_id, checkpoint_path) -> DynamicBatcher
+custom_voice_batchers = {}  # Map (job_id, checkpoint_path, generation_config) -> DynamicBatcher
 voice_clone_batch_jobs = {} # session_id -> {status, completed, total, results, error, ...}
 dataset_jobs = {}  # job_id -> {kind, status, total, completed, failed, ...}
 dataset_job_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DATASET_JOBS)
 
 
-def get_custom_voice_batcher(job_id: str, checkpoint_path: str, speaker_name: str) -> DynamicBatcher:
-    batcher_key = (job_id, checkpoint_path)
+def get_custom_voice_batcher(
+    job_id: str,
+    checkpoint_path: str,
+    speaker_name: str,
+    generation_config: Optional[dict[str, Any]] = None,
+) -> DynamicBatcher:
+    config = {
+        key: value
+        for key, value in (generation_config or {}).items()
+        if value is not None
+    }
+    batcher_key = (job_id, checkpoint_path, tuple(sorted(config.items())))
     if batcher_key not in custom_voice_batchers:
         def process_fn(texts: list[str], languages: list[str], instructs: list[str]):
             return pipeline.inference.generate_batch(
@@ -682,7 +736,8 @@ def get_custom_voice_batcher(job_id: str, checkpoint_path: str, speaker_name: st
                 checkpoint_path=checkpoint_path,
                 speaker_name=speaker_name,
                 languages=languages,
-                instructs=instructs
+                instructs=instructs,
+                **config,
             )
         custom_voice_batchers[batcher_key] = DynamicBatcher(
             batch_size=CUSTOM_VOICE_API_BATCH_SIZE,
@@ -1039,6 +1094,10 @@ class InferRequest(APIModel):
     language: str = "English"
     instruct: str = ""
     checkpoint_epoch: Optional[int] = None
+    do_sample: Optional[bool] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    max_new_tokens: Optional[int] = None
     upload_to_s3: bool = True  # Now default to True
     s3_filename: Optional[str] = None
     book_id: Optional[str] = None
@@ -1081,6 +1140,27 @@ class InferRequest(APIModel):
             raise ValueError("checkpoint_epoch must be >= 0")
         return value
 
+    @field_validator("temperature")
+    @classmethod
+    def validate_temperature(cls, value: Optional[float]) -> Optional[float]:
+        if value is not None and value <= 0:
+            raise ValueError("temperature must be > 0")
+        return value
+
+    @field_validator("top_p")
+    @classmethod
+    def validate_top_p(cls, value: Optional[float]) -> Optional[float]:
+        if value is not None and not (0 < value <= 1):
+            raise ValueError("top_p must be in (0, 1]")
+        return value
+
+    @field_validator("max_new_tokens")
+    @classmethod
+    def validate_max_new_tokens(cls, value: Optional[int]) -> Optional[int]:
+        if value is not None and value <= 0:
+            raise ValueError("max_new_tokens must be > 0")
+        return value
+
 
 class BatchInferItem(APIModel):
     text: str
@@ -1121,6 +1201,10 @@ class BatchInferRequest(APIModel):
     items: list[BatchInferItem]
     language: str = "English"
     checkpoint_epoch: Optional[int] = None
+    do_sample: Optional[bool] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    max_new_tokens: Optional[int] = None
     book_id: Optional[str] = None
     chapter_id: Optional[str] = None
     character_id: Optional[str] = None
@@ -1145,6 +1229,27 @@ class BatchInferRequest(APIModel):
     def validate_checkpoint_epoch(cls, value: Optional[int]) -> Optional[int]:
         if value is not None and value < 0:
             raise ValueError("checkpoint_epoch must be >= 0")
+        return value
+
+    @field_validator("temperature")
+    @classmethod
+    def validate_temperature(cls, value: Optional[float]) -> Optional[float]:
+        if value is not None and value <= 0:
+            raise ValueError("temperature must be > 0")
+        return value
+
+    @field_validator("top_p")
+    @classmethod
+    def validate_top_p(cls, value: Optional[float]) -> Optional[float]:
+        if value is not None and not (0 < value <= 1):
+            raise ValueError("top_p must be in (0, 1]")
+        return value
+
+    @field_validator("max_new_tokens")
+    @classmethod
+    def validate_max_new_tokens(cls, value: Optional[int]) -> Optional[int]:
+        if value is not None and value <= 0:
+            raise ValueError("max_new_tokens must be > 0")
         return value
 
 
@@ -1716,12 +1821,27 @@ async def infer(job_id: str, req: InferRequest):
             job,
             req.checkpoint_epoch,
         )
-        batcher = get_custom_voice_batcher(job_id, checkpoint_path, job.speaker_name)
+        generation_config = {
+            "do_sample": req.do_sample,
+            "temperature": req.temperature,
+            "top_p": req.top_p,
+            "max_new_tokens": req.max_new_tokens,
+        }
+        batcher = get_custom_voice_batcher(
+            job_id,
+            checkpoint_path,
+            job.speaker_name,
+            generation_config=generation_config,
+        )
         
         with ops_log.operation("inference_api", job_id=job_id, extra={
             "text_length": len(req.text),
             "upload_to_s3": req.upload_to_s3,
             "checkpoint_epoch": resolved_epoch,
+            "do_sample": req.do_sample,
+            "temperature": req.temperature,
+            "top_p": req.top_p,
+            "max_new_tokens": req.max_new_tokens,
         }):
             wav_bytes, sr = await batcher.submit(
                 texts=req.text,
@@ -1885,7 +2005,18 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
             # Run generation using the local batcher (fuses multiple requests into one GPU pass)
             try:
                 loop = asyncio.get_running_loop()
-                batcher = get_custom_voice_batcher(job_id, resolved_checkpoint_path, job.speaker_name)
+                generation_config = {
+                    "do_sample": req.do_sample,
+                    "temperature": req.temperature,
+                    "top_p": req.top_p,
+                    "max_new_tokens": req.max_new_tokens,
+                }
+                batcher = get_custom_voice_batcher(
+                    job_id,
+                    resolved_checkpoint_path,
+                    job.speaker_name,
+                    generation_config=generation_config,
+                )
                 
                 wav_bytes, sr = await batcher.submit(
                     texts=text,
@@ -2959,6 +3090,14 @@ async def session_prepare(req: SessionPrepareRequest):
             "workers_started": len(session.workers),
             "vram": pipeline.inference.get_vram_budget(),
         }
+    except DuplicateActiveSessionError as e:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(e),
+                "active_session_id": e.active_session_id,
+            },
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

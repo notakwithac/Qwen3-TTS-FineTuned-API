@@ -927,6 +927,7 @@ class InferenceManager:
         languages: list[str] = None,
         instructs: list[str] = None,
         max_new_tokens: Optional[int] = None,
+        **generation_kwargs,
     ) -> tuple[list[bytes], int]:
         """Generate speech for multiple texts using CustomVoice model."""
         if not languages:
@@ -948,22 +949,24 @@ class InferenceManager:
 
             try:
                 with self._track_active():
+                    effective_generate_kwargs = dict(generation_kwargs)
+                    if max_new_tokens is not None and "max_new_tokens" not in effective_generate_kwargs:
+                        effective_generate_kwargs["max_new_tokens"] = max_new_tokens
                     op = ops_log.start("inference_custom_voice_batch", extra={
                         "batch_size": len(texts),
                         "speaker": spk,
-                        "max_new_tokens": max_new_tokens,
+                        "max_new_tokens": effective_generate_kwargs.get("max_new_tokens"),
+                        "do_sample": effective_generate_kwargs.get("do_sample"),
                     })
                     logger.info(
-                        "Speaker '%s' started saying %s texts (max_new_tokens=%s).",
+                        "Speaker '%s' started saying %s texts (max_new_tokens=%s, do_sample=%s).",
                         spk,
                         len(texts),
-                        max_new_tokens,
+                        effective_generate_kwargs.get("max_new_tokens"),
+                        effective_generate_kwargs.get("do_sample"),
                     )
                     try:
                         speakers = [self._normalize_speaker_name(spk) if spk else spk] * len(texts)
-                        generate_kwargs = {}
-                        if max_new_tokens is not None:
-                            generate_kwargs["max_new_tokens"] = max_new_tokens
 
                         with model_lock:
                             wavs_list, sr = model.generate_custom_voice(
@@ -971,7 +974,7 @@ class InferenceManager:
                                 language=languages,
                                 speaker=speakers,
                                 instruct=instructs,
-                                **generate_kwargs,
+                                **effective_generate_kwargs,
                             )
 
                         # Encode WAVs in parallel on CPU threads (frees GPU thread)
@@ -1000,6 +1003,7 @@ class InferenceManager:
         language: str = "English",
         instruct: str = "",
         max_new_tokens: Optional[int] = None,
+        **generation_kwargs,
     ) -> tuple[bytes, int]:
         """Generate speech using CustomVoice model. Auto-loads if not in cache."""
         with ops_log.operation("gpu_resource_wait", extra={"checkpoint": checkpoint_path}):
@@ -1015,29 +1019,31 @@ class InferenceManager:
 
             try:
                 with self._track_active():
+                    effective_generate_kwargs = dict(generation_kwargs)
+                    if max_new_tokens is not None and "max_new_tokens" not in effective_generate_kwargs:
+                        effective_generate_kwargs["max_new_tokens"] = max_new_tokens
                     op = ops_log.start("inference_custom_voice", extra={
                         "text_length": len(text),
                         "language": language,
                         "speaker": spk,
-                        "max_new_tokens": max_new_tokens,
+                        "max_new_tokens": effective_generate_kwargs.get("max_new_tokens"),
+                        "do_sample": effective_generate_kwargs.get("do_sample"),
                     })
                     logger.info(
-                        "Speaker '%s' started saying text: '%s...' (max_new_tokens=%s)",
+                        "Speaker '%s' started saying text: '%s...' (max_new_tokens=%s, do_sample=%s)",
                         spk,
                         text[:50],
-                        max_new_tokens,
+                        effective_generate_kwargs.get("max_new_tokens"),
+                        effective_generate_kwargs.get("do_sample"),
                     )
                     try:
-                        generate_kwargs = {}
-                        if max_new_tokens is not None:
-                            generate_kwargs["max_new_tokens"] = max_new_tokens
                         with model_lock:
                             wavs, sr = model.generate_custom_voice(
                                 text=text,
                                 language=language,
                                 speaker=self._normalize_speaker_name(spk) if spk else spk,
                                 instruct=instruct if instruct else None,
-                                **generate_kwargs,
+                                **effective_generate_kwargs,
                             )
 
                         result = self._encode_wav(wavs[0], sr)

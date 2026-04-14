@@ -10,7 +10,20 @@ from session_manager import CharacterProgress, CharacterWorker, InferenceMessage
 class _StubInferenceManager:
     max_models = 1
 
-    def generate_batch(self, texts, checkpoint_path, speaker_name, languages=None, instructs=None):
+    def __init__(self):
+        self.calls = []
+
+    def generate_batch(self, texts, checkpoint_path, speaker_name, languages=None, instructs=None, **kwargs):
+        self.calls.append(
+            {
+                "texts": texts,
+                "checkpoint_path": checkpoint_path,
+                "speaker_name": speaker_name,
+                "languages": languages,
+                "instructs": instructs,
+                "kwargs": kwargs,
+            }
+        )
         return [b"wav" for _ in texts], 24000
 
 
@@ -177,10 +190,17 @@ async def test_worker_stop_waits_for_active_batch_completion():
     started = Event()
 
     class _SlowInferenceManager(_StubInferenceManager):
-        def generate_batch(self, texts, checkpoint_path, speaker_name, languages=None, instructs=None):
+        def generate_batch(self, texts, checkpoint_path, speaker_name, languages=None, instructs=None, **kwargs):
             started.set()
             time.sleep(0.05)
-            return super().generate_batch(texts, checkpoint_path, speaker_name, languages, instructs)
+            return super().generate_batch(
+                texts,
+                checkpoint_path,
+                speaker_name,
+                languages,
+                instructs,
+                **kwargs,
+            )
 
     worker = CharacterWorker(
         worker_id="worker-3",
@@ -207,3 +227,33 @@ async def test_worker_stop_waits_for_active_batch_completion():
     assert worker.progress.completed == 1
     assert worker._task is not None
     assert worker._task.done()
+
+
+@pytest.mark.asyncio
+async def test_worker_applies_bounded_deterministic_generation_defaults():
+    queue = asyncio.Queue()
+    inference = _StubInferenceManager()
+    worker = CharacterWorker(
+        worker_id="worker-generate-kwargs",
+        queue=queue,
+        inference_manager=inference,
+        worker_semaphore=asyncio.Semaphore(1),
+        cache_key="checkpoint",
+        speaker_name="Narrator",
+        batch_size=1,
+        batch_timeout_ms=1,
+        generation_kwargs={"do_sample": False, "subtalker_dosample": False},
+        min_new_tokens=512,
+        max_new_tokens=1536,
+        max_new_tokens_per_char=4,
+        progress=CharacterProgress(),
+    )
+
+    await worker._process_batch([_msg("x" * 325)], asyncio.get_running_loop())
+
+    assert inference.calls
+    assert inference.calls[-1]["kwargs"] == {
+        "do_sample": False,
+        "subtalker_dosample": False,
+        "max_new_tokens": 1300,
+    }
