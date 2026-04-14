@@ -121,7 +121,7 @@ def _normalize_transcript_text(text: str) -> str:
 
 def _sentence_units(text: str) -> int:
     matches = SENTENCE_PUNCT_RE.findall(text or "")
-    return max(1, len(matches))
+    return len(matches)
 
 
 def _split_sentences(text: str) -> list[str]:
@@ -333,6 +333,50 @@ def _chunk_segments(
     return chunks
 
 
+def _split_chunk_by_duration(chunk: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    if not chunk:
+        return []
+
+    groups: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    current_start = 0.0
+    current_end = 0.0
+
+    for seg in chunk:
+        if not current:
+            current = [seg]
+            current_start = seg["start"]
+            current_end = seg["end"]
+            continue
+
+        proposed_duration = seg["end"] - current_start
+        current_duration = current_end - current_start
+        gap = max(0.0, seg["start"] - current_end)
+
+        should_merge = False
+        if proposed_duration <= DATASET_SAMPLE_TARGET_SEC:
+            should_merge = True
+        elif proposed_duration <= DATASET_SAMPLE_MAX_SEC and (
+            current_duration < DATASET_SAMPLE_MIN_SEC or gap <= DATASET_MERGE_GAP_SEC
+        ):
+            should_merge = True
+
+        if should_merge:
+            current.append(seg)
+            current_end = seg["end"]
+            continue
+
+        groups.append(current)
+        current = [seg]
+        current_start = seg["start"]
+        current_end = seg["end"]
+
+    if current:
+        groups.append(current)
+
+    return groups
+
+
 def _build_split_results(
     filename: str,
     wav_bytes: bytes,
@@ -350,47 +394,22 @@ def _build_split_results(
 
     results: list[tuple[str, bytes, str, bool, str, str | None]] = []
     for idx, chunk in enumerate(chunks):
-        start_ms = max(0, int(chunk[0]["start"] * 1000) - 100)
-        end_ms = min(len(audio_segment), int(chunk[-1]["end"] * 1000) + 100)
-        cropped = audio_segment[start_ms:end_ms]
-        transcript = _join_segment_text(chunk)
-        if len(cropped) <= 0 or not transcript:
-            continue
-
-        sentence_chunks = _group_sentences(_split_sentences(transcript), 1)
-        transcript = sentence_chunks[0] if sentence_chunks else transcript
-
-        max_ms = int(DATASET_SAMPLE_MAX_SEC * 1000)
-        base_parts = max(1, math.ceil(len(cropped) / max_ms))
-        sentence_parts = max(1, math.ceil(len(_split_sentences(transcript)) / DATASET_MAX_SENTENCES_PER_CLIP))
-        total_parts = max(base_parts, sentence_parts)
-
-        text_parts = _group_sentences(_split_sentences(transcript), total_parts)
-        total_parts = max(total_parts, len(text_parts))
-        if total_parts <= 1:
-            audio_parts = [cropped]
-        else:
-            part_ms = max(1, int(math.ceil(len(cropped) / total_parts)))
-            audio_parts = [
-                cropped[i * part_ms:min((i + 1) * part_ms, len(cropped))]
-                for i in range(total_parts)
-            ]
-        if len(text_parts) < len(audio_parts):
-            text_parts.extend([text_parts[-1] if text_parts else transcript] * (len(audio_parts) - len(text_parts)))
-
-        for part_idx, part_audio in enumerate(audio_parts):
-            if len(part_audio) <= 0:
+        duration_groups = _split_chunk_by_duration(chunk)
+        for part_idx, part_segments in enumerate(duration_groups):
+            start_ms = max(0, int(part_segments[0]["start"] * 1000) - 100)
+            end_ms = min(len(audio_segment), int(part_segments[-1]["end"] * 1000) + 100)
+            cropped = audio_segment[start_ms:end_ms]
+            transcript = _join_segment_text(part_segments)
+            if len(cropped) <= 0 or not transcript:
                 continue
+
             out_buf = io.BytesIO()
-            part_audio.export(out_buf, format="wav")
+            cropped.export(out_buf, format="wav")
             normalized_wav = _normalize_audio_for_dataset_sync(out_buf.getvalue())
-            part_text = _normalize_transcript_text(text_parts[part_idx] if part_idx < len(text_parts) else transcript)
-            if not part_text:
-                continue
             clip_name = _segmented_filename(filename, idx, len(chunks))
-            if len(audio_parts) > 1:
+            if len(duration_groups) > 1:
                 clip_name = _append_filename_suffix(clip_name, f"__part_{part_idx:03d}")
-            results.append((clip_name, normalized_wav, prompt_id, True, part_text, None))
+            results.append((clip_name, normalized_wav, prompt_id, True, transcript, None))
     return results
 
 

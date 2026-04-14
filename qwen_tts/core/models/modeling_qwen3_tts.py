@@ -1749,9 +1749,10 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         loss = None
         if labels is not None:
             import torch.nn.functional as F
+            shift_labels = F.pad(labels, (0, 1), value=-100)[..., 1:].contiguous()
             loss = F.cross_entropy(
                 logits.reshape(-1, self.config.vocab_size),
-                labels.reshape(-1),
+                shift_labels.reshape(-1),
                 ignore_index=-100,
             )
 

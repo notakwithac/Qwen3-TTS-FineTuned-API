@@ -240,6 +240,66 @@ def test_validate_and_crop_audio_splits_long_dominant_speaker_segments(monkeypat
     assert [item[4] for item in result] == ["One.", "Two.", "Three.", "Four."]
 
 
+def test_build_split_results_keeps_time_aligned_transcripts(monkeypatch):
+    class _FakeSlice:
+        def __init__(self, duration_ms: int):
+            self.duration_ms = duration_ms
+
+        def __len__(self):
+            return self.duration_ms
+
+        def export(self, buf, format="wav"):
+            buf.write(_make_wav_bytes(max(self.duration_ms / 1000.0, 0.1)))
+
+    class _FakeAudioSegment:
+        def __init__(self, duration_ms: int):
+            self.duration_ms = duration_ms
+
+        @classmethod
+        def from_wav(cls, _stream):
+            return cls(24_000)
+
+        def __len__(self):
+            return self.duration_ms
+
+        def __getitem__(self, key):
+            start = 0 if key.start is None else key.start
+            stop = self.duration_ms if key.stop is None else key.stop
+            return _FakeSlice(max(0, stop - start))
+
+    fake_pydub = types.SimpleNamespace(AudioSegment=_FakeAudioSegment)
+    monkeypatch.setitem(sys.modules, "pydub", fake_pydub)
+    monkeypatch.setattr(dataset_jobs, "_normalize_audio_for_dataset_sync", lambda audio_bytes: audio_bytes)
+
+    segments = [
+        {"start": 0.0, "end": 4.0, "text": "alpha", "speaker": "SPEAKER_00"},
+        {"start": 4.1, "end": 8.0, "text": "beta", "speaker": "SPEAKER_00"},
+        {"start": 8.1, "end": 12.0, "text": "gamma", "speaker": "SPEAKER_00"},
+        {"start": 12.1, "end": 16.0, "text": "delta", "speaker": "SPEAKER_00"},
+        {"start": 16.1, "end": 20.0, "text": "epsilon", "speaker": "SPEAKER_00"},
+        {"start": 20.1, "end": 24.0, "text": "zeta", "speaker": "SPEAKER_00"},
+    ]
+
+    result = dataset_jobs._build_split_results(
+        "clip.wav",
+        _make_wav_bytes(24.0),
+        "prompt-1",
+        segments,
+        main_speaker="SPEAKER_00",
+    )
+
+    assert [item[0] for item in result] == [
+        "clip__seg_000.wav",
+        "clip__seg_001.wav",
+        "clip__seg_002.wav",
+    ]
+    assert [item[4] for item in result] == [
+        "Alpha beta.",
+        "Gamma delta.",
+        "Epsilon zeta.",
+    ]
+
+
 def test_prepare_dataset_items_preserves_reference_item(monkeypatch):
     uploaded: list[tuple[str, bytes]] = []
 
