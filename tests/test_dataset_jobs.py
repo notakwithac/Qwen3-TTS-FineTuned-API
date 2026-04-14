@@ -63,7 +63,7 @@ def test_validate_and_crop_audio_falls_back_without_diarization_token(monkeypatc
     assert filename == "clip.wav"
     assert prompt_id == "prompt-1"
     assert success is True
-    assert transcript == "hello there"
+    assert transcript == "Hello there."
     assert "HF_TOKEN" in (reason or "")
 
 
@@ -114,7 +114,7 @@ def test_validate_and_crop_audio_retries_on_cpu_after_cuda_oom(monkeypatch):
 
     assert calls == [("cuda", "float16"), ("cpu", "int8")]
     assert result[0][3] is True
-    assert result[0][4] == "major barry"
+    assert result[0][4] == "Major barry."
 
 
 def test_validate_and_crop_audio_auto_uses_cpu_when_cuda_headroom_is_too_low(monkeypatch):
@@ -167,7 +167,7 @@ def test_validate_and_crop_audio_auto_uses_cpu_when_cuda_headroom_is_too_low(mon
 
     assert calls == [("cpu", "int8")]
     assert result[0][3] is True
-    assert result[0][4] == "narrator line"
+    assert result[0][4] == "Narrator line."
 
 
 def test_validate_and_crop_audio_splits_long_dominant_speaker_segments(monkeypatch):
@@ -235,9 +235,9 @@ def test_validate_and_crop_audio_splits_long_dominant_speaker_segments(monkeypat
         "Elena",
     )
 
-    assert len(result) == 2
-    assert [item[0] for item in result] == ["clip__seg_000.wav", "clip__seg_001.wav"]
-    assert [item[4] for item in result] == ["one two", "three four"]
+    assert len(result) == 4
+    assert [item[0] for item in result] == ["clip__seg_000.wav", "clip__seg_001.wav", "clip__seg_002.wav", "clip__seg_003.wav"]
+    assert [item[4] for item in result] == ["One.", "Two.", "Three.", "Four."]
 
 
 def test_prepare_dataset_items_preserves_reference_item(monkeypatch):
@@ -286,7 +286,7 @@ def test_prepare_dataset_items_preserves_reference_item(monkeypatch):
 
     assert items[0]["id"] == "ref_audio.wav"
     assert items[0]["is_reference"] is True
-    assert items[0]["text"] == "reference text"
+    assert items[0]["text"] == "Reference text."
     assert [item["id"] for item in items[1:]] == ["clip-1.wav", "clip-2.wav"]
     assert sum(1 for item in items if item["is_reference"]) == 1
     assert uploaded[0][0].endswith("_ref_audio.wav")

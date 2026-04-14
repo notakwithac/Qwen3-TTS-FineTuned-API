@@ -4,7 +4,10 @@ import asyncio
 import io
 import json
 import logging
+import math
 import os
+import re
+import subprocess
 import tempfile
 import threading
 import zipfile
@@ -15,29 +18,249 @@ log = logging.getLogger(__name__)
 
 _whisper_cache: dict[str, Any] = {}
 _cache_lock = threading.Lock()
-DATASET_SAMPLE_MIN_SEC = 10.0
-DATASET_SAMPLE_TARGET_SEC = 15.0
-DATASET_SAMPLE_MAX_SEC = 30.0
+DATASET_SAMPLE_MIN_SEC = 1.2
+DATASET_SAMPLE_TARGET_SEC = 8.0
+DATASET_SAMPLE_MAX_SEC = 10.0
 DATASET_MERGE_GAP_SEC = 0.75
+DATASET_MAX_SENTENCES_PER_CLIP = 2
+DATASET_TARGET_LUFS = -20.0
+DATASET_TP_DB = -1.5
+
+SENTENCE_PUNCT_RE = re.compile(r"[.!?]+")
+DIGIT_RE = re.compile(r"\d+")
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _number_to_words(number: int) -> str:
+    under_20 = [
+        "zero",
+        "one",
+        "two",
+        "three",
+        "four",
+        "five",
+        "six",
+        "seven",
+        "eight",
+        "nine",
+        "ten",
+        "eleven",
+        "twelve",
+        "thirteen",
+        "fourteen",
+        "fifteen",
+        "sixteen",
+        "seventeen",
+        "eighteen",
+        "nineteen",
+    ]
+    tens = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+
+    def _inner(n: int) -> str:
+        if n < 20:
+            return under_20[n]
+        if n < 100:
+            head = tens[n // 10]
+            tail = n % 10
+            return head if tail == 0 else f"{head} {under_20[tail]}"
+        if n < 1000:
+            head = f"{under_20[n // 100]} hundred"
+            tail = n % 100
+            return head if tail == 0 else f"{head} {_inner(tail)}"
+        if n < 1_000_000:
+            head = f"{_inner(n // 1000)} thousand"
+            tail = n % 1000
+            return head if tail == 0 else f"{head} {_inner(tail)}"
+        if n < 1_000_000_000:
+            head = f"{_inner(n // 1_000_000)} million"
+            tail = n % 1_000_000
+            return head if tail == 0 else f"{head} {_inner(tail)}"
+        head = f"{_inner(n // 1_000_000_000)} billion"
+        tail = n % 1_000_000_000
+        return head if tail == 0 else f"{head} {_inner(tail)}"
+
+    return _inner(number)
+
+
+def _replace_numbers(text: str) -> str:
+    def _repl(match: re.Match[str]) -> str:
+        try:
+            return _number_to_words(int(match.group(0)))
+        except Exception:
+            return match.group(0)
+
+    return DIGIT_RE.sub(_repl, text)
+
+
+def _normalize_transcript_text(text: str) -> str:
+    cleaned = _replace_numbers((text or "").strip())
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = re.sub(r"\s+([,.;!?])", r"\1", cleaned)
+    cleaned = re.sub(r"([,.;!?])([^\s])", r"\1 \2", cleaned)
+    cleaned = cleaned.strip(" ,")
+    if not cleaned:
+        return ""
+
+    parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", cleaned) if p.strip()]
+    if not parts:
+        parts = [cleaned]
+    normalized_parts: list[str] = []
+    for part in parts:
+        part = re.sub(r"[,;:]+$", "", part).strip()
+        if not part:
+            continue
+        part = part[0].upper() + part[1:] if part else part
+        if part[-1] not in ".!?":
+            part = f"{part}."
+        normalized_parts.append(part)
+    return " ".join(normalized_parts).strip()
+
+
+def _sentence_units(text: str) -> int:
+    matches = SENTENCE_PUNCT_RE.findall(text or "")
+    return max(1, len(matches))
+
+
+def _split_sentences(text: str) -> list[str]:
+    if not text.strip():
+        return []
+    parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", text.strip()) if p.strip()]
+    if not parts:
+        return [text.strip()]
+    out: list[str] = []
+    for part in parts:
+        if part[-1] not in ".!?":
+            part = f"{part}."
+        out.append(part)
+    return out
+
+
+def _group_sentences(sentences: list[str], parts: int, max_per_clip: int = DATASET_MAX_SENTENCES_PER_CLIP) -> list[str]:
+    if parts <= 1:
+        return [" ".join(sentences).strip()] if sentences else []
+    if not sentences:
+        return []
+
+    target_parts = max(parts, math.ceil(len(sentences) / max_per_clip))
+    grouped: list[list[str]] = [[] for _ in range(target_parts)]
+
+    sentence_idx = 0
+    for group_idx in range(target_parts):
+        remaining_sentences = len(sentences) - sentence_idx
+        remaining_groups = target_parts - group_idx
+        take = max(1, math.ceil(remaining_sentences / remaining_groups))
+        take = min(take, max_per_clip)
+        grouped[group_idx].extend(sentences[sentence_idx:sentence_idx + take])
+        sentence_idx += take
+        if sentence_idx >= len(sentences):
+            break
+
+    progress_made = True
+    while sentence_idx < len(sentences) and progress_made:
+        progress_made = False
+        for group in grouped:
+            if len(group) < max_per_clip and sentence_idx < len(sentences):
+                group.append(sentences[sentence_idx])
+                sentence_idx += 1
+                progress_made = True
+
+    return [" ".join(group).strip() for group in grouped if group]
+
+
+def _append_filename_suffix(filename: str, suffix: str) -> str:
+    stem, dot, ext = filename.rpartition(".")
+    if not dot:
+        stem = filename
+        ext = ""
+    return f"{stem}{suffix}.{ext}" if ext else f"{stem}{suffix}"
+
+
+def _normalize_audio_for_dataset_sync(audio_bytes: bytes) -> bytes:
+    filters = [
+        "silenceremove=start_periods=1:start_duration=0.08:start_threshold=-45dB",
+        "silenceremove=stop_periods=1:stop_duration=0.12:stop_threshold=-45dB",
+        "aformat=channel_layouts=mono",
+        f"loudnorm=I={DATASET_TARGET_LUFS}:LRA=7:TP={DATASET_TP_DB}",
+        "aresample=24000",
+    ]
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        "pipe:0",
+        "-af",
+        ",".join(filters),
+        "-f",
+        "wav",
+        "pipe:1",
+    ]
+    try:
+        process = subprocess.run(
+            cmd,
+            input=audio_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if process.returncode != 0 or not process.stdout:
+            if process.stderr:
+                log.warning("Dataset audio normalize failed: %s", process.stderr.decode("utf-8", errors="ignore"))
+            return audio_bytes
+        return process.stdout
+    except Exception as exc:
+        log.warning("Dataset audio normalize exception: %s", exc)
+        return audio_bytes
+
+
 def _join_segment_text(segments: list[dict[str, Any]]) -> str:
-    return " ".join(seg.get("text", "").strip() for seg in segments if seg.get("text", "").strip()).strip()
+    if not segments:
+        return ""
+    parts: list[str] = []
+    prev_end: float | None = None
+    for seg in segments:
+        raw = (seg.get("text") or "").strip()
+        if not raw:
+            continue
+        text = re.sub(r"\s+", " ", raw).strip()
+        if prev_end is not None and parts:
+            gap = max(0.0, float(seg.get("start", 0.0) or 0.0) - prev_end)
+            # For dataset work we strongly prefer hard sentence boundaries over commas.
+            # Commas are a common failure mode for ASR: they "mash" two unrelated
+            # sentences together (exactly the issue we want to avoid when trimming
+            # clips to ~2 sentences). Treat moderate gaps as sentence ends.
+            if gap >= 0.45:
+                parts[-1] = parts[-1].rstrip(",.;!?") + "."
+        parts.append(text.strip(" ,"))
+        prev_end = float(seg.get("end", 0.0) or 0.0)
+    return _normalize_transcript_text(" ".join(parts))
+
+
+def _safe_transcribe(model: Any, audio: Any, **kwargs) -> dict[str, Any]:
+    """
+    Call `model.transcribe(...)` with only the kwargs that the installed whisperx
+    version supports. This keeps us compatible across whisperx releases / backends.
+    """
+    import inspect
+
+    try:
+        sig = inspect.signature(model.transcribe)
+        allowed = set(sig.parameters.keys())
+        filtered = {k: v for k, v in kwargs.items() if k in allowed}
+    except Exception:
+        filtered = kwargs
+    return model.transcribe(audio, **filtered)
 
 
 def _segmented_filename(filename: str, segment_index: int, total_segments: int) -> str:
     if total_segments <= 1:
         return filename
-    stem, dot, ext = filename.rpartition(".")
-    if not dot:
-        stem = filename
-        ext = ""
     suffix = f"__seg_{segment_index:03d}"
-    return f"{stem}{suffix}.{ext}" if ext else f"{stem}{suffix}"
+    return _append_filename_suffix(filename, suffix)
 
 
 def _chunk_segments(
@@ -63,33 +286,46 @@ def _chunk_segments(
     current: list[dict[str, Any]] = []
     current_start = 0.0
     current_end = 0.0
+    current_sentence_units = 0
 
     for seg in speaker_segments:
         if not current:
             current = [seg]
             current_start = seg["start"]
             current_end = seg["end"]
+            current_sentence_units = _sentence_units(seg["text"])
             continue
 
         gap = max(0.0, seg["start"] - current_end)
         proposed_duration = seg["end"] - current_start
-        current_duration = current_end - current_start
+        seg_sentence_units = _sentence_units(seg["text"])
+        proposed_sentence_units = current_sentence_units + seg_sentence_units
 
         should_merge = False
-        if gap <= DATASET_MERGE_GAP_SEC and proposed_duration <= DATASET_SAMPLE_TARGET_SEC:
+        if (
+            gap <= DATASET_MERGE_GAP_SEC
+            and proposed_duration <= DATASET_SAMPLE_TARGET_SEC
+            and proposed_sentence_units <= DATASET_MAX_SENTENCES_PER_CLIP
+        ):
             should_merge = True
-        elif current_duration < DATASET_SAMPLE_MIN_SEC and proposed_duration <= DATASET_SAMPLE_MAX_SEC:
+        elif (
+            proposed_duration <= DATASET_SAMPLE_MAX_SEC
+            and proposed_sentence_units <= DATASET_MAX_SENTENCES_PER_CLIP
+            and gap <= (DATASET_MERGE_GAP_SEC * 0.5)
+        ):
             should_merge = True
 
         if should_merge:
             current.append(seg)
             current_end = seg["end"]
+            current_sentence_units = proposed_sentence_units
             continue
 
         chunks.append(current)
         current = [seg]
         current_start = seg["start"]
         current_end = seg["end"]
+        current_sentence_units = seg_sentence_units
 
     if current:
         chunks.append(current)
@@ -120,18 +356,41 @@ def _build_split_results(
         transcript = _join_segment_text(chunk)
         if len(cropped) <= 0 or not transcript:
             continue
-        out_buf = io.BytesIO()
-        cropped.export(out_buf, format="wav")
-        results.append(
-            (
-                _segmented_filename(filename, idx, len(chunks)),
-                out_buf.getvalue(),
-                prompt_id,
-                True,
-                transcript,
-                None,
-            )
-        )
+
+        sentence_chunks = _group_sentences(_split_sentences(transcript), 1)
+        transcript = sentence_chunks[0] if sentence_chunks else transcript
+
+        max_ms = int(DATASET_SAMPLE_MAX_SEC * 1000)
+        base_parts = max(1, math.ceil(len(cropped) / max_ms))
+        sentence_parts = max(1, math.ceil(len(_split_sentences(transcript)) / DATASET_MAX_SENTENCES_PER_CLIP))
+        total_parts = max(base_parts, sentence_parts)
+
+        text_parts = _group_sentences(_split_sentences(transcript), total_parts)
+        total_parts = max(total_parts, len(text_parts))
+        if total_parts <= 1:
+            audio_parts = [cropped]
+        else:
+            part_ms = max(1, int(math.ceil(len(cropped) / total_parts)))
+            audio_parts = [
+                cropped[i * part_ms:min((i + 1) * part_ms, len(cropped))]
+                for i in range(total_parts)
+            ]
+        if len(text_parts) < len(audio_parts):
+            text_parts.extend([text_parts[-1] if text_parts else transcript] * (len(audio_parts) - len(text_parts)))
+
+        for part_idx, part_audio in enumerate(audio_parts):
+            if len(part_audio) <= 0:
+                continue
+            out_buf = io.BytesIO()
+            part_audio.export(out_buf, format="wav")
+            normalized_wav = _normalize_audio_for_dataset_sync(out_buf.getvalue())
+            part_text = _normalize_transcript_text(text_parts[part_idx] if part_idx < len(text_parts) else transcript)
+            if not part_text:
+                continue
+            clip_name = _segmented_filename(filename, idx, len(chunks))
+            if len(audio_parts) > 1:
+                clip_name = _append_filename_suffix(clip_name, f"__part_{part_idx:03d}")
+            results.append((clip_name, normalized_wav, prompt_id, True, part_text, None))
     return results
 
 
@@ -501,7 +760,20 @@ def _validate_and_crop_audio_sync(
                 audio = whisperx.load_audio(temp_wav_path)
 
                 t0 = _time.monotonic()
-                result = model.transcribe(audio, batch_size=8)
+                # "turbo" models are fast but can be less stable; these decoding
+                # options reduce cross-sentence bleed and improve word choice.
+                # We pass them through _safe_transcribe so older whisperx builds
+                # won't break if they don't support a particular knob.
+                result = _safe_transcribe(
+                    model,
+                    audio,
+                    batch_size=8,
+                    language=(os.environ.get("DATASET_LANGUAGE", "en") or "en"),
+                    temperature=0.0,
+                    beam_size=5,
+                    best_of=5,
+                    condition_on_previous_text=False,
+                )
                 log.info(
                     "[%s] Clip %d/%d: transcription done in %.1fs — lang=%s, %d segments",
                     char_name,
@@ -713,6 +985,8 @@ async def prepare_dataset_items(
 ) -> list[dict[str, Any]]:
     ref_audio = await _download_bytes(storage, ref_audio_url)
     ref_audio = await apply_audio_fx(ref_audio, amplitude=amplitude, speed=speed, pitch_shift=pitch_shift)
+    ref_audio = _normalize_audio_for_dataset_sync(ref_audio)
+    ref_text = _normalize_transcript_text(ref_text)
 
     raw_audio_segments: list[tuple[str, bytes, str]] = [("ref_audio.wav", ref_audio, "ref_audio")]
     prompt_id_to_text: dict[str, str] = {"ref_audio": ref_text}
@@ -726,10 +1000,11 @@ async def prepare_dataset_items(
             continue
         prompt_id = str(item.get("prompt_id") or filename)
         prompt_text = str(item.get("text") or "")
-        prompt_id_to_text[prompt_id] = prompt_text
+        prompt_id_to_text[prompt_id] = _normalize_transcript_text(prompt_text)
 
         content = await _download_bytes(storage, ref)
         content = await apply_audio_fx(content, amplitude=amplitude, speed=speed, pitch_shift=pitch_shift)
+        content = _normalize_audio_for_dataset_sync(content)
         raw_audio_segments.append((filename, content, prompt_id))
 
     validated_segments = await validate_and_crop_audio(raw_audio_segments, character_name)
@@ -744,14 +1019,45 @@ async def prepare_dataset_items(
             if failure_reason:
                 failure_reasons.append(f"{filename}: {failure_reason}")
             continue
-        final_train_segments.append((filename, wav_bytes))
-        final_transcripts.append(transcript)
+        # Important: do NOT train on ASR output when we already know the canonical
+        # text for the clip (e.g., Harvard prompts). Whisper is only used here for
+        # diarization and cut points.
+        canonical = prompt_id_to_text.get(prompt_id) or ""
+        normalized_transcript = canonical or _normalize_transcript_text(transcript)
+        if not normalized_transcript:
+            if failure_reason:
+                failure_reasons.append(f"{filename}: transcript empty after normalization")
+            continue
+        final_train_segments.append((filename, _normalize_audio_for_dataset_sync(wav_bytes)))
+        final_transcripts.append(normalized_transcript)
 
     if not final_train_segments:
         detail = "; ".join(failure_reasons[:3]) if failure_reasons else "all clips failed validation"
         raise RuntimeError(f"No valid segments available for finetuning dataset. {detail}")
 
     dataset_items: list[dict[str, Any]] = []
+    ref_key = f"datasets/{book_id}/items/{character_id}_{job_id}_ref_audio.wav"
+    ref_s3_url = await _upload_bytes(
+        storage,
+        ref_audio,
+        ref_key,
+        content_type="audio/wav",
+        metadata={
+            "character_id": character_id,
+            "job_id": job_id,
+            "type": "dataset_item_ref",
+        },
+    )
+    dataset_items.append(
+        {
+            "id": "ref_audio.wav",
+            "url": storage.get_presigned_url(ref_key, expires_in=86400 * 7),
+            "s3_url": ref_s3_url,
+            "text": ref_text,
+            "is_reference": True,
+            "included": True,
+        }
+    )
 
     for idx, (filename, wav_bytes) in enumerate(final_train_segments):
         transcript = final_transcripts[idx]
@@ -831,13 +1137,19 @@ async def package_dataset(
     chosen_ref_audio: bytes | None = None
 
     for item in dataset_items:
+        if item.get("included") is False:
+            continue
         ref = item.get("s3_url") or item.get("url")
         if not ref:
             continue
         wav_bytes = await _download_bytes(storage, str(ref))
+        wav_bytes = _normalize_audio_for_dataset_sync(wav_bytes)
         filename = str(item.get("id") or item.get("filename") or "").strip()
-        transcript = str(item.get("text") or "").strip()
+        transcript = _normalize_transcript_text(str(item.get("text") or "").strip())
         if not filename or not transcript:
+            continue
+        if item.get("is_reference") is True:
+            chosen_ref_audio = wav_bytes
             continue
         final_train_segments.append((filename, wav_bytes))
         final_transcripts.append(transcript)
