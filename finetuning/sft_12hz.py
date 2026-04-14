@@ -416,10 +416,10 @@ def train():
                     labels=codec_0_labels,
                     output_hidden_states=True
                 )
-                # Sub-talker loss: hidden_states shape [B, T, D]，codec_mask shape [B, T]
-                hidden_states = outputs.hidden_states[0][-1]
+                # Use the timestep that predicts the next codec-0 token for sub-codec supervision.
+                hidden_states = outputs.hidden_states[0][-1][:, :-1, :]
                 target_codec_mask = codec_mask[:, 1:]
-                talker_hidden_states = hidden_states[:, :-1][target_codec_mask]
+                talker_hidden_states = hidden_states[target_codec_mask]
                 talker_codec_ids = codec_ids[:, 1:][target_codec_mask]
 
                 sub_talker_logits, sub_talker_loss = model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
@@ -710,10 +710,10 @@ def train_programmatic(
                     labels=codec_0_labels,
                     output_hidden_states=True
                 )
-                # Sub-talker loss: hidden_states shape [B, T, D]，codec_mask shape [B, T]
-                hidden_states = outputs.hidden_states[0][-1]
+                # Use the timestep that predicts the next codec-0 token for sub-codec supervision.
+                hidden_states = outputs.hidden_states[0][-1][:, :-1, :]
                 target_codec_mask = codec_mask[:, 1:]
-                talker_hidden_states = hidden_states[:, :-1][target_codec_mask]
+                talker_hidden_states = hidden_states[target_codec_mask]
                 talker_codec_ids = codec_ids[:, 1:][target_codec_mask]
                 sub_talker_logits, sub_talker_loss = model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
                 loss = outputs.loss + 0.3 * sub_talker_loss
