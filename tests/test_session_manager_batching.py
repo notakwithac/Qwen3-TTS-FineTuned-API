@@ -36,6 +36,7 @@ async def test_worker_groups_messages_until_text_budget_is_reached():
         batch_size=10,
         batch_timeout_ms=1,
         batch_text_budget=6,
+        initial_batch_size=10,
         progress=CharacterProgress(),
     )
 
@@ -43,6 +44,7 @@ async def test_worker_groups_messages_until_text_budget_is_reached():
 
     async def _capture(batch, _loop):
         seen_batches.append([msg.text for msg in batch])
+        worker._first_batch_pending = False
         if len(seen_batches) >= 2:
             worker._running = False
 
@@ -59,6 +61,42 @@ async def test_worker_groups_messages_until_text_budget_is_reached():
 
 
 @pytest.mark.asyncio
+async def test_worker_uses_single_item_initial_batch_for_faster_first_result():
+    queue = asyncio.Queue()
+    worker = CharacterWorker(
+        worker_id="worker-initial",
+        queue=queue,
+        inference_manager=_StubInferenceManager(),
+        worker_semaphore=asyncio.Semaphore(1),
+        cache_key="checkpoint",
+        speaker_name="Narrator",
+        batch_size=10,
+        batch_timeout_ms=1,
+        batch_text_budget=100,
+        progress=CharacterProgress(),
+    )
+
+    seen_batches: list[list[str]] = []
+
+    async def _capture(batch, _loop):
+        seen_batches.append([msg.text for msg in batch])
+        worker._first_batch_pending = False
+        if len(seen_batches) >= 2:
+            worker._running = False
+
+    worker._process_batch = _capture  # type: ignore[method-assign]
+
+    await queue.put(_msg("first"))
+    await queue.put(_msg("second"))
+    await queue.put(_msg("third"))
+
+    worker.start()
+    await asyncio.wait_for(worker._task, timeout=1.0)
+
+    assert seen_batches == [["first"], ["second", "third"]]
+
+
+@pytest.mark.asyncio
 async def test_worker_splits_when_padded_batch_cost_exceeds_budget():
     queue = asyncio.Queue()
     worker = CharacterWorker(
@@ -72,6 +110,7 @@ async def test_worker_splits_when_padded_batch_cost_exceeds_budget():
         batch_timeout_ms=1,
         batch_text_budget=100,
         batch_padded_text_budget=12,
+        initial_batch_size=10,
         progress=CharacterProgress(),
     )
 
@@ -79,6 +118,7 @@ async def test_worker_splits_when_padded_batch_cost_exceeds_budget():
 
     async def _capture(batch, _loop):
         seen_batches.append([msg.text for msg in batch])
+        worker._first_batch_pending = False
         if len(seen_batches) >= 2:
             worker._running = False
 
@@ -108,6 +148,7 @@ async def test_worker_allows_single_oversized_dialogue_as_its_own_batch():
         batch_timeout_ms=1,
         batch_text_budget=10,
         batch_padded_text_budget=10,
+        initial_batch_size=10,
         progress=CharacterProgress(),
     )
 
@@ -115,6 +156,7 @@ async def test_worker_allows_single_oversized_dialogue_as_its_own_batch():
 
     async def _capture(batch, _loop):
         seen_batches.append([msg.text for msg in batch])
+        worker._first_batch_pending = False
         if len(seen_batches) >= 2:
             worker._running = False
 
@@ -150,6 +192,7 @@ async def test_worker_stop_waits_for_active_batch_completion():
         batch_size=10,
         batch_timeout_ms=1,
         batch_text_budget=100,
+        initial_batch_size=10,
         progress=CharacterProgress(),
     )
 

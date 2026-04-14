@@ -365,3 +365,21 @@ def test_gpu_status_is_available_while_startup_preload_runs(monkeypatch):
         assert response.status_code == 200
         assert response.json()["startup_preload"]["in_progress"] is True
         allow_preload_finish.set()
+
+
+def test_custom_voice_batcher_is_configured_for_serial_processing(monkeypatch):
+    inference = StubInference()
+    monkeypatch.setattr(api_server, "pipeline", StubPipeline(inference))
+    monkeypatch.setattr(api_server, "CUSTOM_VOICE_API_BATCH_SIZE", 1)
+    api_server.custom_voice_batchers.clear()
+
+    batcher = api_server.get_custom_voice_batcher(
+        "job-1",
+        "/tmp/checkpoint-epoch-14",
+        "Narrator",
+    )
+
+    assert batcher.batch_size == 1
+    assert batcher.executor._max_workers == 1
+
+    api_server.custom_voice_batchers.clear()

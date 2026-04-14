@@ -487,7 +487,10 @@ GPU_MAX_MODELS = int(os.environ.get("GPU_MAX_MODELS", str(_default_gpu_max_model
 GPU_BATCH_SIZE = int(os.environ.get("GPU_BATCH_SIZE", "32"))
 SESSION_BATCH_MAX_CHARS = int(os.environ.get("SESSION_BATCH_MAX_CHARS", "4000"))
 CUSTOM_VOICE_SESSION_BATCH_SIZE = int(
-    os.environ.get("CUSTOM_VOICE_SESSION_BATCH_SIZE", str(max(1, GPU_BATCH_SIZE // 2)))
+    os.environ.get("CUSTOM_VOICE_SESSION_BATCH_SIZE", "1")
+)
+CUSTOM_VOICE_API_BATCH_SIZE = int(
+    os.environ.get("CUSTOM_VOICE_API_BATCH_SIZE", "1")
 )
 CUSTOM_VOICE_SESSION_BATCH_PADDED_CHARS = int(
     os.environ.get(
@@ -525,6 +528,7 @@ logger.info(f"  - GPU_MAX_MODELS: {GPU_MAX_MODELS}")
 logger.info(f"  - GPU_BATCH_SIZE: {GPU_BATCH_SIZE}")
 logger.info(f"  - SESSION_BATCH_MAX_CHARS: {SESSION_BATCH_MAX_CHARS}")
 logger.info(f"  - CUSTOM_VOICE_SESSION_BATCH_SIZE: {CUSTOM_VOICE_SESSION_BATCH_SIZE}")
+logger.info(f"  - CUSTOM_VOICE_API_BATCH_SIZE: {CUSTOM_VOICE_API_BATCH_SIZE}")
 logger.info(
     f"  - CUSTOM_VOICE_SESSION_BATCH_PADDED_CHARS: {CUSTOM_VOICE_SESSION_BATCH_PADDED_CHARS}"
 )
@@ -681,7 +685,7 @@ def get_custom_voice_batcher(job_id: str, checkpoint_path: str, speaker_name: st
                 instructs=instructs
             )
         custom_voice_batchers[batcher_key] = DynamicBatcher(
-            batch_size=GPU_BATCH_SIZE,
+            batch_size=CUSTOM_VOICE_API_BATCH_SIZE,
             timeout_ms=100,
             process_fn=process_fn,
             max_workers=1  # Always 1 worker per job/model to ensure thread-safety
@@ -1832,9 +1836,8 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
 
     from functools import partial
 
-    # Create a Semaphore to limit concurrent S3 checks and generation launching
-    # Allowing up to GPU_BATCH_SIZE concurrent submissions ensures we fill our fusion batches efficiently.
-    concurrency_limit = asyncio.Semaphore(GPU_BATCH_SIZE)
+    # Keep custom-voice batch jobs strictly serial to avoid padded-batch latency spikes.
+    concurrency_limit = asyncio.Semaphore(max(1, CUSTOM_VOICE_API_BATCH_SIZE))
     
     # Generate one session code for the entire batch request so they are grouped together
     batch_session_code = uuid.uuid4().hex[:8]
