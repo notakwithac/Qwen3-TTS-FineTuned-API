@@ -2,7 +2,7 @@ name: Docker Auto-Version and Publish
 
 on:
   push:
-    branches: [ "docker", "sample" ]
+    branches: [ "docker", "sample", "PR-278" ]
 
 env:
   REGISTRY: "" # Docker Hub
