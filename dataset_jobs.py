@@ -496,6 +496,36 @@ def _segmented_filename(filename: str, segment_index: int, total_segments: int) 
     suffix = f"__seg_{segment_index:03d}"
     return _append_filename_suffix(filename, suffix)
 
+def _resegment_by_sentences(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Takes Whisper segments (which might contain multiple sentences) 
+    and breaks them into individual sentence segments using word-level timing.
+    """
+    new_segments = []
+    for seg in segments:
+        words = seg.get("words", [])
+        if not words:
+            new_segments.append(seg)
+            continue
+            
+        current_sentence_words = []
+        sentence_start = words[0]["start"]
+        
+        for i, word in enumerate(words):
+            current_sentence_words.append(word)
+            # Check if this word ends with sentence punctuation
+            text = word["word"].strip()
+            if any(punc in text for punc in ".!?") or i == len(words) - 1:
+                new_segments.append({
+                    "start": sentence_start,
+                    "end": word["end"],
+                    "text": " ".join([w["word"] for w in current_sentence_words]).strip(),
+                    "speaker": seg.get("speaker")
+                })
+                if i < len(words) - 1:
+                    sentence_start = words[i+1]["start"]
+                    current_sentence_words = []
+    return new_segments
 
 def _chunk_contiguous_segments(segments: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     if not segments:
@@ -1145,6 +1175,7 @@ def _validate_and_crop_audio_sync(
                         diarize_segments = diarize_model(audio, min_speakers=1, max_speakers=10)
                         result = whisperx.assign_word_speakers(diarize_segments, result)
                         segments = result["segments"]
+                        segments = _resegment_by_sentences(segments)
                         log.info(
                             "[%s] Batch %d/%d: diarization done in %.1fs — %d segments",
                             char_name,
