@@ -418,9 +418,14 @@ def _normalize_audio_for_dataset_sync(audio_bytes: bytes) -> bytes:
     more assertively than natural recordings, while still leaving a little gap
     so clips do not start or stop abruptly.
     """
-    filters = [
+    filters =[
+        # 1. Remove silence at the beginning
         "silenceremove=start_periods=1:start_duration=0.2:start_threshold=-50dB",
-        "silenceremove=stop_periods=1:stop_duration=0.2:stop_threshold=-50dB",
+        # 2. Reverse audio, remove silence at the "new" beginning (which is the end), reverse back
+        "areverse",
+        "silenceremove=start_periods=1:start_duration=0.2:start_threshold=-50dB",
+        "areverse",
+        # 3. Format and loudnorm
         "aformat=channel_layouts=mono",
         f"loudnorm=I={DATASET_TARGET_LUFS}:LRA=7:TP={DATASET_TP_DB}",
         "aresample=24000",
