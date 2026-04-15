@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import audioop
 import io
 import json
 import logging
@@ -10,6 +11,7 @@ import re
 import subprocess
 import tempfile
 import threading
+import wave
 import zipfile
 from typing import Any
 from urllib.parse import urlsplit
@@ -28,6 +30,9 @@ DATASET_MAX_SENTENCES_PER_CLIP = 2
 DATASET_TARGET_LUFS = -20.0
 DATASET_TP_DB = -1.5
 DATASET_EDGE_PADDING_MS = 100
+DATASET_DIARIZATION_BATCH_MAX_SEC = 90.0
+DATASET_DIARIZATION_SEPARATOR_SEC = 0.35
+DATASET_BATCH_ANALYSIS_SAMPLE_RATE = 16000
 
 SENTENCE_PUNCT_RE = re.compile(r"[.!?]+")
 DIGIT_RE = re.compile(r"\d+")
@@ -177,36 +182,234 @@ def _group_sentences(sentences: list[str], parts: int, max_per_clip: int = DATAS
     return [" ".join(group).strip() for group in grouped if group]
 
 
-def _expand_segment_sentences(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    expanded: list[dict[str, Any]] = []
-    for seg in segments:
-        text = (seg.get("text") or "").strip()
-        start = float(seg.get("start", 0.0) or 0.0)
-        end = float(seg.get("end", 0.0) or 0.0)
-        if end <= start or not text:
-            continue
-
-        sentences = _split_sentences(text)
-        speaker = seg.get("speaker")
-        if len(sentences) <= 1:
-            expanded.append({"start": start, "end": end, "text": text, "speaker": speaker})
-            continue
-
-        total_duration = end - start
-        for idx, sentence in enumerate(sentences):
-            sent_start = start + (total_duration * idx / len(sentences))
-            sent_end = start + (total_duration * (idx + 1) / len(sentences))
-            expanded.append({"start": sent_start, "end": sent_end, "text": sentence, "speaker": speaker})
-
-    return expanded
-
-
 def _append_filename_suffix(filename: str, suffix: str) -> str:
     stem, dot, ext = filename.rpartition(".")
     if not dot:
         stem = filename
         ext = ""
     return f"{stem}{suffix}.{ext}" if ext else f"{stem}{suffix}"
+
+
+def _wav_duration_seconds(audio_bytes: bytes) -> float:
+    try:
+        with wave.open(io.BytesIO(audio_bytes), "rb") as wf:
+            frame_rate = wf.getframerate()
+            if frame_rate <= 0:
+                return 0.0
+            return wf.getnframes() / float(frame_rate)
+    except Exception:
+        return 0.0
+
+
+def _write_wav_bytes(*, frames: bytes, sample_rate: int, sample_width: int, channels: int) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(sample_width)
+        wf.setframerate(sample_rate)
+        wf.writeframes(frames)
+    return buf.getvalue()
+
+
+def _prepare_wav_for_batch_analysis(audio_bytes: bytes) -> bytes:
+    with wave.open(io.BytesIO(audio_bytes), "rb") as wf:
+        channels = wf.getnchannels()
+        sample_width = wf.getsampwidth()
+        sample_rate = wf.getframerate()
+        frames = wf.readframes(wf.getnframes())
+
+    if sample_width != 2:
+        frames = audioop.lin2lin(frames, sample_width, 2)
+        sample_width = 2
+
+    if channels == 2:
+        frames = audioop.tomono(frames, sample_width, 0.5, 0.5)
+        channels = 1
+    elif channels != 1:
+        raise ValueError(f"Unsupported WAV channel count for batch analysis: {channels}")
+
+    if sample_rate != DATASET_BATCH_ANALYSIS_SAMPLE_RATE:
+        frames, _state = audioop.ratecv(
+            frames,
+            sample_width,
+            channels,
+            sample_rate,
+            DATASET_BATCH_ANALYSIS_SAMPLE_RATE,
+            None,
+        )
+        sample_rate = DATASET_BATCH_ANALYSIS_SAMPLE_RATE
+
+    return _write_wav_bytes(
+        frames=frames,
+        sample_rate=sample_rate,
+        sample_width=sample_width,
+        channels=channels,
+    )
+
+
+def _prepare_batch_analysis_items(
+    audio_items: list[tuple[str, bytes, str]],
+) -> list[dict[str, Any]]:
+    prepared: list[dict[str, Any]] = []
+    for filename, wav_bytes, prompt_id in audio_items:
+        analysis_wav_bytes = _prepare_wav_for_batch_analysis(wav_bytes)
+        prepared.append(
+            {
+                "filename": filename,
+                "prompt_id": prompt_id,
+                "wav_bytes": wav_bytes,
+                "analysis_wav_bytes": analysis_wav_bytes,
+                "duration_sec": _wav_duration_seconds(analysis_wav_bytes),
+            }
+        )
+    return prepared
+
+
+def _build_reference_diarization_batches(
+    ref_item: dict[str, Any],
+    clone_items: list[dict[str, Any]],
+    *,
+    max_total_duration_sec: float | None = None,
+) -> list[list[dict[str, Any]]]:
+    if max_total_duration_sec is None:
+        max_total_duration_sec = DATASET_DIARIZATION_BATCH_MAX_SEC
+    if not clone_items:
+        return [[ref_item]]
+
+    ref_duration_sec = float(ref_item.get("duration_sec", 0.0) or 0.0)
+    clone_budget_sec = max(0.0, max_total_duration_sec - ref_duration_sec)
+    batches: list[list[dict[str, Any]]] = []
+    current_batch: list[dict[str, Any]] = []
+    current_duration_sec = 0.0
+
+    for item in clone_items:
+        clip_duration_sec = float(item.get("duration_sec", 0.0) or 0.0)
+        if current_batch and current_duration_sec + clip_duration_sec > clone_budget_sec:
+            batches.append([ref_item, *current_batch])
+            current_batch = []
+            current_duration_sec = 0.0
+
+        current_batch.append(item)
+        current_duration_sec += clip_duration_sec
+
+    if current_batch:
+        batches.append([ref_item, *current_batch])
+
+    return batches
+
+
+def _concatenate_batch_analysis_wavs(
+    batch_items: list[dict[str, Any]],
+    *,
+    separator_sec: float = DATASET_DIARIZATION_SEPARATOR_SEC,
+) -> tuple[bytes, list[dict[str, Any]]]:
+    if not batch_items:
+        return b"", []
+
+    combined_frames: list[bytes] = []
+    clip_intervals: list[dict[str, Any]] = []
+    sample_rate = DATASET_BATCH_ANALYSIS_SAMPLE_RATE
+    sample_width = 2
+    channels = 1
+    silence_frames = b"\x00" * int(separator_sec * sample_rate) * sample_width * channels
+    current_offset_sec = 0.0
+
+    for index, item in enumerate(batch_items):
+        analysis_wav_bytes = item["analysis_wav_bytes"]
+        with wave.open(io.BytesIO(analysis_wav_bytes), "rb") as wf:
+            frames = wf.readframes(wf.getnframes())
+            duration_sec = wf.getnframes() / float(wf.getframerate() or sample_rate)
+
+        clip_intervals.append(
+            {
+                **item,
+                "analysis_start_sec": current_offset_sec,
+                "analysis_end_sec": current_offset_sec + duration_sec,
+            }
+        )
+        combined_frames.append(frames)
+        current_offset_sec += duration_sec
+
+        if index < len(batch_items) - 1 and silence_frames:
+            combined_frames.append(silence_frames)
+            current_offset_sec += separator_sec
+
+    return (
+        _write_wav_bytes(
+            frames=b"".join(combined_frames),
+            sample_rate=sample_rate,
+            sample_width=sample_width,
+            channels=channels,
+        ),
+        clip_intervals,
+    )
+
+
+def _segment_overlap_seconds(segment: dict[str, Any], start_sec: float, end_sec: float) -> float:
+    segment_start = float(segment.get("start", 0.0) or 0.0)
+    segment_end = float(segment.get("end", 0.0) or 0.0)
+    return max(0.0, min(segment_end, end_sec) - max(segment_start, start_sec))
+
+
+def _select_dominant_speaker(segments: list[dict[str, Any]]) -> str | None:
+    speaker_durations: dict[str, float] = {}
+    for segment in segments:
+        speaker = segment.get("speaker")
+        if not speaker:
+            continue
+        speaker_durations[speaker] = speaker_durations.get(speaker, 0.0) + max(
+            0.0,
+            float(segment.get("end", 0.0) or 0.0) - float(segment.get("start", 0.0) or 0.0),
+        )
+    if not speaker_durations:
+        return None
+    return max(speaker_durations.items(), key=lambda item: item[1])[0]
+
+
+def _select_target_speaker_for_interval(
+    segments: list[dict[str, Any]],
+    interval_start_sec: float,
+    interval_end_sec: float,
+) -> str | None:
+    speaker_durations: dict[str, float] = {}
+    for segment in segments:
+        speaker = segment.get("speaker")
+        if not speaker:
+            continue
+        overlap_sec = _segment_overlap_seconds(segment, interval_start_sec, interval_end_sec)
+        if overlap_sec <= 0.0:
+            continue
+        speaker_durations[speaker] = speaker_durations.get(speaker, 0.0) + overlap_sec
+    if speaker_durations:
+        return max(speaker_durations.items(), key=lambda item: item[1])[0]
+    return None
+
+
+def _slice_combined_segments_to_local_interval(
+    segments: list[dict[str, Any]],
+    interval_start_sec: float,
+    interval_end_sec: float,
+    *,
+    speaker: str | None = None,
+) -> list[dict[str, Any]]:
+    local_segments: list[dict[str, Any]] = []
+    for segment in segments:
+        if speaker is not None and segment.get("speaker") != speaker:
+            continue
+        overlap_start_sec = max(float(segment.get("start", 0.0) or 0.0), interval_start_sec)
+        overlap_end_sec = min(float(segment.get("end", 0.0) or 0.0), interval_end_sec)
+        text = (segment.get("text") or "").strip()
+        if overlap_end_sec <= overlap_start_sec or not text:
+            continue
+        local_segments.append(
+            {
+                "start": round(overlap_start_sec - interval_start_sec, 4),
+                "end": round(overlap_end_sec - interval_start_sec, 4),
+                "text": text,
+                "speaker": segment.get("speaker"),
+            }
+        )
+    return local_segments
 
 
 def _normalize_audio_for_dataset_sync(audio_bytes: bytes) -> bytes:
@@ -351,7 +554,7 @@ def _chunk_segments(
     runs: list[list[dict[str, Any]]] = []
     current_run: list[dict[str, Any]] = []
 
-    for seg in _expand_segment_sentences(segments):
+    for seg in segments:
         speaker = seg.get("speaker")
         if main_speaker is not None and speaker != main_speaker:
             if current_run:
@@ -385,10 +588,10 @@ def _build_split_results(
     *,
     main_speaker: str | None,
     canonical_text: str | None = None,       # ← NEW: pass ground truth if known
-) -> list[tuple[str, bytes, str, bool, str, str | None, bool]]:
+) -> list[tuple[str, bytes, str, bool, str, str | None, bool, bool]]:
     """
     Returns tuples of:
-      (clip_name, wav_bytes, prompt_id, success, transcript, failure_reason, is_short)
+      (clip_name, wav_bytes, prompt_id, success, transcript, failure_reason, is_short, uses_aligned_transcript)
     """
     from pydub import AudioSegment
 
@@ -421,9 +624,19 @@ def _build_split_results(
 
         out_buf = io.BytesIO()
         cropped.export(out_buf, format="wav")
+        normalized_wav = _normalize_audio_for_dataset_sync(out_buf.getvalue())
+        normalized_duration_sec = _wav_duration_seconds(normalized_wav)
+
+        max_output_duration_sec = DATASET_SAMPLE_MAX_SEC + ((2 * DATASET_EDGE_PADDING_MS) / 1000.0)
+        if normalized_duration_sec < DATASET_SAMPLE_MIN_SEC or normalized_duration_sec > max_output_duration_sec:
+            log.debug(
+                "Discarding %s chunk %d after final normalization (%.2fs) — outside [%.1f, %.1f]s window",
+                filename, idx, normalized_duration_sec, DATASET_SAMPLE_MIN_SEC, max_output_duration_sec,
+            )
+            continue
 
         clip_name = _segmented_filename(filename, idx, len(chunks))
-        is_short  = clip_duration_sec < DATASET_SHORT_CLIP_MAX_SEC
+        is_short  = normalized_duration_sec < DATASET_SHORT_CLIP_MAX_SEC
         uses_aligned_transcript = (
             main_speaker is not None
             or len(chunks) > 1
@@ -432,7 +645,7 @@ def _build_split_results(
         )
 
         results.append(
-            (clip_name, out_buf.getvalue(), prompt_id, True, asr_transcript, None, is_short, uses_aligned_transcript)
+            (clip_name, normalized_wav, prompt_id, True, asr_transcript, None, is_short, uses_aligned_transcript)
         )
 
     return results
@@ -745,7 +958,7 @@ def _get_align_model(language_code: str = "en", device: str = "cpu"):
 def _validate_and_crop_audio_sync(
     audio_items: list[tuple[str, bytes, str]],
     char_name: str,
-) -> list[tuple[str, bytes, str, bool, str, str | None, bool]]:
+) -> list[tuple[str, bytes, str, bool, str, str | None, bool, bool]]:
     import torch
     import whisperx
 
@@ -813,22 +1026,58 @@ def _validate_and_crop_audio_sync(
         import time as _time
         import platform
 
-        results = []
-        total_clips = len(audio_items)
-        for clip_idx, (filename, wav_bytes, prompt_id) in enumerate(audio_items, 1):
-            clip_start = _time.monotonic()
+        def _single_clip_result(
+            filename: str,
+            wav_bytes: bytes,
+            prompt_id: str,
+            transcript: str,
+            failure_reason: str | None,
+            segments: list[dict[str, Any]],
+            *,
+            uses_aligned_transcript: bool,
+        ) -> tuple[str, bytes, str, bool, str, str | None, bool, bool]:
+            duration_sec = _wav_duration_seconds(wav_bytes)
+            return (
+                filename,
+                wav_bytes,
+                prompt_id,
+                True,
+                transcript,
+                failure_reason,
+                duration_sec < DATASET_SHORT_CLIP_MAX_SEC,
+                uses_aligned_transcript,
+            )
+
+        prepared_items = _prepare_batch_analysis_items(audio_items)
+        ref_item = next(
+            (item for item in prepared_items if item["prompt_id"] == "ref_audio" or item["filename"] == "ref_audio.wav"),
+            None,
+        )
+        clone_items = [item for item in prepared_items if item is not ref_item]
+        if ref_item is not None and clone_items:
+            batches = _build_reference_diarization_batches(
+                ref_item,
+                clone_items,
+                max_total_duration_sec=DATASET_DIARIZATION_BATCH_MAX_SEC,
+            )
+        else:
+            batches = [[item] for item in prepared_items]
+
+        results: list[tuple[str, bytes, str, bool, str, str | None, bool, bool]] = []
+        emitted_reference = False
+        total_batches = len(batches)
+
+        for batch_idx, batch_items in enumerate(batches, 1):
+            batch_start = _time.monotonic()
+            combined_wav_bytes, clip_intervals = _concatenate_batch_analysis_wavs(batch_items)
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                 temp_wav_path = f.name
-                f.write(wav_bytes)
+                f.write(combined_wav_bytes)
 
             try:
                 audio = whisperx.load_audio(temp_wav_path)
 
                 t0 = _time.monotonic()
-                # "turbo" models are fast but can be less stable; these decoding
-                # options reduce cross-sentence bleed and improve word choice.
-                # We pass them through _safe_transcribe so older whisperx builds
-                # won't break if they don't support a particular knob.
                 result = _safe_transcribe(
                     model,
                     audio,
@@ -840,10 +1089,10 @@ def _validate_and_crop_audio_sync(
                     condition_on_previous_text=False,
                 )
                 log.info(
-                    "[%s] Clip %d/%d: transcription done in %.1fs — lang=%s, %d segments",
+                    "[%s] Batch %d/%d: transcription done in %.1fs — lang=%s, %d segments",
                     char_name,
-                    clip_idx,
-                    total_clips,
+                    batch_idx,
+                    total_batches,
                     _time.monotonic() - t0,
                     result.get("language", "?"),
                     len(result.get("segments", [])),
@@ -873,181 +1122,158 @@ def _validate_and_crop_audio_sync(
                     return_char_alignments=False,
                 )
                 log.info(
-                    "[%s] Clip %d/%d: alignment done in %.1fs (device=%s)",
+                    "[%s] Batch %d/%d: alignment done in %.1fs (device=%s)",
                     char_name,
-                    clip_idx,
-                    total_clips,
+                    batch_idx,
+                    total_batches,
                     _time.monotonic() - t0,
                     align_device,
                 )
 
                 segments = result["segments"]
-                fallback_transcript = _join_segment_text(segments)
+                target_speaker: str | None = None
+                clip_reason = diarization_error
 
-                if diarize_model is None:
-                    split_results = _try_build_split_results(
-                        filename,
-                        wav_bytes,
-                        prompt_id,
-                        segments,
-                        main_speaker=None,
-                    )
-                    if split_results:
-                        results.extend(split_results)
+                if diarize_model is not None:
+                    try:
+                        t0 = _time.monotonic()
+                        diarize_segments = diarize_model(audio, min_speakers=1, max_speakers=10)
+                        result = whisperx.assign_word_speakers(diarize_segments, result)
+                        segments = result["segments"]
                         log.info(
-                            "[%s] Clip %d/%d: PASS — split aligned single-speaker fallback into %d sample(s) (%s)",
+                            "[%s] Batch %d/%d: diarization done in %.1fs — %d segments",
                             char_name,
-                            clip_idx,
-                            total_clips,
-                            len(split_results),
-                            diarization_error or "diarization unavailable",
+                            batch_idx,
+                            total_batches,
+                            _time.monotonic() - t0,
+                            len(segments),
                         )
-                    elif fallback_transcript:
-                        results.append((filename, wav_bytes, prompt_id, True, fallback_transcript, diarization_error))
-                        log.info(
-                            "[%s] Clip %d/%d: PASS — single-speaker fallback (%s)",
-                            char_name,
-                            clip_idx,
-                            total_clips,
-                            diarization_error or "diarization unavailable",
-                        )
-                    else:
-                        results.append(
-                            (
-                                filename,
-                                wav_bytes,
-                                prompt_id,
-                                False,
-                                "",
-                                (diarization_error or "diarization unavailable") + "; empty transcript after alignment",
-                            )
-                        )
-                    continue
-
-                try:
-                    t0 = _time.monotonic()
-                    diarize_segments = diarize_model(audio, min_speakers=1, max_speakers=10)
-                    result = whisperx.assign_word_speakers(diarize_segments, result)
-                    segments = result["segments"]
-                    log.info(
-                        "[%s] Clip %d/%d: diarization done in %.1fs — %d segments",
-                        char_name,
-                        clip_idx,
-                        total_clips,
-                        _time.monotonic() - t0,
-                        len(segments),
-                    )
-                except Exception as exc:
-                    reason = f"diarization failed: {exc}"
-                    split_results = _try_build_split_results(
-                        filename,
-                        wav_bytes,
-                        prompt_id,
-                        segments,
-                        main_speaker=None,
-                    )
-                    if split_results:
-                        results.extend(split_results)
+                    except Exception as exc:
+                        clip_reason = f"diarization failed: {exc}"
                         log.warning(
-                            "[%s] Clip %d/%d: diarization failed, used aligned fallback split into %d sample(s): %s",
+                            "[%s] Batch %d/%d: diarization failed, using aligned fallback: %s",
                             char_name,
-                            clip_idx,
-                            total_clips,
-                            len(split_results),
+                            batch_idx,
+                            total_batches,
                             exc,
                         )
-                    elif fallback_transcript:
-                        results.append((filename, wav_bytes, prompt_id, True, fallback_transcript, reason))
-                        log.warning(
-                            "[%s] Clip %d/%d: diarization failed, using single-speaker fallback: %s",
-                            char_name,
-                            clip_idx,
-                            total_clips,
-                            exc,
-                        )
-                    else:
-                        results.append((filename, wav_bytes, prompt_id, False, "", reason))
-                    continue
 
-                speaker_durations: dict[str, float] = {}
-                for seg in segments:
-                    speaker = seg.get("speaker")
-                    if not speaker:
+                if ref_item is not None:
+                    reference_interval = next(
+                        (
+                            interval
+                            for interval in clip_intervals
+                            if interval["prompt_id"] == "ref_audio" or interval["filename"] == "ref_audio.wav"
+                        ),
+                        None,
+                    )
+                    if reference_interval is not None:
+                        target_speaker = _select_target_speaker_for_interval(
+                            segments,
+                            reference_interval["analysis_start_sec"],
+                            reference_interval["analysis_end_sec"],
+                        )
+
+                if target_speaker is None:
+                    target_speaker = _select_dominant_speaker(segments)
+
+                for clip_interval in clip_intervals:
+                    filename = clip_interval["filename"]
+                    wav_bytes = clip_interval["wav_bytes"]
+                    prompt_id = clip_interval["prompt_id"]
+                    is_reference = prompt_id == "ref_audio" or filename == "ref_audio.wav"
+
+                    if is_reference and emitted_reference:
                         continue
-                    duration = seg.get("end", 0.0) - seg.get("start", 0.0)
-                    speaker_durations[speaker] = speaker_durations.get(speaker, 0.0) + duration
 
-                if not speaker_durations:
-                    split_results = _try_build_split_results(
-                        filename,
-                        wav_bytes,
-                        prompt_id,
+                    local_segments = _slice_combined_segments_to_local_interval(
                         segments,
-                        main_speaker=None,
+                        clip_interval["analysis_start_sec"],
+                        clip_interval["analysis_end_sec"],
                     )
+                    local_target_segments = (
+                        _slice_combined_segments_to_local_interval(
+                            segments,
+                            clip_interval["analysis_start_sec"],
+                            clip_interval["analysis_end_sec"],
+                            speaker=target_speaker,
+                        )
+                        if target_speaker is not None
+                        else []
+                    )
+                    fallback_transcript = _join_segment_text(local_segments)
+
+                    split_results: list[tuple[str, bytes, str, bool, str, str | None, bool, bool]] = []
+                    if local_target_segments:
+                        split_results = _try_build_split_results(
+                            filename,
+                            wav_bytes,
+                            prompt_id,
+                            local_target_segments,
+                            main_speaker=None,
+                        )
+
+                    if not split_results:
+                        split_results = _try_build_split_results(
+                            filename,
+                            wav_bytes,
+                            prompt_id,
+                            local_segments,
+                            main_speaker=None,
+                        )
+
                     if split_results:
                         results.extend(split_results)
-                    elif fallback_transcript:
+                        if is_reference:
+                            emitted_reference = True
+                        continue
+
+                    if fallback_transcript:
+                        uses_aligned_transcript = bool(local_target_segments) or bool(
+                            local_segments and (
+                                local_segments[0]["start"] > 0.15
+                                or local_segments[-1]["end"] < _wav_duration_seconds(wav_bytes) - 0.15
+                            )
+                        )
                         results.append(
-                            (
+                            _single_clip_result(
                                 filename,
                                 wav_bytes,
                                 prompt_id,
-                                True,
                                 fallback_transcript,
-                                "diarization produced no speaker labels",
+                                clip_reason,
+                                local_segments,
+                                uses_aligned_transcript=uses_aligned_transcript,
                             )
                         )
+                        if is_reference:
+                            emitted_reference = True
                     else:
-                        results.append((filename, wav_bytes, prompt_id, False, "", "diarization produced no speaker labels"))
-                    continue
+                        results.append((filename, wav_bytes, prompt_id, False, "", clip_reason or "empty transcript after alignment", False, False))
 
-                main_speaker = max(speaker_durations.items(), key=lambda item: item[1])[0]
-
-                split_results = _build_split_results(
-                    filename,
-                    wav_bytes,
-                    prompt_id,
-                    segments,
-                    main_speaker=main_speaker,
+                log.info(
+                    "[%s] Batch %d/%d: processed %d item(s) in %.1fs",
+                    char_name,
+                    batch_idx,
+                    total_batches,
+                    len(clip_intervals),
+                    _time.monotonic() - batch_start,
                 )
-                if split_results:
-                    results.extend(split_results)
-                    log.info(
-                        "[%s] Clip %d/%d: PASS — kept speaker %s and produced %d sample(s), total %.1fs",
-                        char_name,
-                        clip_idx,
-                        total_clips,
-                        main_speaker,
-                        len(split_results),
-                        _time.monotonic() - clip_start,
-                    )
-                else:
-                    split_results = _try_build_split_results(
-                        filename,
-                        wav_bytes,
-                        prompt_id,
-                        segments,
-                        main_speaker=None,
-                    )
-                    if split_results:
-                        results.extend(split_results)
-                    elif fallback_transcript:
-                        results.append(
-                            (
-                                filename,
-                                wav_bytes,
-                                prompt_id,
-                                True,
-                                fallback_transcript,
-                                "speaker crop was empty; kept original audio",
-                            )
-                        )
-                    else:
-                        results.append((filename, wav_bytes, prompt_id, False, "", "speaker crop was empty"))
             except Exception as exc:
-                log.error("Dataset validation failed for %s: %s", filename, exc, exc_info=True)
-                results.append((filename, wav_bytes, prompt_id, False, "", str(exc)))
+                log.error("Dataset validation batch failed for %s: %s", char_name, exc, exc_info=True)
+                for clip_interval in clip_intervals:
+                    results.append(
+                        (
+                            clip_interval["filename"],
+                            clip_interval["wav_bytes"],
+                            clip_interval["prompt_id"],
+                            False,
+                            "",
+                            str(exc),
+                            False,
+                            False,
+                        )
+                    )
             finally:
                 try:
                     os.remove(temp_wav_path)
@@ -1124,17 +1350,25 @@ async def prepare_dataset_items(
 
     validated_segments = await validate_and_crop_audio(raw_audio_segments, character_name)
 
+    final_reference_segments: list[tuple[str, bytes, str]] = []
     final_train_segments: list[tuple[str, bytes]] = []
     final_transcripts: list[str] = []
     failure_reasons: list[str] = []
     for filename, wav_bytes, prompt_id, success, transcript, failure_reason, *extra in validated_segments:
         is_short = extra[0] if extra else False
         uses_aligned_transcript = extra[1] if len(extra) > 1 else False
-        if filename == "ref_audio.wav":
-            continue
         if not success or not transcript:
             if failure_reason:
                 failure_reasons.append(f"{filename}: {failure_reason}")
+            continue
+        if prompt_id == "ref_audio":
+            final_reference_segments.append(
+                (
+                    filename,
+                    _normalize_audio_for_dataset_sync(wav_bytes),
+                    _normalize_transcript_text(transcript) or ref_text,
+                )
+            )
             continue
         # Important: do NOT train on ASR output when we already know the canonical
         # transcript for the whole uploaded clip. But if validation split that clip
@@ -1160,28 +1394,29 @@ async def prepare_dataset_items(
         raise RuntimeError(f"No valid segments available for finetuning dataset. {detail}")
 
     dataset_items: list[dict[str, Any]] = []
-    normalized_ref_audio = _normalize_audio_for_dataset_sync(ref_audio)
-    ref_key = f"datasets/{book_id}/items/{character_id}_{job_id}_ref_audio.wav"
-    ref_s3_url = await _upload_bytes(
-        storage,
-        normalized_ref_audio,
-        ref_key,
-        content_type="audio/wav",
-        metadata={
-            "character_id": character_id,
-            "job_id": job_id,
-            "type": "dataset_item_ref",
-        },
-    )
-
-    dataset_items.append({
-        "id": "ref_audio.wav",
-        "url": storage.get_presigned_url(ref_key, expires_in=86400 * 7),
-        "s3_url": ref_s3_url,
-        "text": ref_text,
-        "is_reference": True,
-        "included": True,
-    })
+    for filename, wav_bytes, transcript in final_reference_segments:
+        item_key = f"datasets/{book_id}/items/{character_id}_{job_id}_{filename}"
+        s3_url = await _upload_bytes(
+            storage,
+            wav_bytes,
+            item_key,
+            content_type="audio/wav",
+            metadata={
+                "character_id": character_id,
+                "job_id": job_id,
+                "type": "dataset_item_ref",
+            },
+        )
+        dataset_items.append(
+            {
+                "id": filename,
+                "url": storage.get_presigned_url(item_key, expires_in=86400 * 7),
+                "s3_url": s3_url,
+                "text": transcript,
+                "is_reference": True,
+                "included": True,
+            }
+        )
 
     for idx, (filename, wav_bytes, _is_short) in enumerate(final_train_segments):
         transcript = final_transcripts[idx]
@@ -1258,7 +1493,7 @@ async def package_dataset(
 ) -> dict[str, str]:
     final_train_segments: list[tuple[str, bytes]] = []
     final_transcripts: list[str] = []
-    chosen_ref_audio: bytes | None = None
+    reference_segments: list[tuple[float, bytes]] = []
 
     for item in dataset_items:
         if item.get("included") is False:
@@ -1273,7 +1508,7 @@ async def package_dataset(
         if not filename or not transcript:
             continue
         if item.get("is_reference") is True:
-            chosen_ref_audio = wav_bytes
+            reference_segments.append((_wav_duration_seconds(wav_bytes), wav_bytes))
             continue
         final_train_segments.append((filename, wav_bytes))
         final_transcripts.append(transcript)
@@ -1281,8 +1516,7 @@ async def package_dataset(
     if not final_train_segments:
         raise RuntimeError("No dataset items available to package.")
 
-    if chosen_ref_audio is None:
-        chosen_ref_audio = final_train_segments[-1][1]
+    chosen_ref_audio = max(reference_segments, key=lambda item: item[0])[1] if reference_segments else final_train_segments[-1][1]
 
     zip_bytes = _build_dataset_zip(final_train_segments, chosen_ref_audio, final_transcripts)
     key = dataset_zip_key(book_id, character_id, job_id)
