@@ -19,6 +19,32 @@ def _make_wav_bytes(duration_seconds: float = 0.5, sample_rate: int = 24000) -> 
 
 
 def test_validate_and_crop_audio_falls_back_without_diarization_token(monkeypatch):
+    class _FakeSlice:
+        def __init__(self, duration_ms: int):
+            self.duration_ms = duration_ms
+
+        def __len__(self):
+            return self.duration_ms
+
+        def export(self, buf, format="wav"):
+            buf.write(_make_wav_bytes(max(self.duration_ms / 1000.0, 0.1)))
+
+    class _FakeAudioSegment:
+        def __init__(self, duration_ms: int):
+            self.duration_ms = duration_ms
+
+        @classmethod
+        def from_wav(cls, _stream):
+            return cls(24_000)
+
+        def __len__(self):
+            return self.duration_ms
+
+        def __getitem__(self, key):
+            start = 0 if key.start is None else key.start
+            stop = self.duration_ms if key.stop is None else key.stop
+            return _FakeSlice(max(0, stop - start))
+
     fake_torch = types.SimpleNamespace(
         cuda=types.SimpleNamespace(is_available=lambda: False, empty_cache=lambda: None),
         serialization=types.SimpleNamespace(add_safe_globals=lambda _globals: None),
@@ -27,7 +53,7 @@ def test_validate_and_crop_audio_falls_back_without_diarization_token(monkeypatc
         load_audio=lambda _path: "audio",
         align=lambda segments, *_args, **_kwargs: {"segments": segments},
     )
-    fake_pydub = types.SimpleNamespace(AudioSegment=object)
+    fake_pydub = types.SimpleNamespace(AudioSegment=_FakeAudioSegment)
 
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
     monkeypatch.setitem(sys.modules, "whisperx", fake_whisperx)
@@ -40,8 +66,12 @@ def test_validate_and_crop_audio_falls_back_without_diarization_token(monkeypatc
             transcribe=lambda _audio, batch_size=8: {
                 "language": "en",
                 "segments": [
-                    {"start": 0.0, "end": 0.4, "text": "hello"},
-                    {"start": 0.4, "end": 0.8, "text": "there"},
+                    {"start": 0.0, "end": 4.0, "text": "hello"},
+                    {"start": 4.1, "end": 8.0, "text": "there"},
+                    {"start": 8.1, "end": 12.0, "text": "general"},
+                    {"start": 12.1, "end": 16.0, "text": "kenobi"},
+                    {"start": 16.1, "end": 20.0, "text": "you"},
+                    {"start": 20.1, "end": 24.0, "text": "are"},
                 ],
             }
         ),
@@ -54,17 +84,13 @@ def test_validate_and_crop_audio_falls_back_without_diarization_token(monkeypatc
     )
 
     result = dataset_jobs._validate_and_crop_audio_sync(
-        [("clip.wav", _make_wav_bytes(), "prompt-1")],
+        [("clip.wav", _make_wav_bytes(24.0), "prompt-1")],
         "Elena",
     )
 
-    assert len(result) == 1
-    filename, _wav_bytes, prompt_id, success, transcript, reason = result[0]
-    assert filename == "clip.wav"
-    assert prompt_id == "prompt-1"
-    assert success is True
-    assert transcript == "Hello there."
-    assert "HF_TOKEN" in (reason or "")
+    assert len(result) == 3
+    assert [item[0] for item in result] == ["clip__seg_000.wav", "clip__seg_001.wav", "clip__seg_002.wav"]
+    assert [item[4] for item in result] == ["Hello there.", "General kenobi.", "You are."]
 
 
 def test_validate_and_crop_audio_retries_on_cpu_after_cuda_oom(monkeypatch):
@@ -345,8 +371,61 @@ def test_build_split_results_prefers_sentence_end_boundaries(monkeypatch):
         main_speaker="SPEAKER_00",
     )
 
-    assert [item[0] for item in result] == ["clip__seg_000.wav", "clip__seg_001.wav"]
-    assert [item[4] for item in result] == ["First sentence.", "Second sentence third sentence."]
+    assert [item[0] for item in result] == ["clip__seg_000.wav"]
+    assert [item[4] for item in result] == ["First sentence. Second sentence."]
+
+
+def test_build_split_results_force_splits_single_long_segment(monkeypatch):
+    class _FakeSlice:
+        def __init__(self, duration_ms: int):
+            self.duration_ms = duration_ms
+
+        def __len__(self):
+            return self.duration_ms
+
+        def export(self, buf, format="wav"):
+            buf.write(_make_wav_bytes(max(self.duration_ms / 1000.0, 0.1)))
+
+    class _FakeAudioSegment:
+        def __init__(self, duration_ms: int):
+            self.duration_ms = duration_ms
+
+        @classmethod
+        def from_wav(cls, _stream):
+            return cls(30_000)
+
+        def __len__(self):
+            return self.duration_ms
+
+        def __getitem__(self, key):
+            start = 0 if key.start is None else key.start
+            stop = self.duration_ms if key.stop is None else key.stop
+            return _FakeSlice(max(0, stop - start))
+
+    fake_pydub = types.SimpleNamespace(AudioSegment=_FakeAudioSegment)
+    monkeypatch.setitem(sys.modules, "pydub", fake_pydub)
+    monkeypatch.setattr(dataset_jobs, "_normalize_audio_for_dataset_sync", lambda audio_bytes: audio_bytes)
+
+    segments = [
+        {
+            "start": 0.0,
+            "end": 30.0,
+            "text": "First sentence. Second sentence. Third sentence. Fourth sentence. Fifth sentence. Sixth sentence.",
+            "speaker": "SPEAKER_00",
+        }
+    ]
+
+    result = dataset_jobs._build_split_results(
+        "clip.wav",
+        _make_wav_bytes(30.0),
+        "prompt-1",
+        segments,
+        main_speaker="SPEAKER_00",
+    )
+
+    assert len(result) >= 3
+    assert all(len(item[1]) > 0 for item in result)
+    assert all(item[4] for item in result)
 
 
 def test_prepare_dataset_items_preserves_reference_item(monkeypatch):
@@ -360,8 +439,8 @@ def test_prepare_dataset_items_preserves_reference_item(monkeypatch):
 
     async def fake_validate(_segments, _character_name):
         return [
-            ("clip-1.wav", b"clip-1-bytes", "prompt-1", True, "hello there", None),
-            ("clip-2.wav", b"clip-2-bytes", "prompt-2", True, "general kenobi", None),
+            ("clip-1.wav", b"clip-1-bytes", "prompt-1", True, "hello there", None, False),
+            ("clip-2.wav", b"clip-2-bytes", "prompt-2", True, "general kenobi", None, False),
         ]
 
     async def fake_upload(_storage, payload, key, **_kwargs):
@@ -399,3 +478,120 @@ def test_prepare_dataset_items_preserves_reference_item(monkeypatch):
     assert [item["id"] for item in items[1:]] == ["clip-1.wav", "clip-2.wav"]
     assert sum(1 for item in items if item["is_reference"]) == 1
     assert uploaded[0][0].endswith("_ref_audio.wav")
+
+
+def test_prepare_dataset_items_uses_fragment_transcript_for_split_clips(monkeypatch):
+    async def fake_download(_storage, ref):
+        return f"bytes-for:{ref}".encode("utf-8")
+
+    async def fake_apply(audio_bytes, **_kwargs):
+        return audio_bytes
+
+    async def fake_validate(_segments, _character_name):
+        return [
+            (
+                "clip__seg_000.wav",
+                b"clip-1-bytes",
+                "prompt-1",
+                True,
+                "first sliced line",
+                None,
+                False,
+            ),
+            (
+                "clip__seg_001.wav",
+                b"clip-2-bytes",
+                "prompt-1",
+                True,
+                "second sliced line",
+                None,
+                False,
+            ),
+        ]
+
+    async def fake_upload(_storage, payload, key, **_kwargs):
+        return f"https://bucket/{key}"
+
+    storage = types.SimpleNamespace(
+        get_presigned_url=lambda key, expires_in=0: f"https://signed/{key}",
+    )
+
+    monkeypatch.setattr(dataset_jobs, "_download_bytes", fake_download)
+    monkeypatch.setattr(dataset_jobs, "apply_audio_fx", fake_apply)
+    monkeypatch.setattr(dataset_jobs, "validate_and_crop_audio", fake_validate)
+    monkeypatch.setattr(dataset_jobs, "_upload_bytes", fake_upload)
+
+    items = asyncio.run(
+        dataset_jobs.prepare_dataset_items(
+            storage,
+            book_id="book-1",
+            character_id="char-1",
+            character_name="Elena",
+            job_id="job-1",
+            ref_audio_url="s3://bucket/ref.wav",
+            ref_text="reference text",
+            items=[
+                {
+                    "filename": "clone-1.wav",
+                    "prompt_id": "prompt-1",
+                    "text": "full original prompt that should not be reused",
+                    "s3_url": "s3://bucket/clone-1.wav",
+                },
+            ],
+        )
+    )
+
+    assert [item["id"] for item in items[1:]] == ["clip__seg_000.wav", "clip__seg_001.wav"]
+    assert [item["text"] for item in items[1:]] == ["First sliced line.", "Second sliced line."]
+
+
+def test_prepare_dataset_items_normalizes_only_final_outputs(monkeypatch):
+    normalize_calls: list[bytes] = []
+
+    async def fake_download(_storage, ref):
+        return f"bytes-for:{ref}".encode("utf-8")
+
+    async def fake_apply(audio_bytes, **_kwargs):
+        return audio_bytes
+
+    async def fake_validate(_segments, _character_name):
+        return [
+            ("clip-1.wav", b"clip-1-bytes", "prompt-1", True, "hello there", None, False),
+            ("clip-2.wav", b"clip-2-bytes", "prompt-2", True, "general kenobi", None, False),
+        ]
+
+    async def fake_upload(_storage, payload, key, **_kwargs):
+        return f"https://bucket/{key}"
+
+    def fake_normalize(audio_bytes):
+        normalize_calls.append(audio_bytes)
+        return b"norm:" + audio_bytes
+
+    storage = types.SimpleNamespace(
+        get_presigned_url=lambda key, expires_in=0: f"https://signed/{key}",
+    )
+
+    monkeypatch.setattr(dataset_jobs, "_download_bytes", fake_download)
+    monkeypatch.setattr(dataset_jobs, "apply_audio_fx", fake_apply)
+    monkeypatch.setattr(dataset_jobs, "validate_and_crop_audio", fake_validate)
+    monkeypatch.setattr(dataset_jobs, "_upload_bytes", fake_upload)
+    monkeypatch.setattr(dataset_jobs, "_normalize_audio_for_dataset_sync", fake_normalize)
+
+    items = asyncio.run(
+        dataset_jobs.prepare_dataset_items(
+            storage,
+            book_id="book-1",
+            character_id="char-1",
+            character_name="Elena",
+            job_id="job-1",
+            ref_audio_url="s3://bucket/ref.wav",
+            ref_text="reference text",
+            items=[
+                {"filename": "clone-1.wav", "prompt_id": "prompt-1", "text": "hello there", "s3_url": "s3://bucket/clone-1.wav"},
+                {"filename": "clone-2.wav", "prompt_id": "prompt-2", "text": "general kenobi", "s3_url": "s3://bucket/clone-2.wav"},
+            ],
+        )
+    )
+
+    assert normalize_calls == [b"clip-1-bytes", b"clip-2-bytes", b"bytes-for:s3://bucket/ref.wav"]
+    assert items[0]["id"] == "ref_audio.wav"
