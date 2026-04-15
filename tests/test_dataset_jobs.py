@@ -545,6 +545,112 @@ def test_prepare_dataset_items_uses_fragment_transcript_for_split_clips(monkeypa
     assert [item["text"] for item in items[1:]] == ["First sliced line.", "Second sliced line."]
 
 
+def test_prepare_dataset_items_uses_aligned_transcript_for_single_derived_clip(monkeypatch):
+    async def fake_download(_storage, ref):
+        return f"bytes-for:{ref}".encode("utf-8")
+
+    async def fake_apply(audio_bytes, **_kwargs):
+        return audio_bytes
+
+    async def fake_validate(_segments, _character_name):
+        return [
+            (
+                "clip-1.wav",
+                b"clip-1-bytes",
+                "prompt-1",
+                True,
+                "cropped aligned line",
+                None,
+                False,
+                True,
+            ),
+        ]
+
+    async def fake_upload(_storage, payload, key, **_kwargs):
+        return f"https://bucket/{key}"
+
+    storage = types.SimpleNamespace(
+        get_presigned_url=lambda key, expires_in=0: f"https://signed/{key}",
+    )
+
+    monkeypatch.setattr(dataset_jobs, "_download_bytes", fake_download)
+    monkeypatch.setattr(dataset_jobs, "apply_audio_fx", fake_apply)
+    monkeypatch.setattr(dataset_jobs, "validate_and_crop_audio", fake_validate)
+    monkeypatch.setattr(dataset_jobs, "_upload_bytes", fake_upload)
+
+    items = asyncio.run(
+        dataset_jobs.prepare_dataset_items(
+            storage,
+            book_id="book-1",
+            character_id="char-1",
+            character_name="Elena",
+            job_id="job-1",
+            ref_audio_url="s3://bucket/ref.wav",
+            ref_text="reference text",
+            items=[
+                {
+                    "filename": "clip-1.wav",
+                    "prompt_id": "prompt-1",
+                    "text": "full original prompt that should not be reused",
+                    "s3_url": "s3://bucket/clip-1.wav",
+                },
+            ],
+        )
+    )
+
+    assert items[1]["id"] == "clip-1.wav"
+    assert items[1]["text"] == "Cropped aligned line."
+
+
+def test_build_split_results_splits_on_non_main_speaker_boundaries(monkeypatch):
+    class _FakeSlice:
+        def __init__(self, duration_ms: int):
+            self.duration_ms = duration_ms
+
+        def __len__(self):
+            return self.duration_ms
+
+        def export(self, buf, format="wav"):
+            buf.write(_make_wav_bytes(max(self.duration_ms / 1000.0, 0.1)))
+
+    class _FakeAudioSegment:
+        def __init__(self, duration_ms: int):
+            self.duration_ms = duration_ms
+
+        @classmethod
+        def from_wav(cls, _stream):
+            return cls(11_000)
+
+        def __len__(self):
+            return self.duration_ms
+
+        def __getitem__(self, key):
+            start = 0 if key.start is None else key.start
+            stop = self.duration_ms if key.stop is None else key.stop
+            return _FakeSlice(max(0, stop - start))
+
+    fake_pydub = types.SimpleNamespace(AudioSegment=_FakeAudioSegment)
+    monkeypatch.setitem(sys.modules, "pydub", fake_pydub)
+
+    segments = [
+        {"start": 0.0, "end": 5.0, "text": "hello there", "speaker": "SPEAKER_00"},
+        {"start": 5.0, "end": 6.0, "text": "intruder", "speaker": "SPEAKER_01"},
+        {"start": 6.0, "end": 11.0, "text": "general kenobi", "speaker": "SPEAKER_00"},
+    ]
+
+    result = dataset_jobs._build_split_results(
+        "clip.wav",
+        _make_wav_bytes(11.0),
+        "prompt-1",
+        segments,
+        main_speaker="SPEAKER_00",
+    )
+
+    assert [item[0] for item in result] == ["clip__seg_000.wav", "clip__seg_001.wav"]
+    assert [item[4] for item in result] == ["Hello there.", "General kenobi."]
+    assert [item[7] for item in result] == [True, True]
+
+
 def test_prepare_dataset_items_normalizes_only_final_outputs(monkeypatch):
     normalize_calls: list[bytes] = []
 

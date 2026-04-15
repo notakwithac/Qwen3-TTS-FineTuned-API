@@ -289,67 +289,49 @@ def _segmented_filename(filename: str, segment_index: int, total_segments: int) 
     return _append_filename_suffix(filename, suffix)
 
 
-def _chunk_segments(
-    segments: list[dict[str, Any]],
-    *,
-    main_speaker: str | None,
-) -> list[list[dict[str, Any]]]:
-    speaker_segments: list[dict[str, Any]] = []
-    for seg in _expand_segment_sentences(segments):
-        if main_speaker is not None and seg.get("speaker") != main_speaker:
-            continue
-        text = seg.get("text", "").strip()
-        start = float(seg.get("start", 0.0) or 0.0)
-        end   = float(seg.get("end",   0.0) or 0.0)
-        if end <= start or not text:
-            continue
-        speaker_segments.append({"start": start, "end": end, "text": text})
-
-    if not speaker_segments:
+def _chunk_contiguous_segments(segments: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    if not segments:
         return []
 
     chunks: list[list[dict[str, Any]]] = []
     current: list[dict[str, Any]] = []
     current_start = 0.0
-    current_end   = 0.0
+    current_end = 0.0
 
-    for seg in speaker_segments:
+    for seg in segments:
         if not current:
-            current       = [seg]
+            current = [seg]
             current_start = seg["start"]
-            current_end   = seg["end"]
+            current_end = seg["end"]
             continue
 
         proposed_duration = seg["end"] - current_start
 
-        # Hard ceiling — force flush before this segment tips us over 10s
         if proposed_duration > DATASET_SAMPLE_MAX_SEC:
             chunks.append(current)
-            current       = [seg]
+            current = [seg]
             current_start = seg["start"]
-            current_end   = seg["end"]
+            current_end = seg["end"]
             continue
 
-        current_duration       = current_end - current_start
+        current_duration = current_end - current_start
         current_has_sentence_end = _ends_with_sentence_punct(current[-1].get("text", ""))
         gap_duration = max(0.0, seg["start"] - current_end)
         can_flush = current_duration >= DATASET_SAMPLE_MIN_SEC
         hit_sentence_limit = len(current) >= DATASET_MAX_SENTENCES_PER_CLIP
 
-        # Prefer shorter, tighter clips for synthetic audio, but still enforce
-        # the hard 5s minimum before flushing.
         if can_flush and (hit_sentence_limit or gap_duration >= DATASET_MERGE_GAP_SEC):
             chunks.append(current)
-            current       = [seg]
+            current = [seg]
             current_start = seg["start"]
-            current_end   = seg["end"]
+            current_end = seg["end"]
             continue
 
         if can_flush and current_has_sentence_end and current_duration >= DATASET_CLIP_FLUSH_SEC:
             chunks.append(current)
-            current       = [seg]
+            current = [seg]
             current_start = seg["start"]
-            current_end   = seg["end"]
+            current_end = seg["end"]
             continue
 
         current.append(seg)
@@ -358,6 +340,40 @@ def _chunk_segments(
     if current:
         chunks.append(current)
 
+    return chunks
+
+
+def _chunk_segments(
+    segments: list[dict[str, Any]],
+    *,
+    main_speaker: str | None,
+) -> list[list[dict[str, Any]]]:
+    runs: list[list[dict[str, Any]]] = []
+    current_run: list[dict[str, Any]] = []
+
+    for seg in _expand_segment_sentences(segments):
+        speaker = seg.get("speaker")
+        if main_speaker is not None and speaker != main_speaker:
+            if current_run:
+                runs.append(current_run)
+                current_run = []
+            continue
+        text = seg.get("text", "").strip()
+        start = float(seg.get("start", 0.0) or 0.0)
+        end   = float(seg.get("end",   0.0) or 0.0)
+        if end <= start or not text:
+            if current_run:
+                runs.append(current_run)
+                current_run = []
+            continue
+        current_run.append({"start": start, "end": end, "text": text, "speaker": speaker})
+
+    if current_run:
+        runs.append(current_run)
+
+    chunks: list[list[dict[str, Any]]] = []
+    for run in runs:
+        chunks.extend(_chunk_contiguous_segments(run))
     return chunks
 
 
@@ -377,6 +393,7 @@ def _build_split_results(
     from pydub import AudioSegment
 
     audio_segment = AudioSegment.from_wav(io.BytesIO(wav_bytes))
+    audio_duration_sec = len(audio_segment) / 1000.0
     chunks = _chunk_segments(segments, main_speaker=main_speaker)
     if not chunks:
         return []
@@ -407,8 +424,16 @@ def _build_split_results(
 
         clip_name = _segmented_filename(filename, idx, len(chunks))
         is_short  = clip_duration_sec < DATASET_SHORT_CLIP_MAX_SEC
+        uses_aligned_transcript = (
+            main_speaker is not None
+            or len(chunks) > 1
+            or chunk[0]["start"] > 0.15
+            or chunk[-1]["end"] < audio_duration_sec - 0.15
+        )
 
-        results.append((clip_name, out_buf.getvalue(), prompt_id, True, asr_transcript, None, is_short))
+        results.append(
+            (clip_name, out_buf.getvalue(), prompt_id, True, asr_transcript, None, is_short, uses_aligned_transcript)
+        )
 
     return results
 
@@ -1104,6 +1129,7 @@ async def prepare_dataset_items(
     failure_reasons: list[str] = []
     for filename, wav_bytes, prompt_id, success, transcript, failure_reason, *extra in validated_segments:
         is_short = extra[0] if extra else False
+        uses_aligned_transcript = extra[1] if len(extra) > 1 else False
         if filename == "ref_audio.wav":
             continue
         if not success or not transcript:
@@ -1115,7 +1141,7 @@ async def prepare_dataset_items(
         # into `__seg_...`/`__part_...` fragments, the returned per-fragment
         # transcript is the only text that still matches the cropped audio.
         canonical = prompt_id_to_text.get(prompt_id) or ""
-        is_split_fragment = "__seg_" in filename or "__part_" in filename
+        is_split_fragment = "__seg_" in filename or "__part_" in filename or uses_aligned_transcript
 
         normalized_transcript = (
             _normalize_transcript_text(transcript)
