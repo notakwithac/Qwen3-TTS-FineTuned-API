@@ -18,7 +18,9 @@ log = logging.getLogger(__name__)
 
 _whisper_cache: dict[str, Any] = {}
 _cache_lock = threading.Lock()
-DATASET_SAMPLE_MIN_SEC = 1.2
+DATASET_SAMPLE_MIN_SEC = 3.0
+DATASET_SHORT_CLIP_MAX_SEC = 5.0   # clips below this are flagged as "short" in manifest
+DATASET_CLIP_FLUSH_SEC    = 6.0    # don't flush at sentence boundary until >= 6s accumulated
 DATASET_SAMPLE_TARGET_SEC = 8.0
 DATASET_SAMPLE_MAX_SEC = 10.0
 DATASET_MERGE_GAP_SEC = 0.75
@@ -183,33 +185,31 @@ def _append_filename_suffix(filename: str, suffix: str) -> str:
 
 
 def _normalize_audio_for_dataset_sync(audio_bytes: bytes) -> bytes:
+    """
+    Normalise loudness and resample.  Silence trimming is intentionally light:
+    TTS fine-tuning benefits from natural leading/trailing breath — aggressive
+    trimming teaches the model to start/stop unnaturally.
+    """
     filters = [
-        "silenceremove=start_periods=1:start_duration=0.08:start_threshold=-45dB",
-        "silenceremove=stop_periods=1:stop_duration=0.12:stop_threshold=-45dB",
+        # Only clip dead silence (>500ms of near-digital-silence) at edges.
+        # threshold raised to -55dB (was -45dB) and durations lengthened so
+        # soft breath / room tone is preserved.
+        "silenceremove=start_periods=1:start_duration=0.5:start_threshold=-55dB",
+        "silenceremove=stop_periods=1:stop_duration=0.5:stop_threshold=-55dB",
         "aformat=channel_layouts=mono",
         f"loudnorm=I={DATASET_TARGET_LUFS}:LRA=7:TP={DATASET_TP_DB}",
         "aresample=24000",
     ]
     cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-i",
-        "pipe:0",
-        "-af",
-        ",".join(filters),
-        "-f",
-        "wav",
-        "pipe:1",
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-i", "pipe:0",
+        "-af", ",".join(filters),
+        "-f", "wav", "pipe:1",
     ]
     try:
         process = subprocess.run(
-            cmd,
-            input=audio_bytes,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
+            cmd, input=audio_bytes,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
         )
         if process.returncode != 0 or not process.stdout:
             if process.stderr:
@@ -270,15 +270,15 @@ def _segmented_filename(filename: str, segment_index: int, total_segments: int) 
 def _chunk_segments(
     segments: list[dict[str, Any]],
     *,
-    main_speaker: str,
+    main_speaker: str | None,
 ) -> list[list[dict[str, Any]]]:
     speaker_segments: list[dict[str, Any]] = []
     for seg in segments:
-        if seg.get("speaker") != main_speaker:
+        if main_speaker is not None and seg.get("speaker") != main_speaker:
             continue
         text = seg.get("text", "").strip()
         start = float(seg.get("start", 0.0) or 0.0)
-        end = float(seg.get("end", 0.0) or 0.0)
+        end   = float(seg.get("end",   0.0) or 0.0)
         if end <= start or not text:
             continue
         speaker_segments.append({"start": start, "end": end, "text": text})
@@ -289,116 +289,43 @@ def _chunk_segments(
     chunks: list[list[dict[str, Any]]] = []
     current: list[dict[str, Any]] = []
     current_start = 0.0
-    current_end = 0.0
-    current_sentence_units = 0
+    current_end   = 0.0
 
     for seg in speaker_segments:
         if not current:
-            current = [seg]
+            current       = [seg]
             current_start = seg["start"]
-            current_end = seg["end"]
-            current_sentence_units = _sentence_units(seg["text"])
+            current_end   = seg["end"]
             continue
 
-        gap = max(0.0, seg["start"] - current_end)
         proposed_duration = seg["end"] - current_start
-        seg_sentence_units = _sentence_units(seg["text"])
-        proposed_sentence_units = current_sentence_units + seg_sentence_units
+
+        # Hard ceiling — force flush before this segment tips us over 10s
+        if proposed_duration > DATASET_SAMPLE_MAX_SEC:
+            chunks.append(current)
+            current       = [seg]
+            current_start = seg["start"]
+            current_end   = seg["end"]
+            continue
+
+        current_duration       = current_end - current_start
         current_has_sentence_end = _ends_with_sentence_punct(current[-1].get("text", ""))
 
-        if (
-            current_has_sentence_end
-            and (current_end - current_start) >= DATASET_SAMPLE_MIN_SEC
-        ):
+        # Natural flush: sentence boundary AND we've accumulated at least 6s
+        if current_has_sentence_end and current_duration >= DATASET_CLIP_FLUSH_SEC:
             chunks.append(current)
-            current = [seg]
+            current       = [seg]
             current_start = seg["start"]
-            current_end = seg["end"]
-            current_sentence_units = seg_sentence_units
+            current_end   = seg["end"]
             continue
 
-        should_merge = False
-        if (
-            gap <= DATASET_MERGE_GAP_SEC
-            and proposed_duration <= DATASET_SAMPLE_TARGET_SEC
-            and proposed_sentence_units <= DATASET_MAX_SENTENCES_PER_CLIP
-        ):
-            should_merge = True
-        elif (
-            proposed_duration <= DATASET_SAMPLE_MAX_SEC
-            and proposed_sentence_units <= DATASET_MAX_SENTENCES_PER_CLIP
-            and gap <= (DATASET_MERGE_GAP_SEC * 0.5)
-        ):
-            should_merge = True
-
-        if should_merge:
-            current.append(seg)
-            current_end = seg["end"]
-            current_sentence_units = proposed_sentence_units
-            continue
-
-        chunks.append(current)
-        current = [seg]
-        current_start = seg["start"]
+        current.append(seg)
         current_end = seg["end"]
-        current_sentence_units = seg_sentence_units
 
     if current:
         chunks.append(current)
 
     return chunks
-
-
-def _split_chunk_by_duration(chunk: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
-    if not chunk:
-        return []
-
-    groups: list[list[dict[str, Any]]] = []
-    current: list[dict[str, Any]] = []
-    current_start = 0.0
-    current_end = 0.0
-
-    for seg in chunk:
-        if not current:
-            current = [seg]
-            current_start = seg["start"]
-            current_end = seg["end"]
-            continue
-
-        proposed_duration = seg["end"] - current_start
-        current_duration = current_end - current_start
-        gap = max(0.0, seg["start"] - current_end)
-        current_has_sentence_end = _ends_with_sentence_punct(current[-1].get("text", ""))
-
-        if current_has_sentence_end and current_duration >= DATASET_SAMPLE_MIN_SEC:
-            groups.append(current)
-            current = [seg]
-            current_start = seg["start"]
-            current_end = seg["end"]
-            continue
-
-        should_merge = False
-        if proposed_duration <= DATASET_SAMPLE_TARGET_SEC:
-            should_merge = True
-        elif proposed_duration <= DATASET_SAMPLE_MAX_SEC and (
-            current_duration < DATASET_SAMPLE_MIN_SEC or gap <= DATASET_MERGE_GAP_SEC
-        ):
-            should_merge = True
-
-        if should_merge:
-            current.append(seg)
-            current_end = seg["end"]
-            continue
-
-        groups.append(current)
-        current = [seg]
-        current_start = seg["start"]
-        current_end = seg["end"]
-
-    if current:
-        groups.append(current)
-
-    return groups
 
 
 def _build_split_results(
@@ -407,8 +334,13 @@ def _build_split_results(
     prompt_id: str,
     segments: list[dict[str, Any]],
     *,
-    main_speaker: str,
-):
+    main_speaker: str | None,
+    canonical_text: str | None = None,       # ← NEW: pass ground truth if known
+) -> list[tuple[str, bytes, str, bool, str, str | None, bool]]:
+    """
+    Returns tuples of:
+      (clip_name, wav_bytes, prompt_id, success, transcript, failure_reason, is_short)
+    """
     from pydub import AudioSegment
 
     audio_segment = AudioSegment.from_wav(io.BytesIO(wav_bytes))
@@ -416,25 +348,59 @@ def _build_split_results(
     if not chunks:
         return []
 
-    results: list[tuple[str, bytes, str, bool, str, str | None]] = []
-    for idx, chunk in enumerate(chunks):
-        duration_groups = _split_chunk_by_duration(chunk)
-        for part_idx, part_segments in enumerate(duration_groups):
-            start_ms = max(0, int(part_segments[0]["start"] * 1000) - 100)
-            end_ms = min(len(audio_segment), int(part_segments[-1]["end"] * 1000) + 100)
-            cropped = audio_segment[start_ms:end_ms]
-            transcript = _join_segment_text(part_segments)
-            if len(cropped) <= 0 or not transcript:
-                continue
+    is_fragmented = len(chunks) > 1
+    results = []
 
-            out_buf = io.BytesIO()
-            cropped.export(out_buf, format="wav")
-            normalized_wav = _normalize_audio_for_dataset_sync(out_buf.getvalue())
-            clip_name = _segmented_filename(filename, idx, len(chunks))
-            if len(duration_groups) > 1:
-                clip_name = _append_filename_suffix(clip_name, f"__part_{part_idx:03d}")
-            results.append((clip_name, normalized_wav, prompt_id, True, transcript, None))
+    for idx, chunk in enumerate(chunks):
+        start_ms = max(0, int(chunk[0]["start"]  * 1000) - 100)
+        end_ms   = min(len(audio_segment), int(chunk[-1]["end"] * 1000) + 100)
+        cropped  = audio_segment[start_ms:end_ms]
+        asr_transcript = _join_segment_text(chunk)
+
+        if not asr_transcript or len(cropped) <= 0:
+            continue
+
+        clip_duration_sec = len(cropped) / 1000.0
+
+        # Hard discard: below absolute floor or above ceiling
+        if clip_duration_sec < DATASET_SAMPLE_MIN_SEC or clip_duration_sec > DATASET_SAMPLE_MAX_SEC:
+            log.debug(
+                "Discarding %s chunk %d (%.2fs) — outside [%.1f, %.1f]s window",
+                filename, idx, clip_duration_sec, DATASET_SAMPLE_MIN_SEC, DATASET_SAMPLE_MAX_SEC,
+            )
+            continue
+
+        out_buf = io.BytesIO()
+        cropped.export(out_buf, format="wav")
+        normalized_wav = _normalize_audio_for_dataset_sync(out_buf.getvalue())
+
+        clip_name = _segmented_filename(filename, idx, len(chunks))
+        is_short  = clip_duration_sec < DATASET_SHORT_CLIP_MAX_SEC
+
+        results.append((clip_name, normalized_wav, prompt_id, True, asr_transcript, None, is_short))
+
     return results
+
+
+def _try_build_split_results(
+    filename: str,
+    wav_bytes: bytes,
+    prompt_id: str,
+    segments: list[dict[str, Any]],
+    *,
+    main_speaker: str | None,
+) -> list[tuple[str, bytes, str, bool, str, str | None]]:
+    try:
+        return _build_split_results(
+            filename,
+            wav_bytes,
+            prompt_id,
+            segments,
+            main_speaker=main_speaker,
+        )
+    except Exception as exc:
+        log.warning("Dataset split fallback failed for %s: %s", filename, exc)
+        return []
 
 
 def _is_cuda_oom_error(exc: BaseException) -> bool:
@@ -863,7 +829,24 @@ def _validate_and_crop_audio_sync(
                 fallback_transcript = _join_segment_text(segments)
 
                 if diarize_model is None:
-                    if fallback_transcript:
+                    split_results = _try_build_split_results(
+                        filename,
+                        wav_bytes,
+                        prompt_id,
+                        segments,
+                        main_speaker=None,
+                    )
+                    if split_results:
+                        results.extend(split_results)
+                        log.info(
+                            "[%s] Clip %d/%d: PASS — split aligned single-speaker fallback into %d sample(s) (%s)",
+                            char_name,
+                            clip_idx,
+                            total_clips,
+                            len(split_results),
+                            diarization_error or "diarization unavailable",
+                        )
+                    elif fallback_transcript:
                         results.append((filename, wav_bytes, prompt_id, True, fallback_transcript, diarization_error))
                         log.info(
                             "[%s] Clip %d/%d: PASS — single-speaker fallback (%s)",
@@ -900,7 +883,24 @@ def _validate_and_crop_audio_sync(
                     )
                 except Exception as exc:
                     reason = f"diarization failed: {exc}"
-                    if fallback_transcript:
+                    split_results = _try_build_split_results(
+                        filename,
+                        wav_bytes,
+                        prompt_id,
+                        segments,
+                        main_speaker=None,
+                    )
+                    if split_results:
+                        results.extend(split_results)
+                        log.warning(
+                            "[%s] Clip %d/%d: diarization failed, used aligned fallback split into %d sample(s): %s",
+                            char_name,
+                            clip_idx,
+                            total_clips,
+                            len(split_results),
+                            exc,
+                        )
+                    elif fallback_transcript:
                         results.append((filename, wav_bytes, prompt_id, True, fallback_transcript, reason))
                         log.warning(
                             "[%s] Clip %d/%d: diarization failed, using single-speaker fallback: %s",
@@ -922,7 +922,16 @@ def _validate_and_crop_audio_sync(
                     speaker_durations[speaker] = speaker_durations.get(speaker, 0.0) + duration
 
                 if not speaker_durations:
-                    if fallback_transcript:
+                    split_results = _try_build_split_results(
+                        filename,
+                        wav_bytes,
+                        prompt_id,
+                        segments,
+                        main_speaker=None,
+                    )
+                    if split_results:
+                        results.extend(split_results)
+                    elif fallback_transcript:
                         results.append(
                             (
                                 filename,
@@ -958,7 +967,16 @@ def _validate_and_crop_audio_sync(
                         _time.monotonic() - clip_start,
                     )
                 else:
-                    if fallback_transcript:
+                    split_results = _try_build_split_results(
+                        filename,
+                        wav_bytes,
+                        prompt_id,
+                        segments,
+                        main_speaker=None,
+                    )
+                    if split_results:
+                        results.extend(split_results)
+                    elif fallback_transcript:
                         results.append(
                             (
                                 filename,
@@ -1063,15 +1081,16 @@ async def prepare_dataset_items(
                 failure_reasons.append(f"{filename}: {failure_reason}")
             continue
         # Important: do NOT train on ASR output when we already know the canonical
-        # text for the clip (e.g., Harvard prompts). Whisper is only used here for
-        # diarization and cut points.
+        # For sub-split clips (filename contains __seg_ or __part_), the original
+        # canonical text covers the whole source clip — don't stamp it on a fragment.
         canonical = prompt_id_to_text.get(prompt_id) or ""
+
         normalized_transcript = canonical or _normalize_transcript_text(transcript)
         if not normalized_transcript:
-            if failure_reason:
-                failure_reasons.append(f"{filename}: transcript empty after normalization")
+            failure_reasons.append(f"{filename}: transcript empty after normalization")
             continue
-        final_train_segments.append((filename, _normalize_audio_for_dataset_sync(wav_bytes)))
+
+        final_train_segments.append((filename, _normalize_audio_for_dataset_sync(wav_bytes), is_short))
         final_transcripts.append(normalized_transcript)
 
     if not final_train_segments:
@@ -1091,16 +1110,15 @@ async def prepare_dataset_items(
             "type": "dataset_item_ref",
         },
     )
-    dataset_items.append(
-        {
-            "id": "ref_audio.wav",
-            "url": storage.get_presigned_url(ref_key, expires_in=86400 * 7),
-            "s3_url": ref_s3_url,
-            "text": ref_text,
-            "is_reference": True,
-            "included": True,
-        }
-    )
+    
+    dataset_items.append({
+        "id": filename,
+        "url": storage.get_presigned_url(item_key, expires_in=86400 * 7),
+        "s3_url": s3_url,
+        "text": transcript,
+        "is_reference": False,
+        "included": True,
+    })
 
     for idx, (filename, wav_bytes) in enumerate(final_train_segments):
         transcript = final_transcripts[idx]
