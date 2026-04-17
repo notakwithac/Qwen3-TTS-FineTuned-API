@@ -96,7 +96,7 @@ def test_validate_and_crop_audio_falls_back_without_diarization_token(monkeypatc
     assert [item[4] for item in result] == ["Hello there.", "General kenobi.", "You are."]
 
 
-def test_validate_and_crop_audio_retries_on_cpu_after_cuda_oom(monkeypatch):
+def test_validate_and_crop_audio_retries_on_cuda_after_cuda_oom(monkeypatch):
     fake_torch = types.SimpleNamespace(
         cuda=types.SimpleNamespace(is_available=lambda: True, empty_cache=lambda: None),
         serialization=types.SimpleNamespace(add_safe_globals=lambda _globals: None),
@@ -116,7 +116,7 @@ def test_validate_and_crop_audio_retries_on_cpu_after_cuda_oom(monkeypatch):
 
     def fake_get_whisper_model(model_name, *, device=None, compute_type=None):
         calls.append((device or "", compute_type or ""))
-        if device == "cuda":
+        if len(calls) == 1:
             raise RuntimeError("CUDA failed with error out of memory")
         return types.SimpleNamespace(
             transcribe=lambda _audio, batch_size=8: {
@@ -141,17 +141,27 @@ def test_validate_and_crop_audio_retries_on_cpu_after_cuda_oom(monkeypatch):
         "Major Barry",
     )
 
-    assert calls == [("cuda", "float16"), ("cpu", "int8")]
+    assert calls == [("cuda", "float16"), ("cuda", "float16")]
     assert result[0][3] is True
     assert result[0][4] == "Major barry."
 
 
-def test_validate_and_crop_audio_auto_uses_cpu_when_cuda_headroom_is_too_low(monkeypatch):
+def test_validate_and_crop_audio_auto_waits_for_cuda_headroom(monkeypatch):
+    mem_values = [
+        (4 * 1024**3, 24 * 1024**3),
+        (12 * 1024**3, 24 * 1024**3),
+    ]
+
+    def fake_mem_get_info(*_args, **_kwargs):
+        if len(mem_values) > 1:
+            return mem_values.pop(0)
+        return mem_values[0]
+
     fake_torch = types.SimpleNamespace(
         cuda=types.SimpleNamespace(
             is_available=lambda: True,
             empty_cache=lambda: None,
-            mem_get_info=lambda *_args, **_kwargs: (4 * 1024**3, 24 * 1024**3),
+            mem_get_info=fake_mem_get_info,
         ),
         serialization=types.SimpleNamespace(add_safe_globals=lambda _globals: None),
     )
@@ -167,6 +177,7 @@ def test_validate_and_crop_audio_auto_uses_cpu_when_cuda_headroom_is_too_low(mon
     monkeypatch.delenv("HF_TOKEN", raising=False)
     monkeypatch.delenv("DATASET_PREP_DEVICE", raising=False)
     monkeypatch.setenv("DATASET_WHISPER_MODEL", "large-v3")
+    monkeypatch.setenv("DATASET_PREP_CUDA_WAIT_POLL_SEC", "0.001")
     calls: list[tuple[str, str]] = []
 
     def fake_get_whisper_model(model_name, *, device=None, compute_type=None):
@@ -194,7 +205,7 @@ def test_validate_and_crop_audio_auto_uses_cpu_when_cuda_headroom_is_too_low(mon
         "Narrator",
     )
 
-    assert calls == [("cpu", "int8")]
+    assert calls == [("cuda", "float16")]
     assert result[0][3] is True
     assert result[0][4] == "Narrator line."
 

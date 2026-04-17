@@ -766,24 +766,125 @@ def _dataset_whisper_min_free_gb(model_name: str) -> float:
     return thresholds.get(normalized, 6.0)
 
 
+def _dataset_prep_cuda_wait_interval_sec() -> float:
+    raw = (os.environ.get("DATASET_PREP_CUDA_WAIT_POLL_SEC", "10") or "10").strip()
+    try:
+        return max(float(raw), 0.1)
+    except ValueError:
+        log.warning("Ignoring invalid DATASET_PREP_CUDA_WAIT_POLL_SEC=%r", raw)
+        return 10.0
+
+
+def _dataset_prep_cuda_wait_timeout_sec() -> float | None:
+    raw = (os.environ.get("DATASET_PREP_CUDA_WAIT_TIMEOUT_SEC", "0") or "0").strip()
+    try:
+        timeout_sec = max(float(raw), 0.0)
+    except ValueError:
+        log.warning("Ignoring invalid DATASET_PREP_CUDA_WAIT_TIMEOUT_SEC=%r", raw)
+        timeout_sec = 0.0
+    return None if timeout_sec == 0.0 else timeout_sec
+
+
+def _wait_for_dataset_prep_cuda(model_name: str, *, reason: str) -> None:
+    import time
+    import torch
+
+    min_free_gb = _dataset_whisper_min_free_gb(model_name)
+    poll_sec = _dataset_prep_cuda_wait_interval_sec()
+    timeout_sec = _dataset_prep_cuda_wait_timeout_sec()
+    started_at = time.monotonic()
+    last_log_at = 0.0
+
+    while True:
+        cuda_available = torch.cuda.is_available()
+        free_gb = _get_cuda_free_memory_gb() if cuda_available else None
+        has_headroom = free_gb is None or free_gb >= min_free_gb
+        if cuda_available and has_headroom:
+            if last_log_at:
+                waited_sec = time.monotonic() - started_at
+                if free_gb is None:
+                    log.info(
+                        "Dataset prep resumed on CUDA for WhisperX %s after waiting %.1fs.",
+                        model_name,
+                        waited_sec,
+                    )
+                else:
+                    log.info(
+                        "Dataset prep resumed on CUDA for WhisperX %s after waiting %.1fs (free %.1f GB).",
+                        model_name,
+                        waited_sec,
+                        free_gb,
+                    )
+            return
+
+        now = time.monotonic()
+        if timeout_sec is not None and (now - started_at) >= timeout_sec:
+            if not cuda_available:
+                raise RuntimeError(
+                    f"Timed out waiting for CUDA to become available for dataset prep ({reason})."
+                )
+            free_text = "unknown" if free_gb is None else f"{free_gb:.1f} GB"
+            raise RuntimeError(
+                f"Timed out waiting for CUDA headroom for dataset prep ({reason}); "
+                f"free memory {free_text}, need at least {min_free_gb:.1f} GB."
+            )
+
+        if (now - last_log_at) >= poll_sec:
+            if not cuda_available:
+                log.info(
+                    "Dataset prep waiting for CUDA availability for WhisperX %s (%s).",
+                    model_name,
+                    reason,
+                )
+            elif free_gb is None:
+                log.info(
+                    "Dataset prep waiting for CUDA headroom for WhisperX %s (%s).",
+                    model_name,
+                    reason,
+                )
+            else:
+                log.info(
+                    "Dataset prep waiting for CUDA headroom for WhisperX %s: %.1f/%.1f GB free (%s).",
+                    model_name,
+                    free_gb,
+                    min_free_gb,
+                    reason,
+                )
+            last_log_at = now
+
+        time.sleep(poll_sec)
+
+
 def _resolve_dataset_prep_device(configured_device: str, model_name: str) -> str:
     import torch
 
-    if configured_device in {"cpu", "cuda"}:
+    if configured_device == "cpu":
         return configured_device
-    if not torch.cuda.is_available():
-        return "cpu"
-
-    free_gb = _get_cuda_free_memory_gb()
-    min_free_gb = _dataset_whisper_min_free_gb(model_name)
-    if free_gb is not None and free_gb < min_free_gb:
-        log.info(
-            "Dataset prep auto-selected CPU for WhisperX %s: free CUDA memory %.1f GB below %.1f GB threshold.",
-            model_name,
-            free_gb,
-            min_free_gb,
-        )
-        return "cpu"
+    if configured_device == "auto":
+        if not torch.cuda.is_available():
+            return "cpu"
+        free_gb = _get_cuda_free_memory_gb()
+        min_free_gb = _dataset_whisper_min_free_gb(model_name)
+        if free_gb is not None and free_gb < min_free_gb:
+            _wait_for_dataset_prep_cuda(
+                model_name,
+                reason=f"free CUDA memory {free_gb:.1f} GB below {min_free_gb:.1f} GB threshold",
+            )
+        return "cuda"
+    if configured_device == "cuda":
+        if not torch.cuda.is_available():
+            _wait_for_dataset_prep_cuda(model_name, reason=f"configured_device={configured_device}")
+        free_gb = _get_cuda_free_memory_gb()
+        min_free_gb = _dataset_whisper_min_free_gb(model_name)
+        if free_gb is not None and free_gb < min_free_gb:
+            _wait_for_dataset_prep_cuda(
+                model_name,
+                reason=f"free CUDA memory {free_gb:.1f} GB below {min_free_gb:.1f} GB threshold",
+            )
+        return "cuda"
+    if configured_device:
+        log.warning("Unknown DATASET_PREP_DEVICE=%r; defaulting dataset prep to CUDA wait mode.", configured_device)
+        _wait_for_dataset_prep_cuda(model_name, reason=f"configured_device={configured_device}")
     return "cuda"
 
 
@@ -1012,20 +1113,20 @@ def _validate_and_crop_audio_sync(
         device = _resolve_dataset_prep_device(configured_device, model_name)
         compute_type = "float16" if device == "cuda" else "int8"
 
-        try:
-            model = _get_whisper_model(model_name, device=device, compute_type=compute_type)
-        except Exception as exc:
-            if device == "cuda" and _is_cuda_oom_error(exc):
-                log.warning(
-                    "WhisperX model load hit CUDA OOM for %s; retrying dataset prep on CPU.",
-                    char_name,
-                    exc_info=True,
-                )
-                _clear_torch_cuda_cache()
-                device = "cpu"
-                compute_type = "int8"
+        while True:
+            try:
                 model = _get_whisper_model(model_name, device=device, compute_type=compute_type)
-            else:
+                break
+            except Exception as exc:
+                if device == "cuda" and _is_cuda_oom_error(exc):
+                    log.warning(
+                        "WhisperX model load hit CUDA OOM for %s; waiting for GPU headroom before retrying.",
+                        char_name,
+                        exc_info=True,
+                    )
+                    _clear_torch_cuda_cache()
+                    _wait_for_dataset_prep_cuda(model_name, reason="WhisperX model load CUDA OOM")
+                    continue
                 raise
 
         diarize_model = None
@@ -1034,29 +1135,27 @@ def _validate_and_crop_audio_sync(
             diarization_error = "SKIP_WHISPER_VALIDATION enabled"
             log.info("SKIP_WHISPER_VALIDATION enabled on GPU dataset job for %s.", char_name)
         else:
-            try:
-                diarize_model = _get_diarization_pipeline(hf_token, device=device)
-            except Exception as exc:
-                if device == "cuda" and _is_cuda_oom_error(exc):
-                    log.warning(
-                        "Diarization load hit CUDA OOM for %s; retrying diarization on CPU.",
-                        char_name,
-                        exc_info=True,
-                    )
-                    _clear_torch_cuda_cache()
-                    try:
-                        diarize_model = _get_diarization_pipeline(hf_token, device="cpu")
-                        diarization_error = "diarization downgraded to CPU after CUDA OOM"
-                    except Exception as cpu_exc:
-                        diarization_error = str(cpu_exc)
-                else:
+            while True:
+                try:
+                    diarize_model = _get_diarization_pipeline(hf_token, device=device)
+                    break
+                except Exception as exc:
+                    if device == "cuda" and _is_cuda_oom_error(exc):
+                        log.warning(
+                            "Diarization load hit CUDA OOM for %s; waiting for GPU headroom before retrying.",
+                            char_name,
+                            exc_info=True,
+                        )
+                        _clear_torch_cuda_cache()
+                        _wait_for_dataset_prep_cuda(model_name, reason="WhisperX diarization CUDA OOM")
+                        continue
                     diarization_error = str(exc)
-                if diarize_model is None:
                     log.warning(
                         "Diarization unavailable for %s; falling back to aligned full-audio transcripts: %s",
                         char_name,
                         diarization_error,
                     )
+                    break
 
         import time as _time
         import platform
@@ -1137,14 +1236,20 @@ def _validate_and_crop_audio_sync(
                 if platform.system() == "Windows" and align_device == "cuda":
                     align_device = "cpu"
 
-                try:
-                    model_a, metadata = _get_align_model(result["language"], align_device)
-                except Exception as exc:
-                    if align_device == "cuda":
-                        log.warning("Alignment on CUDA failed, falling back to CPU: %s", exc)
-                        model_a, metadata = _get_align_model(result["language"], "cpu")
-                        align_device = "cpu"
-                    else:
+                while True:
+                    try:
+                        model_a, metadata = _get_align_model(result["language"], align_device)
+                        break
+                    except Exception as exc:
+                        if align_device == "cuda" and _is_cuda_oom_error(exc):
+                            log.warning(
+                                "Alignment load hit CUDA OOM for %s; waiting for GPU headroom before retrying.",
+                                char_name,
+                                exc_info=True,
+                            )
+                            _clear_torch_cuda_cache()
+                            _wait_for_dataset_prep_cuda(model_name, reason="WhisperX alignment CUDA OOM")
+                            continue
                         raise
 
                 t0 = _time.monotonic()
