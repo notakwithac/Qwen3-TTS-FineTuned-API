@@ -46,7 +46,7 @@ broadcast_module.Broadcast = _DummyBroadcast
 sys.modules["broadcaster"] = broadcast_module
 
 import api_server
-from session_manager import DuplicateActiveSessionError
+from session_manager import DuplicateActiveSessionError, TrainingConflictError
 
 
 class StubInference:
@@ -295,6 +295,41 @@ def test_session_prepare_returns_conflict_for_duplicate_active_session(monkeypat
             "message": "A matching session is already active for this chapter workload (session-1).",
             "active_session_id": "session-1",
         }
+    }
+
+
+def test_session_prepare_returns_conflict_when_training_is_active(monkeypatch):
+    inference = StubInference()
+    monkeypatch.setattr(api_server, "pipeline", StubPipeline(inference))
+    _patch_startup_dependencies(monkeypatch)
+
+    async def _raise_training_conflict(**_kwargs):
+        raise TrainingConflictError(
+            "GPU training is active; session preparation must wait for training to finish."
+        )
+
+    monkeypatch.setattr(api_server.session_mgr, "prepare_session", _raise_training_conflict)
+
+    with TestClient(api_server.app) as client:
+        response = client.post(
+            "/session/prepare",
+            json={
+                "session_id": "session-2",
+                "book_id": "book-1",
+                "chapter_id": "chapter-1",
+                "characters": [
+                    {
+                        "job_id": "job-1",
+                        "character_name": "Narrator",
+                        "line_count": 17,
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": "GPU training is active; session preparation must wait for training to finish."
     }
 
 

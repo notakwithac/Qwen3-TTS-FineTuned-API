@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 import session_manager
-from session_manager import DuplicateActiveSessionError, SessionManager
+from session_manager import DuplicateActiveSessionError, SessionManager, TrainingConflictError
 
 
 class _StubJob:
@@ -28,9 +28,10 @@ class _StubPipeline:
 
 
 class _StubInferenceManager:
-    def __init__(self, *, loaded_count: int = 2, max_models: int = 4):
+    def __init__(self, *, loaded_count: int = 2, max_models: int = 4, training_active: bool = False):
         self.loaded_count = loaded_count
         self.max_models = max_models
+        self.training_active = training_active
         self.load_calls = []
         self.unpin_calls = []
         self.unload_calls = []
@@ -41,6 +42,9 @@ class _StubInferenceManager:
 
     def load_for_session(self, cache_key, checkpoint_path, speaker_name, session_id=""):
         self.load_calls.append((cache_key, checkpoint_path, speaker_name, session_id))
+
+    def is_training_active_or_requested(self):
+        return self.training_active
 
     def unpin_session(self, cache_key, session_id):
         self.unpin_calls.append((cache_key, session_id))
@@ -196,3 +200,39 @@ async def test_prepare_session_rejects_duplicate_active_chapter_workload(monkeyp
         )
 
     assert excinfo.value.active_session_id == "session-1"
+
+
+@pytest.mark.asyncio
+async def test_prepare_session_rejects_when_training_is_active(monkeypatch, tmp_path):
+    checkpoint_path = tmp_path / "checkpoint-epoch-14"
+    checkpoint_path.mkdir()
+    (checkpoint_path / "config.json").write_text("{}", encoding="utf-8")
+
+    inference = _StubInferenceManager(loaded_count=2, max_models=4, training_active=True)
+    pipeline = _StubPipeline({"job-1": _StubJob("job-1", checkpoint_path)})
+    manager = SessionManager(
+        inference_manager=inference,
+        pipeline=pipeline,
+        storage=None,
+        replica_threshold=500,
+        max_replicas=4,
+        batch_size=1,
+    )
+
+    monkeypatch.setattr(manager, "_get_available_vram", lambda: 40.0)
+
+    with pytest.raises(TrainingConflictError, match="training is active"):
+        await manager.prepare_session(
+            session_id="session-1",
+            characters=[
+                {
+                    "job_id": "job-1",
+                    "character_name": "Narrator",
+                    "line_count": 17,
+                }
+            ],
+            book_id="book-1",
+            chapter_id="chapter-1",
+        )
+
+    assert inference.load_calls == []

@@ -41,6 +41,26 @@ AudioInput = Union[
 ]
 
 
+def _normalize_single_device_map(load_kwargs):
+    normalized_kwargs = dict(load_kwargs)
+    device_map = normalized_kwargs.get("device_map")
+
+    if isinstance(device_map, dict):
+        return normalized_kwargs, None
+
+    if isinstance(device_map, str) and device_map == "auto":
+        return normalized_kwargs, None
+
+    if device_map is None:
+        return normalized_kwargs, None
+
+    if not isinstance(device_map, (str, torch.device, int)):
+        return normalized_kwargs, None
+
+    normalized_kwargs.pop("device_map", None)
+    return normalized_kwargs, device_map
+
+
 class Qwen3TTSTokenizer:
     """
     A wrapper for Qwen3 TTS Tokenizer 25Hz/12Hz with HuggingFace-style loading.
@@ -84,8 +104,11 @@ class Qwen3TTSTokenizer:
         AutoConfig.register("qwen3_tts_tokenizer_12hz", Qwen3TTSTokenizerV2Config)
         AutoModel.register(Qwen3TTSTokenizerV2Config, Qwen3TTSTokenizerV2Model)
 
+        load_kwargs, target_device = _normalize_single_device_map(kwargs)
         inst.feature_extractor = AutoFeatureExtractor.from_pretrained(pretrained_model_name_or_path)
-        inst.model = AutoModel.from_pretrained(pretrained_model_name_or_path, **kwargs)
+        inst.model = AutoModel.from_pretrained(pretrained_model_name_or_path, **load_kwargs)
+        if target_device is not None:
+            inst.model = inst.model.to(target_device)
         inst.config = inst.model.config
 
         inst.device = getattr(inst.model, "device", None)

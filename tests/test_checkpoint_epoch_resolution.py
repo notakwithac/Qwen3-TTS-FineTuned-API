@@ -82,3 +82,53 @@ def test_upload_latest_checkpoint_to_s3_only_uploads_last_epoch(tmp_path, monkey
     assert checkpoint_s3_keys == {"9": "s3://bucket/9.zip"}
     assert job.s3_model_key == "s3://bucket/9.zip"
     assert job.checkpoint_s3_keys == {"9": "s3://bucket/9.zip"}
+
+
+def test_has_verified_checkpoint_backup_checks_actual_object_existence(tmp_path, monkeypatch):
+    job = _make_job(tmp_path, num_epochs=10)
+    job.s3_model_key = "s3://bucket/9.zip"
+
+    pipe = pipeline.Pipeline.__new__(pipeline.Pipeline)
+
+    class _Storage:
+        is_configured = True
+        bucket = "bucket"
+
+        @staticmethod
+        def object_exists(key):
+            return key == "9.zip"
+
+    monkeypatch.setattr("pipeline.storage", _Storage(), raising=False)
+    import types
+    monkeypatch.setitem(sys.modules, "storage", types.SimpleNamespace(storage=_Storage()))
+
+    assert pipeline.Pipeline._has_verified_checkpoint_backup(pipe, job) is True
+
+
+def test_retry_job_failed_with_only_job_json_falls_back_to_full_restart(tmp_path, monkeypatch):
+    job = _make_job(tmp_path, num_epochs=10)
+    job.status = pipeline.JobStatus.FAILED
+    job.s3_model_key = "s3://bucket/missing.zip"
+
+    pipe = pipeline.Pipeline.__new__(pipeline.Pipeline)
+    pipe.jobs_dir = tmp_path / "jobs"
+    pipe._lock = None
+    started = []
+
+    class _Storage:
+        is_configured = True
+        bucket = "bucket"
+
+        @staticmethod
+        def object_exists(key):
+            return False
+
+    monkeypatch.setitem(sys.modules, "storage", __import__("types").SimpleNamespace(storage=_Storage()))
+    monkeypatch.setattr(pipe, "get_job", lambda job_id: job)
+    monkeypatch.setattr(pipe, "start_job", lambda job_id: started.append(job_id))
+
+    retried = pipeline.Pipeline.retry_job(pipe, job.job_id)
+
+    assert retried is job
+    assert job.status == pipeline.JobStatus.QUEUED
+    assert started == [job.job_id]

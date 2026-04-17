@@ -43,6 +43,29 @@ AudioLike = Union[
 MaybeList = Union[Any, List[Any]]
 
 
+def _normalize_single_device_map(load_kwargs: Dict[str, Any]) -> tuple[Dict[str, Any], Optional[Union[str, torch.device, int]]]:
+    normalized_kwargs = dict(load_kwargs)
+    device_map = normalized_kwargs.get("device_map")
+
+    if isinstance(device_map, dict):
+        return normalized_kwargs, None
+
+    if isinstance(device_map, str) and device_map == "auto":
+        return normalized_kwargs, None
+
+    if device_map is None:
+        return normalized_kwargs, None
+
+    target_device: Optional[Union[str, torch.device, int]] = None
+    if isinstance(device_map, (str, torch.device, int)):
+        target_device = device_map
+    else:
+        return normalized_kwargs, None
+
+    normalized_kwargs.pop("device_map", None)
+    return normalized_kwargs, target_device
+
+
 @dataclass
 class VoiceClonePromptItem:
     """
@@ -115,11 +138,16 @@ class Qwen3TTSModel:
         AutoModel.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
         AutoProcessor.register(Qwen3TTSConfig, Qwen3TTSProcessor)
 
-        model = AutoModel.from_pretrained(pretrained_model_name_or_path, **kwargs)
+        load_kwargs, target_device = _normalize_single_device_map(kwargs)
+
+        model = AutoModel.from_pretrained(pretrained_model_name_or_path, **load_kwargs)
         if not isinstance(model, Qwen3TTSForConditionalGeneration):
             raise TypeError(
                 f"AutoModel returned {type(model)}, expected Qwen3TTSForConditionalGeneration. "
             )
+
+        if target_device is not None:
+            model = model.to(target_device)
 
         processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, fix_mistral_regex=True,)
 

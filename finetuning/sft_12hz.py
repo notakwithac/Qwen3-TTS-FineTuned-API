@@ -57,6 +57,29 @@ def _needs_final_checkpoint(
     return not _should_save_epoch(final_epoch, save_from_epoch=save_from_epoch)
 
 
+def _iter_checkpoint_dirs(output_dir: str):
+    root = Path(output_dir)
+    if not root.exists():
+        return []
+    candidates = []
+    for item in root.iterdir():
+        if not item.is_dir():
+            continue
+        match = re.match(r"checkpoint-epoch-(\d+)$", item.name)
+        if match:
+            candidates.append((int(match.group(1)), item))
+    candidates.sort(key=lambda x: x[0])
+    return candidates
+
+
+def _prune_checkpoint_dirs(output_dir: str, keep_epoch: int) -> None:
+    keep_name = f"checkpoint-epoch-{keep_epoch}"
+    for _, checkpoint_dir in _iter_checkpoint_dirs(output_dir):
+        if checkpoint_dir.name == keep_name:
+            continue
+        shutil.rmtree(checkpoint_dir, ignore_errors=True)
+
+
 def _ensure_local_model_path(model_path: str) -> str:
     if os.path.exists(model_path):
         return model_path
@@ -190,18 +213,9 @@ def train():
         tb_writer = SummaryWriter(log_dir=str(tb_log_dir))
 
     def _find_latest_checkpoint(output_dir: str):
-        root = Path(output_dir)
-        if not root.exists():
-            return None, None
-        candidates = []
-        for item in root.iterdir():
-            if item.is_dir():
-                m = re.match(r"checkpoint-epoch-(\d+)$", item.name)
-                if m:
-                    candidates.append((int(m.group(1)), item))
+        candidates = _iter_checkpoint_dirs(output_dir)
         if not candidates:
             return None, None
-        candidates.sort(key=lambda x: x[0])
         return candidates[-1][1], candidates[-1][0]
 
     start_epoch = 0
@@ -351,6 +365,7 @@ def train():
 
     def _save_checkpoint(epoch_idx: int):
         output_dir = os.path.join(args.output_model_path, f"checkpoint-epoch-{epoch_idx}")
+        _prune_checkpoint_dirs(args.output_model_path, keep_epoch=epoch_idx)
         _copy_checkpoint_assets(
             source_model_path=MODEL_PATH,
             output_dir=output_dir,
@@ -649,6 +664,7 @@ def train_programmatic(
 
     def _save_ckpt(epoch_idx):
         output_dir = os.path.join(args.output_model_path, f"checkpoint-epoch-{epoch_idx}")
+        _prune_checkpoint_dirs(args.output_model_path, keep_epoch=epoch_idx)
         _copy_checkpoint_assets(
             source_model_path=MODEL_PATH,
             output_dir=output_dir,
@@ -770,16 +786,7 @@ def train_programmatic(
 
 def _find_latest_checkpoint_static(output_dir: str):
     """Standalone version of _find_latest_checkpoint for use outside train()."""
-    root = Path(output_dir)
-    if not root.exists():
-        return None, None
-    candidates = []
-    for item in root.iterdir():
-        if item.is_dir():
-            m = re.match(r"checkpoint-epoch-(\d+)$", item.name)
-            if m:
-                candidates.append((int(m.group(1)), item))
+    candidates = _iter_checkpoint_dirs(output_dir)
     if not candidates:
         return None, None
-    candidates.sort(key=lambda x: x[0])
     return candidates[-1][1], candidates[-1][0]

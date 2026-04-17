@@ -246,6 +246,40 @@ def test_generate_voice_design_releases_gpu_controller_on_failure(monkeypatch):
     ]
 
 
+def test_load_for_session_uses_gpu_controller_and_releases_on_failure(monkeypatch):
+    events = []
+
+    class _GpuController:
+        def begin_inference(self, op_name):
+            events.append(("begin", op_name))
+
+        def end_inference(self):
+            events.append(("end", None))
+
+        def is_training_active_or_requested(self):
+            return False
+
+    manager = InferenceManager(device="cpu", gpu_controller=_GpuController())
+    monkeypatch.setattr(
+        manager,
+        "_load_model_into_cache",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("forced session load failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="forced session load failure"):
+        manager.load_for_session(
+            cache_key="checkpoint::replica-0",
+            checkpoint_path="checkpoint",
+            speaker_name="Narrator",
+            session_id="session-1",
+        )
+
+    assert events == [
+        ("begin", "session_prepare_model_load"),
+        ("end", None),
+    ]
+
+
 def test_runtime_adjustable_limiter_logs_wait_lifecycle(monkeypatch):
     limiter = inference_manager.RuntimeAdjustableLimiter(1)
     events = []

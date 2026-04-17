@@ -826,14 +826,29 @@ class InferenceManager:
 
         Session-pinned models are protected from LRU eviction.
         """
-        with self._lock:
-            return self._load_model_into_cache(
-                cache_key=cache_key,
-                source_path=checkpoint_path,
-                model_type="custom_voice",
-                speaker_name=speaker_name,
-                session_id=session_id,
-            )
+        if self._gpu_controller:
+            self._gpu_controller.begin_inference("session_prepare_model_load")
+        try:
+            with self._lock:
+                return self._load_model_into_cache(
+                    cache_key=cache_key,
+                    source_path=checkpoint_path,
+                    model_type="custom_voice",
+                    speaker_name=speaker_name,
+                    session_id=session_id,
+                )
+        finally:
+            if self._gpu_controller:
+                self._gpu_controller.end_inference()
+
+    def is_training_active_or_requested(self) -> bool:
+        controller = self._gpu_controller
+        if controller is None:
+            return False
+        checker = getattr(controller, "is_training_active_or_requested", None)
+        if checker is None:
+            return False
+        return bool(checker())
 
     def unload_specific(self, cache_key: str):
         """Unload a specific model by its cache key."""

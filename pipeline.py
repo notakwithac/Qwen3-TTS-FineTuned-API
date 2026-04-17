@@ -65,6 +65,24 @@ def _list_saved_checkpoint_epochs(output_dir: str) -> list[int]:
     return sorted(set(epochs))
 
 
+def _normalize_s3_object_key(value: Optional[str], bucket: Optional[str] = None) -> Optional[str]:
+    if not value:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    if raw.startswith("s3://"):
+        without_scheme = raw[5:]
+        parts = without_scheme.split("/", 1)
+        if len(parts) == 2:
+            obj_bucket, key = parts
+            if bucket and obj_bucket != bucket:
+                return None
+            return key
+        return None
+    return raw
+
+
 # ---------------------------------------------------------------------------
 # Job state
 # ---------------------------------------------------------------------------
@@ -347,6 +365,52 @@ class Pipeline:
         job.checkpoint_s3_keys = checkpoint_s3_keys
         job.s3_model_key = s3_key
         return checkpoint_s3_keys
+
+    def _checkpoint_s3_object_exists(
+        self,
+        job: Job,
+        checkpoint_epoch: Optional[int] = None,
+    ) -> bool:
+        from storage import storage
+
+        if not storage.is_configured:
+            return False
+
+        s3_ref = None
+        if checkpoint_epoch is not None:
+            s3_ref = job.checkpoint_s3_keys.get(str(checkpoint_epoch))
+        if not s3_ref:
+            s3_ref = job.s3_model_key
+        s3_key = _normalize_s3_object_key(s3_ref, bucket=getattr(storage, "bucket", None))
+        if not s3_key:
+            return False
+        return storage.object_exists(s3_key)
+
+    def _has_verified_checkpoint_backup(self, job: Job) -> bool:
+        latest_epoch = self._latest_checkpoint_epoch(job)
+        if latest_epoch is not None and self._checkpoint_s3_object_exists(job, checkpoint_epoch=latest_epoch):
+            return True
+        return self._checkpoint_s3_object_exists(job)
+
+    def _has_local_checkpoint(self, job: Job) -> bool:
+        checkpoint_path = job.checkpoint_path
+        if checkpoint_path and os.path.exists(str(checkpoint_path)):
+            return True
+        latest_epoch = self._latest_checkpoint_epoch(job)
+        if latest_epoch is None:
+            return False
+        checkpoint_dir = _checkpoint_path_for_epoch(job.output_dir, latest_epoch)
+        return checkpoint_dir.is_dir() and any(checkpoint_dir.iterdir())
+
+    def _ensure_s3_backup_for_ready_job(self, job: Job) -> bool:
+        if self._has_verified_checkpoint_backup(job):
+            return True
+        if not self._has_local_checkpoint(job):
+            return False
+        checkpoint_s3_keys = self._upload_latest_checkpoint_to_s3(job)
+        self._upload_job_json_to_s3(job)
+        job.save()
+        return bool(checkpoint_s3_keys) and self._has_verified_checkpoint_backup(job)
 
     def resolve_checkpoint_path(
         self,
@@ -668,14 +732,23 @@ class Pipeline:
             return None
             
         if job.status == JobStatus.READY:
-            return job # Already complete, just return it
+            if self._ensure_s3_backup_for_ready_job(job):
+                return job
+            if not self._has_local_checkpoint(job):
+                job.status = JobStatus.QUEUED
+                job.error = None
+                job._cancel_requested = False
+                job.progress = {"stage": "queued", "detail": "Rebuilding missing checkpoint backup from dataset..."}
+                self.start_job(job_id)
+                return job
+            return job # Already complete, and local checkpoint still exists.
             
         if job.status not in (JobStatus.FAILED, JobStatus.CANCELLED):
             return None  # Only allow retrying if it actually failed or died.
 
         # Check if training already completed (late-stage failure)
-        checkpoint_exists = job.checkpoint_path and os.path.exists(str(job.checkpoint_path))
-        has_s3_backup = bool(job.s3_model_key)
+        checkpoint_exists = self._has_local_checkpoint(job)
+        has_s3_backup = self._has_verified_checkpoint_backup(job)
 
         if checkpoint_exists or has_s3_backup:
             # Training succeeded — skip to Stage 3 (load for inference)

@@ -72,6 +72,12 @@ class GPUResourceController:
                 self._lock.wait()
             self._inference_count += 1
 
+    def is_training_active_or_requested(self) -> bool:
+        if self.allow_concurrent:
+            return False
+        with self._lock:
+            return self._training_active or self._training_requested
+
     def end_inference(self):
         if self.allow_concurrent:
             return

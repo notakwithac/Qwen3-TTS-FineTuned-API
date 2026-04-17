@@ -65,6 +65,10 @@ class DuplicateActiveSessionError(ValueError):
         self.active_session_id = active_session_id
 
 
+class TrainingConflictError(RuntimeError):
+    """Raised when exclusive GPU training blocks session preparation."""
+
+
 @dataclass
 class CharacterPlan:
     """Plan for a single character within a session."""
@@ -898,6 +902,11 @@ class SessionManager:
                 )
 
             # 4. Pre-load and pin planned replicas before any work is queued.
+            if self.inference.is_training_active_or_requested():
+                raise TrainingConflictError(
+                    "GPU training is active; session preparation must wait for training to finish."
+                )
+
             preload_tasks = []
             for plan in session.character_plans.values():
                 for cache_key in plan.replica_keys:

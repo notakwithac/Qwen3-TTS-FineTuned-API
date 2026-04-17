@@ -70,3 +70,24 @@ def test_needs_final_checkpoint_for_short_runs_before_epoch_six():
     assert sft_12hz._needs_final_checkpoint(4, 0, True, save_from_epoch=6) is True
     assert sft_12hz._needs_final_checkpoint(6, 0, True, save_from_epoch=6) is False
     assert sft_12hz._needs_final_checkpoint(4, 0, False, save_from_epoch=6) is False
+
+
+def test_prune_checkpoint_dirs_keeps_only_latest_epoch(tmp_path):
+    for epoch in (6, 9, 14):
+        checkpoint_dir = tmp_path / f"checkpoint-epoch-{epoch}"
+        checkpoint_dir.mkdir()
+        (checkpoint_dir / "model.safetensors").write_text(f"ckpt-{epoch}", encoding="utf-8")
+
+    sft_12hz._prune_checkpoint_dirs(str(tmp_path), keep_epoch=14)
+
+    assert not (tmp_path / "checkpoint-epoch-6").exists()
+    assert not (tmp_path / "checkpoint-epoch-9").exists()
+    assert (tmp_path / "checkpoint-epoch-14").exists()
+
+
+def test_find_latest_checkpoint_static_uses_remaining_checkpoint(tmp_path):
+    (tmp_path / "checkpoint-epoch-14").mkdir()
+    latest_path, latest_epoch = sft_12hz._find_latest_checkpoint_static(str(tmp_path))
+
+    assert latest_epoch == 14
+    assert latest_path == tmp_path / "checkpoint-epoch-14"

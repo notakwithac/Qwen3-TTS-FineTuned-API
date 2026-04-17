@@ -26,7 +26,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pipeline import Pipeline, JobStatus
 from storage import storage
 from ops_logger import ops_log
-from session_manager import DuplicateActiveSessionError, SessionManager, SessionStatus
+from session_manager import (
+    DuplicateActiveSessionError,
+    SessionManager,
+    SessionStatus,
+    TrainingConflictError,
+)
 from metrics_collector import metrics_collector
 from gpu_resource_controller import GPUResourceController
 from dataset_jobs import (
@@ -1266,6 +1271,8 @@ class JobSummary(APIModel):
     available_checkpoint_epochs: list[int] = Field(default_factory=list)
     inference_url: Optional[str] = None
     message: Optional[str] = None
+    s3_checkpoint_present: bool = False
+    has_durable_checkpoint: bool = False
 
 
 class StorageStatus(APIModel):
@@ -1675,7 +1682,12 @@ async def get_job(job_id: str):
     job = await loop.run_in_executor(None, pipeline.get_job, job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
-    return job.to_dict()
+    payload = job.to_dict()
+    s3_present = await loop.run_in_executor(None, pipeline._has_verified_checkpoint_backup, job)
+    has_local = await loop.run_in_executor(None, pipeline._has_local_checkpoint, job)
+    payload["s3_checkpoint_present"] = s3_present
+    payload["has_durable_checkpoint"] = bool(s3_present or has_local)
+    return payload
 
 
 @app.delete("/jobs/{job_id}", summary="Cancel or delete a job")
@@ -3098,6 +3110,8 @@ async def session_prepare(req: SessionPrepareRequest):
                 "active_session_id": e.active_session_id,
             },
         )
+    except TrainingConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
