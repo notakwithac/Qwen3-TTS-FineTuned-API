@@ -849,13 +849,13 @@ class SessionManager:
                             )
 
                     self.pipeline.touch_job(job_id)
-                    return job_id, checkpoint_path, job.character_id
+                    return job_id, checkpoint_path, job.character_id, job.speaker_name
 
                 return await loop.run_in_executor(None, _resolve_job_sync)
 
             # Resolve all unique jobs
             results = await asyncio.gather(*[_resolve_job(c) for c in unique_jobs.values()])
-            job_info = {r[0]: (r[1], r[2]) for r in results}
+            job_info = {r[0]: (r[1], r[2], r[3]) for r in results}
 
             headroom_buffer_gb = self._shared_headroom_buffer_gb()
             available_vram_gb = max(0.0, self._get_available_vram() - headroom_buffer_gb)
@@ -871,11 +871,11 @@ class SessionManager:
             # 2. Map all characters to their resolved plans
             for char_dict in characters:
                 job_id = char_dict["job_id"]
-                checkpoint_path, character_id = job_info[job_id]
+                checkpoint_path, character_id, speaker_name = job_info[job_id]
                 
                 plan = CharacterPlan(
                     job_id=job_id,
-                    character_name=char_dict["character_name"],
+                    character_name=speaker_name,
                     checkpoint_path=checkpoint_path,
                     line_count=char_dict.get("line_count", 0),
                     avg_word_count=char_dict.get("avg_word_count", 20),
