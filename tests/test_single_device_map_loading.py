@@ -57,9 +57,9 @@ def test_qwen3_tts_model_loads_single_device_map_without_dispatch(monkeypatch):
     )
 
     _, forwarded_kwargs = captured["call"]
-    assert "device_map" not in forwarded_kwargs
+    assert forwarded_kwargs["device_map"] == {"": "cuda:0"}
     assert forwarded_kwargs["dtype"] == "bf16"
-    assert fake_model.to_calls == ["cuda:0"]
+    assert fake_model.to_calls == []
     assert wrapper.model is fake_model
 
 
@@ -119,7 +119,24 @@ def test_qwen3_tts_tokenizer_loads_single_device_map_without_dispatch(monkeypatc
     )
 
     _, forwarded_kwargs = captured["call"]
-    assert "device_map" not in forwarded_kwargs
+    assert forwarded_kwargs["device_map"] == {"": "cuda:0"}
     assert forwarded_kwargs["dtype"] == "bf16"
-    assert fake_model.to_calls == ["cuda:0"]
+    assert fake_model.to_calls == []
     assert tokenizer.model is fake_model
+
+
+def test_skip_dispatch_for_single_device_restores_original_dispatch(monkeypatch):
+    original_dispatch = qwen3_tts_model_module.hf_modeling_utils.dispatch_model
+    seen = []
+
+    def _replacement(model, **kwargs):
+        seen.append((model, kwargs))
+        return "replacement"
+
+    monkeypatch.setattr(qwen3_tts_model_module.hf_modeling_utils, "dispatch_model", _replacement)
+
+    with qwen3_tts_model_module._skip_dispatch_for_single_device({"": "cuda:0"}):
+        assert qwen3_tts_model_module.hf_modeling_utils.dispatch_model("model") == "model"
+
+    assert qwen3_tts_model_module.hf_modeling_utils.dispatch_model is _replacement
+    assert seen == []

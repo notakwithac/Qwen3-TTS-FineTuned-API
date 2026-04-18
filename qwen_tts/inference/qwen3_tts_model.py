@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import base64
+import contextlib
 import io
 import logging
 import time
@@ -28,6 +29,7 @@ import librosa
 import numpy as np
 import soundfile as sf
 import torch
+from transformers import modeling_utils as hf_modeling_utils
 from transformers import AutoConfig, AutoModel, AutoProcessor
 
 from ..core.models import Qwen3TTSConfig, Qwen3TTSForConditionalGeneration, Qwen3TTSProcessor
@@ -43,7 +45,7 @@ AudioLike = Union[
 MaybeList = Union[Any, List[Any]]
 
 
-def _normalize_single_device_map(load_kwargs: Dict[str, Any]) -> tuple[Dict[str, Any], Optional[Union[str, torch.device, int]]]:
+def _normalize_single_device_map(load_kwargs: Dict[str, Any]) -> tuple[Dict[str, Any], Optional[Dict[str, Union[str, torch.device, int]]]]:
     normalized_kwargs = dict(load_kwargs)
     device_map = normalized_kwargs.get("device_map")
 
@@ -56,14 +58,32 @@ def _normalize_single_device_map(load_kwargs: Dict[str, Any]) -> tuple[Dict[str,
     if device_map is None:
         return normalized_kwargs, None
 
-    target_device: Optional[Union[str, torch.device, int]] = None
+    target_device_map: Optional[Dict[str, Union[str, torch.device, int]]] = None
     if isinstance(device_map, (str, torch.device, int)):
-        target_device = device_map
+        target_device_map = {"": device_map}
     else:
         return normalized_kwargs, None
 
-    normalized_kwargs.pop("device_map", None)
-    return normalized_kwargs, target_device
+    normalized_kwargs["device_map"] = target_device_map
+    return normalized_kwargs, target_device_map
+
+
+@contextlib.contextmanager
+def _skip_dispatch_for_single_device(single_device_map: Optional[Dict[str, Union[str, torch.device, int]]]):
+    if single_device_map is None:
+        yield
+        return
+
+    original_dispatch_model = hf_modeling_utils.dispatch_model
+
+    def _dispatch_model_noop(model, **kwargs):
+        return model
+
+    hf_modeling_utils.dispatch_model = _dispatch_model_noop
+    try:
+        yield
+    finally:
+        hf_modeling_utils.dispatch_model = original_dispatch_model
 
 
 @dataclass
@@ -138,16 +158,14 @@ class Qwen3TTSModel:
         AutoModel.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
         AutoProcessor.register(Qwen3TTSConfig, Qwen3TTSProcessor)
 
-        load_kwargs, target_device = _normalize_single_device_map(kwargs)
+        load_kwargs, single_device_map = _normalize_single_device_map(kwargs)
 
-        model = AutoModel.from_pretrained(pretrained_model_name_or_path, **load_kwargs)
+        with _skip_dispatch_for_single_device(single_device_map):
+            model = AutoModel.from_pretrained(pretrained_model_name_or_path, **load_kwargs)
         if not isinstance(model, Qwen3TTSForConditionalGeneration):
             raise TypeError(
                 f"AutoModel returned {type(model)}, expected Qwen3TTSForConditionalGeneration. "
             )
-
-        if target_device is not None:
-            model = model.to(target_device)
 
         processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, fix_mistral_regex=True,)
 

@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import base64
+import contextlib
 import io
 import urllib.request
 from typing import List, Optional, Tuple, Union
@@ -24,6 +25,7 @@ import numpy as np
 import soundfile as sf
 import torch
 from torch.nn.utils.rnn import pad_sequence
+from transformers import modeling_utils as hf_modeling_utils
 from transformers import AutoConfig, AutoFeatureExtractor, AutoModel
 
 from ..core import (
@@ -57,8 +59,26 @@ def _normalize_single_device_map(load_kwargs):
     if not isinstance(device_map, (str, torch.device, int)):
         return normalized_kwargs, None
 
-    normalized_kwargs.pop("device_map", None)
-    return normalized_kwargs, device_map
+    normalized_kwargs["device_map"] = {"": device_map}
+    return normalized_kwargs, normalized_kwargs["device_map"]
+
+
+@contextlib.contextmanager
+def _skip_dispatch_for_single_device(single_device_map):
+    if single_device_map is None:
+        yield
+        return
+
+    original_dispatch_model = hf_modeling_utils.dispatch_model
+
+    def _dispatch_model_noop(model, **kwargs):
+        return model
+
+    hf_modeling_utils.dispatch_model = _dispatch_model_noop
+    try:
+        yield
+    finally:
+        hf_modeling_utils.dispatch_model = original_dispatch_model
 
 
 class Qwen3TTSTokenizer:
@@ -104,11 +124,10 @@ class Qwen3TTSTokenizer:
         AutoConfig.register("qwen3_tts_tokenizer_12hz", Qwen3TTSTokenizerV2Config)
         AutoModel.register(Qwen3TTSTokenizerV2Config, Qwen3TTSTokenizerV2Model)
 
-        load_kwargs, target_device = _normalize_single_device_map(kwargs)
+        load_kwargs, single_device_map = _normalize_single_device_map(kwargs)
         inst.feature_extractor = AutoFeatureExtractor.from_pretrained(pretrained_model_name_or_path)
-        inst.model = AutoModel.from_pretrained(pretrained_model_name_or_path, **load_kwargs)
-        if target_device is not None:
-            inst.model = inst.model.to(target_device)
+        with _skip_dispatch_for_single_device(single_device_map):
+            inst.model = AutoModel.from_pretrained(pretrained_model_name_or_path, **load_kwargs)
         inst.config = inst.model.config
 
         inst.device = getattr(inst.model, "device", None)
