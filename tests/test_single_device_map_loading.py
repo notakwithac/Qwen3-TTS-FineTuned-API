@@ -1,6 +1,8 @@
 from pathlib import Path
 import sys
 
+import torch
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from qwen_tts.inference import qwen3_tts_model as qwen3_tts_model_module
@@ -140,3 +142,18 @@ def test_skip_dispatch_for_single_device_restores_original_dispatch(monkeypatch)
 
     assert qwen3_tts_model_module.hf_modeling_utils.dispatch_model is _replacement
     assert seen == []
+
+
+def test_align_single_device_model_tensors_rehomes_cpu_leftovers():
+    class _ActualModule(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.child = torch.nn.Linear(2, 2, bias=False)
+            self.register_buffer("cpu_buffer", torch.zeros(1))
+
+    model = _ActualModule()
+
+    qwen3_tts_model_module._align_single_device_model_tensors(model, {"": "cpu"})
+
+    assert model.child.weight.device.type == "cpu"
+    assert model.cpu_buffer.device.type == "cpu"

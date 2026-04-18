@@ -29,6 +29,7 @@ import librosa
 import numpy as np
 import soundfile as sf
 import torch
+from torch import nn
 from transformers import modeling_utils as hf_modeling_utils
 from transformers import AutoConfig, AutoModel, AutoProcessor
 
@@ -84,6 +85,73 @@ def _skip_dispatch_for_single_device(single_device_map: Optional[Dict[str, Union
         yield
     finally:
         hf_modeling_utils.dispatch_model = original_dispatch_model
+
+
+def _coerce_device(device: Union[str, torch.device, int]) -> torch.device:
+    if isinstance(device, torch.device):
+        return device
+    if isinstance(device, int):
+        return torch.device(f"cuda:{device}")
+    return torch.device(device)
+
+
+def _move_single_tensor_to_device(
+    model: nn.Module,
+    tensor_name: str,
+    tensor: torch.Tensor,
+    target_device: torch.device,
+    *,
+    is_parameter: bool,
+) -> None:
+    if "." in tensor_name:
+        module_name, leaf_name = tensor_name.rsplit(".", 1)
+        module = model.get_submodule(module_name)
+    else:
+        module = model
+        leaf_name = tensor_name
+
+    moved_tensor = tensor.detach().to(target_device)
+    if is_parameter:
+        module._parameters[leaf_name] = nn.Parameter(moved_tensor, requires_grad=tensor.requires_grad)
+    else:
+        module._buffers[leaf_name] = moved_tensor
+
+
+def _align_single_device_model_tensors(
+    model: nn.Module,
+    single_device_map: Optional[Dict[str, Union[str, torch.device, int]]],
+) -> None:
+    if single_device_map is None:
+        return
+    if not hasattr(model, "named_parameters") or not hasattr(model, "named_buffers"):
+        return
+
+    target_device = _coerce_device(single_device_map[""])
+    meta_tensors: list[str] = []
+
+    for name, param in model.named_parameters(recurse=True, remove_duplicate=False):
+        if param is None:
+            continue
+        if param.device.type == "meta":
+            meta_tensors.append(name)
+            continue
+        if param.device != target_device:
+            _move_single_tensor_to_device(model, name, param, target_device, is_parameter=True)
+
+    for name, buffer in model.named_buffers(recurse=True, remove_duplicate=False):
+        if buffer is None:
+            continue
+        if buffer.device.type == "meta":
+            meta_tensors.append(name)
+            continue
+        if buffer.device != target_device:
+            _move_single_tensor_to_device(model, name, buffer, target_device, is_parameter=False)
+
+    if meta_tensors:
+        preview = ", ".join(meta_tensors[:6])
+        raise RuntimeError(
+            f"Single-device load left meta tensors after weight materialization: {preview}"
+        )
 
 
 @dataclass
@@ -166,6 +234,7 @@ class Qwen3TTSModel:
             raise TypeError(
                 f"AutoModel returned {type(model)}, expected Qwen3TTSForConditionalGeneration. "
             )
+        _align_single_device_model_tensors(model, single_device_map)
 
         processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, fix_mistral_regex=True,)
 

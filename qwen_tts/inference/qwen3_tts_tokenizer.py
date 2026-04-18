@@ -24,6 +24,7 @@ import librosa
 import numpy as np
 import soundfile as sf
 import torch
+from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 from transformers import modeling_utils as hf_modeling_utils
 from transformers import AutoConfig, AutoFeatureExtractor, AutoModel
@@ -81,6 +82,63 @@ def _skip_dispatch_for_single_device(single_device_map):
         hf_modeling_utils.dispatch_model = original_dispatch_model
 
 
+def _coerce_device(device):
+    if isinstance(device, torch.device):
+        return device
+    if isinstance(device, int):
+        return torch.device(f"cuda:{device}")
+    return torch.device(device)
+
+
+def _move_single_tensor_to_device(model, tensor_name, tensor, target_device, *, is_parameter):
+    if "." in tensor_name:
+        module_name, leaf_name = tensor_name.rsplit(".", 1)
+        module = model.get_submodule(module_name)
+    else:
+        module = model
+        leaf_name = tensor_name
+
+    moved_tensor = tensor.detach().to(target_device)
+    if is_parameter:
+        module._parameters[leaf_name] = nn.Parameter(moved_tensor, requires_grad=tensor.requires_grad)
+    else:
+        module._buffers[leaf_name] = moved_tensor
+
+
+def _align_single_device_model_tensors(model, single_device_map):
+    if single_device_map is None:
+        return
+    if not hasattr(model, "named_parameters") or not hasattr(model, "named_buffers"):
+        return
+
+    target_device = _coerce_device(single_device_map[""])
+    meta_tensors = []
+
+    for name, param in model.named_parameters(recurse=True, remove_duplicate=False):
+        if param is None:
+            continue
+        if param.device.type == "meta":
+            meta_tensors.append(name)
+            continue
+        if param.device != target_device:
+            _move_single_tensor_to_device(model, name, param, target_device, is_parameter=True)
+
+    for name, buffer in model.named_buffers(recurse=True, remove_duplicate=False):
+        if buffer is None:
+            continue
+        if buffer.device.type == "meta":
+            meta_tensors.append(name)
+            continue
+        if buffer.device != target_device:
+            _move_single_tensor_to_device(model, name, buffer, target_device, is_parameter=False)
+
+    if meta_tensors:
+        preview = ", ".join(meta_tensors[:6])
+        raise RuntimeError(
+            f"Single-device tokenizer load left meta tensors after weight materialization: {preview}"
+        )
+
+
 class Qwen3TTSTokenizer:
     """
     A wrapper for Qwen3 TTS Tokenizer 25Hz/12Hz with HuggingFace-style loading.
@@ -128,6 +186,7 @@ class Qwen3TTSTokenizer:
         inst.feature_extractor = AutoFeatureExtractor.from_pretrained(pretrained_model_name_or_path)
         with _skip_dispatch_for_single_device(single_device_map):
             inst.model = AutoModel.from_pretrained(pretrained_model_name_or_path, **load_kwargs)
+        _align_single_device_model_tensors(inst.model, single_device_map)
         inst.config = inst.model.config
 
         inst.device = getattr(inst.model, "device", None)
