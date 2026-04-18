@@ -11,6 +11,7 @@ import re
 import subprocess
 import tempfile
 import threading
+import time
 import wave
 import zipfile
 from typing import Any
@@ -20,6 +21,7 @@ log = logging.getLogger(__name__)
 
 _whisper_cache: dict[str, Any] = {}
 _cache_lock = threading.Lock()
+_dataset_cuda_oom_retry_after = 0.0
 DATASET_SAMPLE_MIN_SEC = 4.0
 DATASET_SHORT_CLIP_MAX_SEC = 5.0   # clips below this are flagged as "short" in manifest
 DATASET_CLIP_FLUSH_SEC    = 5.0    # prefer to flush earlier, but never below the hard 5s floor
@@ -1022,6 +1024,7 @@ def _get_whisper_model(model_name: str = "large-v3", device: str | None = None, 
     import whisperx
     import torch
 
+    global _dataset_cuda_oom_retry_after
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     if compute_type is None:
@@ -1029,9 +1032,57 @@ def _get_whisper_model(model_name: str = "large-v3", device: str | None = None, 
 
     cache_key = f"model_{model_name}_{device}_{compute_type}"
     with _cache_lock:
+        if device == "cuda" and time.time() < _dataset_cuda_oom_retry_after:
+            fallback_key = f"model_{model_name}_cpu_int8"
+            if fallback_key not in _whisper_cache:
+                retry_in = max(0.0, _dataset_cuda_oom_retry_after - time.time())
+                log.warning(
+                    "Skipping WhisperX CUDA load for %.1fs after recent OOM; using CPU int8 (%s).",
+                    retry_in,
+                    model_name,
+                )
+                _whisper_cache[fallback_key] = whisperx.load_model(model_name, "cpu", compute_type="int8")
+            return _whisper_cache[fallback_key]
+
         if cache_key not in _whisper_cache:
             log.info("Loading WhisperX model %s on %s (%s)", model_name, device, compute_type)
-            _whisper_cache[cache_key] = whisperx.load_model(model_name, device, compute_type=compute_type)
+            try:
+                _whisper_cache[cache_key] = whisperx.load_model(model_name, device, compute_type=compute_type)
+            except RuntimeError as exc:
+                if device != "cuda" or not _is_cuda_oom_error(exc):
+                    raise
+
+                _clear_torch_cuda_cache()
+                reduced_key = f"model_{model_name}_cuda_int8_float16"
+                log.warning(
+                    "WhisperX CUDA OOM for %s (%s); retrying with compute_type=int8_float16.",
+                    model_name,
+                    compute_type,
+                )
+                try:
+                    if reduced_key not in _whisper_cache:
+                        _whisper_cache[reduced_key] = whisperx.load_model(
+                            model_name,
+                            "cuda",
+                            compute_type="int8_float16",
+                        )
+                    _dataset_cuda_oom_retry_after = 0.0
+                    return _whisper_cache[reduced_key]
+                except RuntimeError as reduced_exc:
+                    if not _is_cuda_oom_error(reduced_exc):
+                        raise
+
+                cooldown_sec = max(float(os.environ.get("DATASET_WHISPER_CUDA_OOM_COOLDOWN_SEC", "90")), 1.0)
+                _dataset_cuda_oom_retry_after = time.time() + cooldown_sec
+                fallback_key = f"model_{model_name}_cpu_int8"
+                log.warning(
+                    "WhisperX CUDA still OOM for %s; using CPU int8 for %.0fs cooldown.",
+                    model_name,
+                    cooldown_sec,
+                )
+                if fallback_key not in _whisper_cache:
+                    _whisper_cache[fallback_key] = whisperx.load_model(model_name, "cpu", compute_type="int8")
+                return _whisper_cache[fallback_key]
         return _whisper_cache[cache_key]
 
 

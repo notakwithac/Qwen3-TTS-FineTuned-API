@@ -542,7 +542,16 @@ MAX_REPLICAS_PER_MODEL = int(os.environ.get("MAX_REPLICAS_PER_MODEL", "4"))
 SESSION_TIMEOUT = int(os.environ.get("SESSION_TIMEOUT", "3600"))
 MAX_CONCURRENT_VOICE_DESIGNS = int(os.environ.get("MAX_CONCURRENT_VOICE_DESIGNS", str(GPU_BATCH_SIZE)))
 BATCH_STORAGE_CONCURRENCY = int(os.environ.get("BATCH_STORAGE_CONCURRENCY", "8"))
-MAX_CONCURRENT_DATASET_JOBS = int(os.environ.get("MAX_CONCURRENT_DATASET_JOBS", "1"))
+_configured_dataset_jobs = int(os.environ.get("MAX_CONCURRENT_DATASET_JOBS", "1"))
+MAX_CONCURRENT_DATASET_JOBS = max(1, min(3, _configured_dataset_jobs))
+DATASET_JOB_MIN_FREE_VRAM_GB = float(
+    os.environ.get(
+        "DATASET_JOB_MIN_FREE_VRAM_GB",
+        os.environ.get("DATASET_PREP_CUDA_MIN_FREE_GB", "10"),
+    )
+)
+DATASET_JOB_VRAM_WAIT_POLL_SEC = float(os.environ.get("DATASET_JOB_VRAM_WAIT_POLL_SEC", "5"))
+DATASET_JOB_VRAM_WAIT_TIMEOUT_SEC = float(os.environ.get("DATASET_JOB_VRAM_WAIT_TIMEOUT_SEC", "0"))
 VOICE_DESIGN_REPLICAS = int(os.environ.get("VOICE_DESIGN_REPLICAS", "1"))
 VOICE_CLONE_REPLICAS = int(os.environ.get("VOICE_CLONE_REPLICAS", "1"))
 SHARED_MODEL_MIN_HEADROOM_GB = float(os.environ.get("SHARED_MODEL_MIN_HEADROOM_GB", "4"))
@@ -576,7 +585,16 @@ logger.info(f"  - USE_TORCH_COMPILE: {USE_TORCH_COMPILE}")
 logger.info(f"  - REPLICA_THRESHOLD: {REPLICA_THRESHOLD}")
 logger.info(f"  - MAX_CONCURRENT_VOICE_DESIGNS: {MAX_CONCURRENT_VOICE_DESIGNS}")
 logger.info(f"  - BATCH_STORAGE_CONCURRENCY: {BATCH_STORAGE_CONCURRENCY}")
+if MAX_CONCURRENT_DATASET_JOBS != _configured_dataset_jobs:
+    logger.warning(
+        "MAX_CONCURRENT_DATASET_JOBS=%s capped to %s (hard limit).",
+        _configured_dataset_jobs,
+        MAX_CONCURRENT_DATASET_JOBS,
+    )
 logger.info(f"  - MAX_CONCURRENT_DATASET_JOBS: {MAX_CONCURRENT_DATASET_JOBS}")
+logger.info(f"  - DATASET_JOB_MIN_FREE_VRAM_GB: {DATASET_JOB_MIN_FREE_VRAM_GB}")
+logger.info(f"  - DATASET_JOB_VRAM_WAIT_POLL_SEC: {DATASET_JOB_VRAM_WAIT_POLL_SEC}")
+logger.info(f"  - DATASET_JOB_VRAM_WAIT_TIMEOUT_SEC: {DATASET_JOB_VRAM_WAIT_TIMEOUT_SEC}")
 logger.info(f"  - VOICE_DESIGN_REPLICAS: {VOICE_DESIGN_REPLICAS}")
 logger.info(f"  - VOICE_CLONE_REPLICAS: {VOICE_CLONE_REPLICAS}")
 logger.info(f"  - SHARED_MODEL_MIN_HEADROOM_GB: {SHARED_MODEL_MIN_HEADROOM_GB}")
@@ -2413,10 +2431,79 @@ def _dataset_status_payload(job: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _get_cuda_free_vram_gb() -> float | None:
+    try:
+        if not torch.cuda.is_available():
+            return None
+        mem_get_info = getattr(torch.cuda, "mem_get_info", None)
+        if mem_get_info is None:
+            return None
+        try:
+            free_bytes, _total_bytes = mem_get_info(0)
+        except TypeError:
+            free_bytes, _total_bytes = mem_get_info()
+        return max(float(free_bytes), 0.0) / (1024 ** 3)
+    except Exception:
+        return None
+
+
+async def _wait_for_dataset_job_vram_headroom(*, job_id: str, kind: str) -> None:
+    if DATASET_JOB_MIN_FREE_VRAM_GB <= 0:
+        return
+    if not torch.cuda.is_available():
+        return
+
+    started_at = time.monotonic()
+    poll_sec = max(0.1, DATASET_JOB_VRAM_WAIT_POLL_SEC)
+    timeout_sec = DATASET_JOB_VRAM_WAIT_TIMEOUT_SEC if DATASET_JOB_VRAM_WAIT_TIMEOUT_SEC > 0 else None
+    logged_wait = False
+
+    while True:
+        free_gb = _get_cuda_free_vram_gb()
+        if free_gb is None or free_gb >= DATASET_JOB_MIN_FREE_VRAM_GB:
+            if logged_wait:
+                waited = time.monotonic() - started_at
+                if free_gb is None:
+                    logger.info(
+                        "Dataset %s job %s resumed after waiting %.1fs for VRAM headroom.",
+                        kind,
+                        job_id,
+                        waited,
+                    )
+                else:
+                    logger.info(
+                        "Dataset %s job %s resumed after waiting %.1fs (free %.1f GB).",
+                        kind,
+                        job_id,
+                        waited,
+                        free_gb,
+                    )
+            return
+
+        waited = time.monotonic() - started_at
+        if timeout_sec is not None and waited >= timeout_sec:
+            raise RuntimeError(
+                f"Timed out waiting for VRAM headroom: {free_gb:.1f} GB free, "
+                f"need at least {DATASET_JOB_MIN_FREE_VRAM_GB:.1f} GB."
+            )
+
+        if not logged_wait or waited >= poll_sec:
+            logger.info(
+                "Dataset %s job %s waiting for VRAM headroom: %.1f/%.1f GB free.",
+                kind,
+                job_id,
+                free_gb,
+                DATASET_JOB_MIN_FREE_VRAM_GB,
+            )
+            logged_wait = True
+        await asyncio.sleep(poll_sec)
+
+
 async def _run_dataset_prepare_job(job_id: str, req: DatasetPrepareRequest) -> None:
     job = dataset_jobs[job_id]
     async with dataset_job_semaphore:
         try:
+            await _wait_for_dataset_job_vram_headroom(job_id=job_id, kind="prepare")
             dataset_items = await prepare_dataset_items(
                 storage,
                 book_id=req.book_id,
@@ -2445,6 +2532,7 @@ async def _run_dataset_package_job(job_id: str, req: DatasetPackageRequest) -> N
     job = dataset_jobs[job_id]
     async with dataset_job_semaphore:
         try:
+            await _wait_for_dataset_job_vram_headroom(job_id=job_id, kind="package")
             packaged = await package_dataset(
                 storage,
                 book_id=req.book_id,
