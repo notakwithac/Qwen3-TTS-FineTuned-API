@@ -194,6 +194,8 @@ class InferenceManager:
                 self._shared_model_replicas[model_type] = max(1, int(count))
         self._shared_model_min_headroom_gb = float(shared_model_min_headroom_gb)
         self._estimated_model_vram_gb = 5.5
+        self._voice_clone_prompt_cache: collections.OrderedDict[tuple[str, str, bool], Any] = collections.OrderedDict()
+        self._voice_clone_prompt_cache_max_entries = 128
 
         # Session pinning: models pinned by active sessions won't be LRU evicted
         # Dict[cache_key, set[session_id]]
@@ -662,6 +664,45 @@ class InferenceManager:
 
     def _build_shared_replica_key(self, source_path: str, replica_index: int) -> str:
         return f"{source_path}::replica-{replica_index}"
+
+    @staticmethod
+    def _clone_prompt_cache_key(ref_audio: Any, ref_text: Any, xvec_only: Any) -> Optional[tuple[str, str, bool]]:
+        if not isinstance(ref_audio, str):
+            return None
+        return (ref_audio, ref_text or "", bool(xvec_only))
+
+    @staticmethod
+    def _clone_prompt_item_to_cpu(prompt_item: Any) -> Any:
+        prompt_type = type(prompt_item)
+        ref_code = getattr(prompt_item, "ref_code", None)
+        ref_spk_embedding = getattr(prompt_item, "ref_spk_embedding", None)
+        return prompt_type(
+            ref_code=None if ref_code is None else ref_code.detach().cpu().clone(),
+            ref_spk_embedding=ref_spk_embedding.detach().cpu().clone(),
+            x_vector_only_mode=bool(getattr(prompt_item, "x_vector_only_mode", False)),
+            icl_mode=bool(getattr(prompt_item, "icl_mode", False)),
+            ref_text=getattr(prompt_item, "ref_text", None),
+        )
+
+    def _get_cached_clone_prompt_item(self, cache_key: Optional[tuple[str, str, bool]]) -> Any:
+        if cache_key is None:
+            return None
+        with self._lock:
+            prompt_item = self._voice_clone_prompt_cache.get(cache_key)
+            if prompt_item is None:
+                return None
+            self._voice_clone_prompt_cache.move_to_end(cache_key)
+            return self._clone_prompt_item_to_cpu(prompt_item)
+
+    def _store_cached_clone_prompt_item(self, cache_key: Optional[tuple[str, str, bool]], prompt_item: Any) -> None:
+        if cache_key is None:
+            return
+        cached_item = self._clone_prompt_item_to_cpu(prompt_item)
+        with self._lock:
+            self._voice_clone_prompt_cache[cache_key] = cached_item
+            self._voice_clone_prompt_cache.move_to_end(cache_key)
+            while len(self._voice_clone_prompt_cache) > self._voice_clone_prompt_cache_max_entries:
+                self._voice_clone_prompt_cache.popitem(last=False)
 
     def _move_cache_entry_locked(self, old_key: str, new_key: str) -> bool:
         """Rename a cached model entry without reloading the weights."""
@@ -1269,34 +1310,42 @@ class InferenceManager:
                         "cache_key": cache_key,
                     })
                     try:
-                        with model_lock:
-                            unique_prompt_cache: Dict[tuple[str, str, bool], Any] = {}
-                            prompt_items = []
+                        prompt_build_started_at = time.time()
+                        prompt_items: list[Any] = []
+                        pending_prompt_misses: list[tuple[int, Any, Any, Any, Optional[tuple[str, str, bool]]]] = []
+                        prompt_cache_hits = 0
 
-                            for ref_audio, ref_text, xvec_only in zip(ref_audios, ref_texts, x_vector_only_modes):
-                                prompt_cache_key = None
-                                if isinstance(ref_audio, str):
-                                    prompt_cache_key = (ref_audio, ref_text or "", bool(xvec_only))
-
-                                prompt_item = unique_prompt_cache.get(prompt_cache_key) if prompt_cache_key is not None else None
-                                if prompt_item is None:
-                                    built_items = model.create_voice_clone_prompt(
-                                        ref_audio=ref_audio,
-                                        ref_text=ref_text,
-                                        x_vector_only_mode=xvec_only,
-                                    )
-                                    prompt_item = built_items[0]
-                                    if prompt_cache_key is not None:
-                                        unique_prompt_cache[prompt_cache_key] = prompt_item
-
+                        for index, (ref_audio, ref_text, xvec_only) in enumerate(zip(ref_audios, ref_texts, x_vector_only_modes)):
+                            prompt_cache_key = self._clone_prompt_cache_key(ref_audio, ref_text, xvec_only)
+                            prompt_item = self._get_cached_clone_prompt_item(prompt_cache_key)
+                            if prompt_item is not None:
+                                prompt_cache_hits += 1
                                 prompt_items.append(prompt_item)
+                            else:
+                                prompt_items.append(None)
+                                pending_prompt_misses.append((index, ref_audio, ref_text, xvec_only, prompt_cache_key))
 
-                            unique_ref_count = len(unique_prompt_cache) if unique_prompt_cache else len(ref_audios)
+                        with model_lock:
+                            for index, ref_audio, ref_text, xvec_only, prompt_cache_key in pending_prompt_misses:
+                                built_items = model.create_voice_clone_prompt(
+                                    ref_audio=ref_audio,
+                                    ref_text=ref_text,
+                                    x_vector_only_mode=xvec_only,
+                                )
+                                prompt_item = built_items[0]
+                                prompt_items[index] = prompt_item
+                                self._store_cached_clone_prompt_item(prompt_cache_key, prompt_item)
+
+                            unique_ref_count = len({self._clone_prompt_cache_key(a, t, x) for a, t, x in zip(ref_audios, ref_texts, x_vector_only_modes)})
+                            prompt_build_seconds = round(time.time() - prompt_build_started_at, 3)
                             logger.info(
-                                "VoiceClone flexible started on %s for %s texts with %s unique prompt(s).",
+                                "VoiceClone flexible started on %s for %s texts with %s unique prompt(s), prompt_cache_hits=%s, prompt_cache_misses=%s, prompt_build_seconds=%s.",
                                 cache_key,
                                 len(texts),
                                 unique_ref_count,
+                                prompt_cache_hits,
+                                len(pending_prompt_misses),
+                                prompt_build_seconds,
                             )
                             wavs_list, sr = model.generate_voice_clone(
                                 text=texts,

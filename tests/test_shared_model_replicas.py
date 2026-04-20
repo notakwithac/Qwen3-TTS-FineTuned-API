@@ -6,6 +6,7 @@ import time
 import types
 
 import pytest
+import torch
 from inference_manager import InferenceManager, VOICE_CLONE_MODEL, VOICE_DESIGN_MODEL
 
 
@@ -244,6 +245,59 @@ def test_generate_voice_design_releases_gpu_controller_on_failure(monkeypatch):
         ("begin", "inference_voice_design"),
         ("end", None),
     ]
+
+
+def test_voice_clone_prompt_cache_reuses_reference_prompt(monkeypatch):
+    manager = InferenceManager(device="cpu")
+    cache_key = manager._build_shared_replica_key(VOICE_CLONE_MODEL, 0)
+    create_calls = []
+    generate_calls = []
+
+    class _PromptItem:
+        def __init__(self, ref_code, ref_spk_embedding, x_vector_only_mode, icl_mode, ref_text=None):
+            self.ref_code = ref_code
+            self.ref_spk_embedding = ref_spk_embedding
+            self.x_vector_only_mode = x_vector_only_mode
+            self.icl_mode = icl_mode
+            self.ref_text = ref_text
+
+    class _StubModel:
+        def create_voice_clone_prompt(self, ref_audio, ref_text, x_vector_only_mode):
+            create_calls.append((ref_audio, ref_text, x_vector_only_mode))
+            return [_PromptItem(None, torch.zeros(2), x_vector_only_mode, not x_vector_only_mode, ref_text)]
+
+        def generate_voice_clone(self, text, language, voice_clone_prompt):
+            generate_calls.append((text, language, voice_clone_prompt))
+            return (["wav"], 24000)
+
+    stub_model = _StubModel()
+
+    monkeypatch.setattr(manager, "_acquire_shared_replica", lambda *_args, **_kwargs: cache_key)
+    monkeypatch.setattr(manager, "_release_shared_replica", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(manager, "_get_model_by_cache_key", lambda *_args, **_kwargs: (stub_model, None))
+    monkeypatch.setattr(manager, "_encode_wav", lambda wav, sr: b"wav-bytes")
+
+    first_result, first_sr = manager.generate_voice_clone_flexible_batch(
+        texts=["hello"],
+        ref_audios=["https://example.com/ref.wav"],
+        ref_texts=["ref text"],
+        languages=["English"],
+        x_vector_only_modes=[False],
+    )
+    second_result, second_sr = manager.generate_voice_clone_flexible_batch(
+        texts=["hello again"],
+        ref_audios=["https://example.com/ref.wav"],
+        ref_texts=["ref text"],
+        languages=["English"],
+        x_vector_only_modes=[False],
+    )
+
+    assert first_result == [b"wav-bytes"]
+    assert second_result == [b"wav-bytes"]
+    assert first_sr == 24000
+    assert second_sr == 24000
+    assert len(create_calls) == 1
+    assert len(generate_calls) == 2
 
 
 def test_load_for_session_uses_gpu_controller_and_releases_on_failure(monkeypatch):
