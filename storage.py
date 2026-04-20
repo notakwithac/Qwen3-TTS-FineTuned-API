@@ -135,7 +135,15 @@ class StorageClient:
             self.client.upload_file(local_path, self.bucket, key, ExtraArgs=extra_args or None)
         return self._object_url(key)
 
-    def upload_wav(self, wav_bytes: bytes, job_id: str, filename: Optional[str] = None, prefix: Optional[str] = None, model_id: Optional[str] = None) -> str:
+    def upload_wav(
+        self,
+        wav_bytes: bytes,
+        job_id: str,
+        filename: Optional[str] = None,
+        prefix: Optional[str] = None,
+        model_id: Optional[str] = None,
+        metadata: Optional[dict[str, str]] = None,
+    ) -> str:
         """Upload a WAV file with a structured key.
 
         Key format: {prefix or f'audio/{job_id}'}/{filename}
@@ -146,6 +154,7 @@ class StorageClient:
             filename: Custom filename (default: timestamped).
             prefix: Custom S3 prefix (folder path).
             model_id: Model ID for metadata (x-amz-meta-model-id).
+            metadata: Additional custom object metadata.
 
         Returns:
             URL of the uploaded WAV file.
@@ -157,11 +166,16 @@ class StorageClient:
         base_prefix = prefix or f"audio/{job_id}"
         key = f"{base_prefix}/{filename}"
         
-        metadata = None
+        combined_metadata = dict(metadata or {})
         if model_id:
-            metadata = {"model-id": model_id}
-            
-        return self.upload_bytes(wav_bytes, key, content_type="audio/wav", metadata=metadata)
+            combined_metadata.setdefault("model-id", model_id)
+
+        return self.upload_bytes(
+            wav_bytes,
+            key,
+            content_type="audio/wav",
+            metadata=combined_metadata or None,
+        )
 
     def upload_text(self, text: str, key: str) -> str:
         """Upload a text file to S3."""

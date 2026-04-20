@@ -87,6 +87,11 @@ def _skip_dispatch_for_single_device(single_device_map: Optional[Dict[str, Union
         hf_modeling_utils.dispatch_model = original_dispatch_model
 
 
+def _is_meta_tensor_copy_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return "cannot copy out of meta tensor" in message and "to_empty()" in message
+
+
 def _coerce_device(device: Union[str, torch.device, int]) -> torch.device:
     if isinstance(device, torch.device):
         return device
@@ -228,13 +233,23 @@ class Qwen3TTSModel:
 
         load_kwargs, single_device_map = _normalize_single_device_map(kwargs)
 
-        with _skip_dispatch_for_single_device(single_device_map):
+        try:
             model = AutoModel.from_pretrained(pretrained_model_name_or_path, **load_kwargs)
+        except Exception as exc:
+            if single_device_map is None or not _is_meta_tensor_copy_error(exc):
+                raise
+            logger.warning(
+                "Single-device load hit meta-tensor dispatch path for %s; retrying with safe dispatch bypass.",
+                pretrained_model_name_or_path,
+            )
+            with _skip_dispatch_for_single_device(single_device_map):
+                model = AutoModel.from_pretrained(pretrained_model_name_or_path, **load_kwargs)
         if not isinstance(model, Qwen3TTSForConditionalGeneration):
             raise TypeError(
                 f"AutoModel returned {type(model)}, expected Qwen3TTSForConditionalGeneration. "
             )
-        _align_single_device_model_tensors(model, single_device_map)
+        if single_device_map is not None:
+            _align_single_device_model_tensors(model, single_device_map)
 
         processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, fix_mistral_regex=True,)
 

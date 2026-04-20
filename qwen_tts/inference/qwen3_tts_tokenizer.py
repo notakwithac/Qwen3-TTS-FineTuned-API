@@ -82,6 +82,11 @@ def _skip_dispatch_for_single_device(single_device_map):
         hf_modeling_utils.dispatch_model = original_dispatch_model
 
 
+def _is_meta_tensor_copy_error(exc):
+    message = str(exc).lower()
+    return "cannot copy out of meta tensor" in message and "to_empty()" in message
+
+
 def _coerce_device(device):
     if isinstance(device, torch.device):
         return device
@@ -184,9 +189,15 @@ class Qwen3TTSTokenizer:
 
         load_kwargs, single_device_map = _normalize_single_device_map(kwargs)
         inst.feature_extractor = AutoFeatureExtractor.from_pretrained(pretrained_model_name_or_path)
-        with _skip_dispatch_for_single_device(single_device_map):
+        try:
             inst.model = AutoModel.from_pretrained(pretrained_model_name_or_path, **load_kwargs)
-        _align_single_device_model_tensors(inst.model, single_device_map)
+        except Exception as exc:
+            if single_device_map is None or not _is_meta_tensor_copy_error(exc):
+                raise
+            with _skip_dispatch_for_single_device(single_device_map):
+                inst.model = AutoModel.from_pretrained(pretrained_model_name_or_path, **load_kwargs)
+        if single_device_map is not None:
+            _align_single_device_model_tensors(inst.model, single_device_map)
         inst.config = inst.model.config
 
         inst.device = getattr(inst.model, "device", None)
