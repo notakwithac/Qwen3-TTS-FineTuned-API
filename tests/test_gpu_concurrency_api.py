@@ -458,3 +458,21 @@ def test_custom_voice_batcher_is_configured_for_serial_processing(monkeypatch):
     assert batcher.executor._max_workers == 1
 
     api_server.custom_voice_batchers.clear()
+
+
+def test_custom_voice_max_new_tokens_is_derived_when_request_omits_it():
+    derived = api_server._derive_custom_voice_max_new_tokens(
+        texts=["short line"],
+        requested_max_new_tokens=None,
+    )
+
+    assert derived == api_server.CUSTOM_VOICE_SESSION_MIN_NEW_TOKENS
+
+
+def test_custom_voice_max_new_tokens_respects_explicit_request():
+    derived = api_server._derive_custom_voice_max_new_tokens(
+        texts=["this should not matter"],
+        requested_max_new_tokens=2048,
+    )
+
+    assert derived == 2048

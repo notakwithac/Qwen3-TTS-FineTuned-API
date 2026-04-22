@@ -740,6 +740,25 @@ dataset_jobs = {}  # job_id -> {kind, status, total, completed, failed, ...}
 dataset_job_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DATASET_JOBS)
 
 
+def _derive_custom_voice_max_new_tokens(
+    texts: list[str],
+    requested_max_new_tokens: Optional[int],
+) -> Optional[int]:
+    if requested_max_new_tokens is not None:
+        return requested_max_new_tokens
+    if not texts:
+        return None
+
+    max_text_chars = max(1, max(len((text or "").strip()) for text in texts))
+    derived_limit = max(
+        CUSTOM_VOICE_SESSION_MIN_NEW_TOKENS,
+        max_text_chars * CUSTOM_VOICE_SESSION_MAX_NEW_TOKENS_PER_CHAR,
+    )
+    if CUSTOM_VOICE_SESSION_MAX_NEW_TOKENS > 0:
+        derived_limit = min(derived_limit, CUSTOM_VOICE_SESSION_MAX_NEW_TOKENS)
+    return derived_limit if derived_limit > 0 else None
+
+
 def get_custom_voice_batcher(
     job_id: str,
     checkpoint_path: str,
@@ -754,13 +773,20 @@ def get_custom_voice_batcher(
     batcher_key = (job_id, checkpoint_path, tuple(sorted(config.items())))
     if batcher_key not in custom_voice_batchers:
         def process_fn(texts: list[str], languages: list[str], instructs: list[str]):
+            effective_config = dict(config)
+            effective_max_new_tokens = _derive_custom_voice_max_new_tokens(
+                texts,
+                effective_config.get("max_new_tokens"),
+            )
+            if effective_max_new_tokens is not None:
+                effective_config["max_new_tokens"] = effective_max_new_tokens
             return pipeline.inference.generate_batch(
                 texts=texts,
                 checkpoint_path=checkpoint_path,
                 speaker_name=speaker_name,
                 languages=languages,
                 instructs=instructs,
-                **config,
+                **effective_config,
             )
         custom_voice_batchers[batcher_key] = DynamicBatcher(
             batch_size=CUSTOM_VOICE_API_BATCH_SIZE,
