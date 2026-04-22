@@ -1313,6 +1313,7 @@ class InferenceManager:
                         prompt_build_started_at = time.time()
                         prompt_items: list[Any] = []
                         pending_prompt_misses: list[tuple[int, Any, Any, Any, Optional[tuple[str, str, bool]]]] = []
+                        pending_prompt_miss_positions: Dict[tuple[str, str, bool], list[int]] = {}
                         prompt_cache_hits = 0
 
                         for index, (ref_audio, ref_text, xvec_only) in enumerate(zip(ref_audios, ref_texts, x_vector_only_modes)):
@@ -1323,7 +1324,12 @@ class InferenceManager:
                                 prompt_items.append(prompt_item)
                             else:
                                 prompt_items.append(None)
+                                if prompt_cache_key is not None and prompt_cache_key in pending_prompt_miss_positions:
+                                    pending_prompt_miss_positions[prompt_cache_key].append(index)
+                                    continue
                                 pending_prompt_misses.append((index, ref_audio, ref_text, xvec_only, prompt_cache_key))
+                                if prompt_cache_key is not None:
+                                    pending_prompt_miss_positions[prompt_cache_key] = [index]
 
                         with model_lock:
                             for index, ref_audio, ref_text, xvec_only, prompt_cache_key in pending_prompt_misses:
@@ -1333,7 +1339,13 @@ class InferenceManager:
                                     x_vector_only_mode=xvec_only,
                                 )
                                 prompt_item = built_items[0]
-                                prompt_items[index] = prompt_item
+                                target_indexes = (
+                                    pending_prompt_miss_positions.get(prompt_cache_key, [index])
+                                    if prompt_cache_key is not None
+                                    else [index]
+                                )
+                                for target_index in target_indexes:
+                                    prompt_items[target_index] = prompt_item
                                 self._store_cached_clone_prompt_item(prompt_cache_key, prompt_item)
 
                             unique_ref_count = len({self._clone_prompt_cache_key(a, t, x) for a, t, x in zip(ref_audios, ref_texts, x_vector_only_modes)})
