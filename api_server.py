@@ -490,6 +490,9 @@ GPU_IDLE_TIMEOUT = int(os.environ.get("GPU_IDLE_TIMEOUT", "600"))
 GPU_MAX_CONCURRENCY = int(os.environ.get("GPU_MAX_CONCURRENCY", "16"))
 GPU_MAX_MODELS = int(os.environ.get("GPU_MAX_MODELS", str(_default_gpu_max_models())))
 GPU_BATCH_SIZE = int(os.environ.get("GPU_BATCH_SIZE", "32"))
+VOICE_CLONE_API_BATCH_SIZE = int(
+    os.environ.get("VOICE_CLONE_API_BATCH_SIZE", "10")
+)
 SESSION_BATCH_MAX_CHARS = int(os.environ.get("SESSION_BATCH_MAX_CHARS", "4000"))
 CUSTOM_VOICE_SESSION_BATCH_SIZE = int(
     os.environ.get("CUSTOM_VOICE_SESSION_BATCH_SIZE", "1")
@@ -563,6 +566,7 @@ logger.info(f"  - GPU_IDLE_TIMEOUT: {GPU_IDLE_TIMEOUT}s")
 logger.info(f"  - GPU_MAX_CONCURRENCY: {GPU_MAX_CONCURRENCY}")
 logger.info(f"  - GPU_MAX_MODELS: {GPU_MAX_MODELS}")
 logger.info(f"  - GPU_BATCH_SIZE: {GPU_BATCH_SIZE}")
+logger.info(f"  - VOICE_CLONE_API_BATCH_SIZE: {VOICE_CLONE_API_BATCH_SIZE}")
 logger.info(f"  - SESSION_BATCH_MAX_CHARS: {SESSION_BATCH_MAX_CHARS}")
 logger.info(f"  - CUSTOM_VOICE_SESSION_BATCH_SIZE: {CUSTOM_VOICE_SESSION_BATCH_SIZE}")
 logger.info(f"  - CUSTOM_VOICE_API_BATCH_SIZE: {CUSTOM_VOICE_API_BATCH_SIZE}")
@@ -728,7 +732,7 @@ voice_design_batcher = DynamicBatcher(
 )
 
 voice_clone_batcher = DynamicBatcher(
-    batch_size=GPU_BATCH_SIZE,
+    batch_size=VOICE_CLONE_API_BATCH_SIZE,
     timeout_ms=100,
     process_fn=pipeline.inference.generate_voice_clone_flexible_batch,
     max_workers=1

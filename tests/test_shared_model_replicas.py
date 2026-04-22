@@ -300,6 +300,47 @@ def test_voice_clone_prompt_cache_reuses_reference_prompt(monkeypatch):
     assert len(generate_calls) == 2
 
 
+def test_voice_clone_prompt_cache_dedupes_repeated_refs_within_same_batch(monkeypatch):
+    manager = InferenceManager(device="cpu")
+    cache_key = manager._build_shared_replica_key(VOICE_CLONE_MODEL, 0)
+    create_calls = []
+
+    class _PromptItem:
+        def __init__(self, ref_code, ref_spk_embedding, x_vector_only_mode, icl_mode, ref_text=None):
+            self.ref_code = ref_code
+            self.ref_spk_embedding = ref_spk_embedding
+            self.x_vector_only_mode = x_vector_only_mode
+            self.icl_mode = icl_mode
+            self.ref_text = ref_text
+
+    class _StubModel:
+        def create_voice_clone_prompt(self, ref_audio, ref_text, x_vector_only_mode):
+            create_calls.append((ref_audio, ref_text, x_vector_only_mode))
+            return [_PromptItem(None, torch.zeros(2), x_vector_only_mode, not x_vector_only_mode, ref_text)]
+
+        def generate_voice_clone(self, text, language, voice_clone_prompt):
+            return (["wav-1", "wav-2", "wav-3"], 24000)
+
+    stub_model = _StubModel()
+
+    monkeypatch.setattr(manager, "_acquire_shared_replica", lambda *_args, **_kwargs: cache_key)
+    monkeypatch.setattr(manager, "_release_shared_replica", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(manager, "_get_model_by_cache_key", lambda *_args, **_kwargs: (stub_model, None))
+    monkeypatch.setattr(manager, "_encode_wav", lambda wav, sr: f"{wav}-{sr}".encode())
+
+    result, sr = manager.generate_voice_clone_flexible_batch(
+        texts=["one", "two", "three"],
+        ref_audios=["https://example.com/ref.wav"] * 3,
+        ref_texts=["ref text"] * 3,
+        languages=["English"] * 3,
+        x_vector_only_modes=[False] * 3,
+    )
+
+    assert result == [b"wav-1-24000", b"wav-2-24000", b"wav-3-24000"]
+    assert sr == 24000
+    assert len(create_calls) == 1
+
+
 def test_load_for_session_uses_gpu_controller_and_releases_on_failure(monkeypatch):
     events = []
 
