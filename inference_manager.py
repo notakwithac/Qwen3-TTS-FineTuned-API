@@ -991,10 +991,11 @@ class InferenceManager:
         if not instructs:
             instructs = [""] * len(texts)
 
+        if self._gpu_controller:
+            self._gpu_controller.begin_inference("inference_custom_voice_batch")
+
         # Acquire semaphore FIRST to limit concurrent model usage to max_models
         with ops_log.operation("gpu_resource_wait", extra={"checkpoint": checkpoint_path}):
-            if self._gpu_controller:
-                self._gpu_controller.begin_inference("inference_custom_voice_batch")
             self._inference_limiter.acquire("inference_custom_voice_batch")
         try:
             with self._lock:
@@ -1364,16 +1365,20 @@ class InferenceManager:
                                 len(pending_prompt_misses),
                                 prompt_build_seconds,
                             )
+                            t0 = time.time()
                             wavs_list, sr = model.generate_voice_clone(
                                 text=texts,
                                 language=languages,
                                 voice_clone_prompt=prompt_items,
                             )
+                            logger.info("generate_voice_clone took %.3fs for %d texts", time.time() - t0, len(texts))
 
                         # Encode WAVs in parallel on CPU threads (frees GPU thread)
+                        t1 = time.time()
                         results = list(self._wav_pool.map(
                             lambda w: self._encode_wav(w, sr), wavs_list
                         ))
+                        logger.info("wav encoding took %.3fs", time.time() - t1)
 
                         ops_log.end(op, extra={"sample_rate": sr})
                         logger.info(f"VoiceClone flexible finished for {len(texts)} texts on {cache_key}.")
