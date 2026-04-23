@@ -876,7 +876,9 @@ MAX_TEXT_LENGTH = int(os.environ.get("MAX_TEXT_LENGTH", "5000"))
 MAX_INSTRUCT_LENGTH = int(os.environ.get("MAX_INSTRUCT_LENGTH", "1000"))
 MAX_REF_TEXT_LENGTH = int(os.environ.get("MAX_REF_TEXT_LENGTH", "5000"))
 MAX_BATCH_ITEMS = int(os.environ.get("MAX_BATCH_ITEMS", str(GPU_BATCH_SIZE)))
-MAX_CLONE_BATCH_ITEMS = int(os.environ.get("MAX_CLONE_BATCH_ITEMS", "32"))
+# This caps the accepted request envelope only. The endpoint still breaks the
+# work into smaller GPU sub-batches using VOICE_CLONE_API_BATCH_SIZE.
+MAX_CLONE_BATCH_ITEMS = int(os.environ.get("MAX_CLONE_BATCH_ITEMS", "128"))
 
 
 def _normalize_text(value: str, field_name: str, max_length: int) -> str:
