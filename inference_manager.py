@@ -991,10 +991,11 @@ class InferenceManager:
         if not instructs:
             instructs = [""] * len(texts)
 
+        if self._gpu_controller:
+            self._gpu_controller.begin_inference("inference_custom_voice_batch")
+
         # Acquire semaphore FIRST to limit concurrent model usage to max_models
         with ops_log.operation("gpu_resource_wait", extra={"checkpoint": checkpoint_path}):
-            if self._gpu_controller:
-                self._gpu_controller.begin_inference("inference_custom_voice_batch")
             self._inference_limiter.acquire("inference_custom_voice_batch")
         try:
             with self._lock:
@@ -1290,6 +1291,7 @@ class InferenceManager:
             languages = ["English"] * len(texts)
         if not x_vector_only_modes:
             x_vector_only_modes = [False] * len(texts)
+        batch_started_at = time.monotonic()
 
         with ops_log.operation("gpu_resource_wait", extra={"model": "voice_clone"}):
             if self._gpu_controller:
@@ -1310,7 +1312,7 @@ class InferenceManager:
                         "cache_key": cache_key,
                     })
                     try:
-                        prompt_build_started_at = time.time()
+                        prompt_scan_started_at = time.monotonic()
                         prompt_items: list[Any] = []
                         pending_prompt_misses: list[tuple[int, Any, Any, Any, Optional[tuple[str, str, bool]]]] = []
                         pending_prompt_miss_positions: Dict[tuple[str, str, bool], list[int]] = {}
@@ -1331,7 +1333,23 @@ class InferenceManager:
                                 if prompt_cache_key is not None:
                                     pending_prompt_miss_positions[prompt_cache_key] = [index]
 
-                        with model_lock:
+                        unique_ref_count = len({
+                            self._clone_prompt_cache_key(a, t, x)
+                            for a, t, x in zip(ref_audios, ref_texts, x_vector_only_modes)
+                        })
+                        lock_wait_started_at = time.monotonic()
+                        logger.info(
+                            "VoiceClone flexible awaiting execution lock on %s: texts=%d unique_refs=%d prompt_cache_hits=%d prompt_cache_misses=%d",
+                            cache_key,
+                            len(texts),
+                            unique_ref_count,
+                            prompt_cache_hits,
+                            len(pending_prompt_misses),
+                        )
+                        model_lock.acquire()
+                        lock_wait_seconds = time.monotonic() - lock_wait_started_at
+                        try:
+                            prompt_build_started_at = time.monotonic()
                             for index, ref_audio, ref_text, xvec_only, prompt_cache_key in pending_prompt_misses:
                                 built_items = model.create_voice_clone_prompt(
                                     ref_audio=ref_audio,
@@ -1342,41 +1360,66 @@ class InferenceManager:
                                 target_indexes = (
                                     pending_prompt_miss_positions.get(prompt_cache_key, [index])
                                     if prompt_cache_key is not None
-                                    else [index]  # ✅ always use [index] when cache_key is None
+                                    else [index]
                                 )
                                 for target_index in target_indexes:
                                     prompt_items[target_index] = prompt_item
-                                if prompt_cache_key is not None:  # ✅ only store if key is valid
+                                if prompt_cache_key is not None:
                                     self._store_cached_clone_prompt_item(prompt_cache_key, prompt_item)
 
-                            # Add this assertion before calling the model
-                            assert all(p is not None for p in prompt_items), \
-                                f"prompt_items has None entries: {[i for i,p in enumerate(prompt_items) if p is None]}"
+                            assert all(p is not None for p in prompt_items), (
+                                f"prompt_items has None entries: {[i for i, p in enumerate(prompt_items) if p is None]}"
+                            )
 
-                            unique_ref_count = len({self._clone_prompt_cache_key(a, t, x) for a, t, x in zip(ref_audios, ref_texts, x_vector_only_modes)})
-                            prompt_build_seconds = round(time.time() - prompt_build_started_at, 3)
+                            prompt_build_seconds = time.monotonic() - prompt_build_started_at
                             logger.info(
-                                "VoiceClone flexible started on %s for %s texts with %s unique prompt(s), prompt_cache_hits=%s, prompt_cache_misses=%s, prompt_build_seconds=%s.",
+                                "VoiceClone flexible lock acquired on %s after %.3fs: prompt_scan=%.3fs prompt_build=%.3fs unique_refs=%d cache_hits=%d cache_misses=%d",
                                 cache_key,
-                                len(texts),
+                                lock_wait_seconds,
+                                time.monotonic() - prompt_scan_started_at,
+                                prompt_build_seconds,
                                 unique_ref_count,
                                 prompt_cache_hits,
                                 len(pending_prompt_misses),
-                                prompt_build_seconds,
                             )
+
+                            generate_started_at = time.monotonic()
                             wavs_list, sr = model.generate_voice_clone(
                                 text=texts,
                                 language=languages,
                                 voice_clone_prompt=prompt_items,
                             )
+                            generate_seconds = time.monotonic() - generate_started_at
+                            logger.info(
+                                "VoiceClone flexible model.generate finished on %s in %.3fs: texts=%d sample_rate=%s",
+                                cache_key,
+                                generate_seconds,
+                                len(texts),
+                                sr,
+                            )
+                        finally:
+                            model_lock.release()
 
                         # Encode WAVs in parallel on CPU threads (frees GPU thread)
+                        t1 = time.monotonic()
                         results = list(self._wav_pool.map(
                             lambda w: self._encode_wav(w, sr), wavs_list
                         ))
+                        logger.info(
+                            "VoiceClone flexible WAV encoding finished in %.3fs: texts=%d bytes=%d",
+                            time.monotonic() - t1,
+                            len(texts),
+                            sum(len(result) for result in results),
+                        )
 
                         ops_log.end(op, extra={"sample_rate": sr})
-                        logger.info(f"VoiceClone flexible finished for {len(texts)} texts on {cache_key}.")
+                        logger.info(
+                            "VoiceClone flexible finished on %s in %.3fs: texts=%d total_bytes=%d",
+                            cache_key,
+                            time.monotonic() - batch_started_at,
+                            len(texts),
+                            sum(len(result) for result in results),
+                        )
                         return results, sr
                     except Exception as e:
                         ops_log.fail(op, str(e))

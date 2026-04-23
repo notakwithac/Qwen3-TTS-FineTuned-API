@@ -442,6 +442,7 @@ class Qwen3TTSModel:
         return base64.b64decode(b64)
 
     def _load_audio_to_np(self, x: str) -> Tuple[np.ndarray, int]:
+        load_started_at = time.monotonic()
         if self._is_url(x):
             # Truncate URL for logging (hide sensitive tokens but show host/path)
             from urllib.parse import urlparse as _urlparse
@@ -462,7 +463,12 @@ class Qwen3TTSModel:
                     )
                     with urllib.request.urlopen(req, timeout=30) as resp:
                         audio_bytes = resp.read()
-                    logger.info(f"Ref audio downloaded OK: {len(audio_bytes)} bytes from {_safe_url}")
+                    logger.info(
+                        "Ref audio downloaded OK: %d bytes from %s in %.3fs",
+                        len(audio_bytes),
+                        _safe_url,
+                        time.monotonic() - load_started_at,
+                    )
                     with io.BytesIO(audio_bytes) as f:
                         audio, sr = sf.read(f, dtype="float32", always_2d=False)
                     return audio.astype(np.float32), int(sr)
@@ -497,8 +503,17 @@ class Qwen3TTSModel:
             wav_bytes = self._decode_base64_to_wav_bytes(x)
             with io.BytesIO(wav_bytes) as f:
                 audio, sr = sf.read(f, dtype="float32", always_2d=False)
+            logger.info(
+                "Loaded ref audio from base64 payload in %.3fs",
+                time.monotonic() - load_started_at,
+            )
         else:
             audio, sr = librosa.load(x, sr=None, mono=True)
+            logger.info(
+                "Loaded ref audio from local path in %.3fs: %s",
+                time.monotonic() - load_started_at,
+                x,
+            )
 
         if audio.ndim > 1:
             audio = np.mean(audio, axis=-1)
@@ -793,6 +808,7 @@ class Qwen3TTSModel:
                 - If x_vector_only_mode=False but ref_text is missing.
                 - If batch lengths mismatch.
         """
+        prompt_started_at = time.monotonic()
         if self.model.tts_model_type != "base":
             raise ValueError(
                 f"model with \ntokenizer_type: {self.model.tokenizer_type}\n"
@@ -810,7 +826,9 @@ class Qwen3TTSModel:
                 f"Batch size mismatch: ref_audio={len(ref_audio_list)}, ref_text={len(ref_text_list)}, x_vector_only_mode={len(xvec_list)}"
             )
 
+        normalize_started_at = time.monotonic()
         normalized = self._normalize_audio_inputs(ref_audio_list)
+        normalize_seconds = time.monotonic() - normalize_started_at
 
         ref_wavs_for_code: List[np.ndarray] = []
         ref_sr_for_code: List[int] = []
@@ -818,6 +836,7 @@ class Qwen3TTSModel:
             ref_wavs_for_code.append(wav)
             ref_sr_for_code.append(sr)
 
+        code_started_at = time.monotonic()
         if len(set(ref_sr_for_code)) == 1:
             enc = self.model.speech_tokenizer.encode(ref_wavs_for_code, sr=ref_sr_for_code[0])
             ref_codes = enc.audio_codes
@@ -825,8 +844,10 @@ class Qwen3TTSModel:
             ref_codes = []
             for wav, sr in normalized:
                 ref_codes.append(self.model.speech_tokenizer.encode(wav, sr=sr).audio_codes[0])
+        code_seconds = time.monotonic() - code_started_at
 
         items: List[VoiceClonePromptItem] = []
+        speaker_embed_started_at = time.monotonic()
         for i, ((wav, sr), code, rtext, xvec_only) in enumerate(zip(normalized, ref_codes, ref_text_list, xvec_list)):
             if not xvec_only:
                 if rtext is None or rtext == "":
@@ -850,6 +871,17 @@ class Qwen3TTSModel:
                     ref_text=rtext,
                 )
             )
+        speaker_embed_seconds = time.monotonic() - speaker_embed_started_at
+        logger.info(
+            "Voice clone prompt built: refs=%d unique_input_audio=%d normalize_audio=%.3fs code_encode=%.3fs speaker_embed=%.3fs total=%.3fs sample_rates=%s",
+            len(ref_audio_list),
+            len({id(wav) for wav, _ in normalized}),
+            normalize_seconds,
+            code_seconds,
+            speaker_embed_seconds,
+            time.monotonic() - prompt_started_at,
+            sorted(set(ref_sr_for_code)),
+        )
         return items
 
     @torch.inference_mode()
@@ -993,6 +1025,7 @@ class Qwen3TTSModel:
             ValueError:
                 If batch sizes mismatch or required prompt inputs are missing.
         """
+        generation_started_at = time.monotonic()
         if self.model.tts_model_type != "base":
             raise ValueError(
                 f"model with \ntokenizer_type: {self.model.tokenizer_type}\n"
@@ -1033,12 +1066,17 @@ class Qwen3TTSModel:
                 voice_clone_prompt_dict = voice_clone_prompt
                 ref_texts_for_ids = None
 
+        tokenize_started_at = time.monotonic()
         input_ids = self._tokenize_texts([self._build_assistant_text(t) for t in texts])
+        tokenize_seconds = time.monotonic() - tokenize_started_at
 
+        ref_id_started_at = time.monotonic()
         ref_ids = self._build_ref_ids(ref_texts_for_ids) if ref_texts_for_ids is not None else None
+        ref_id_seconds = time.monotonic() - ref_id_started_at
 
         gen_kwargs = self._merge_generate_kwargs(**kwargs)
 
+        model_generate_started_at = time.monotonic()
         talker_codes_list, _ = self._run_generate(
             input_ids=input_ids,
             ref_ids=ref_ids,
@@ -1047,6 +1085,7 @@ class Qwen3TTSModel:
             non_streaming_mode=non_streaming_mode,
             **gen_kwargs,
         )
+        model_generate_seconds = time.monotonic() - model_generate_started_at
 
         codes_for_decode = []
         for i, codes in enumerate(talker_codes_list):
@@ -1056,29 +1095,43 @@ class Qwen3TTSModel:
             else:
                 codes_for_decode.append(codes)
 
+        decode_started_at = time.monotonic()
         wavs_all, fs = self._decode_audio_codes(codes_for_decode)
+        decode_seconds = time.monotonic() - decode_started_at
 
         wavs_out: List[np.ndarray] = []
         CODEC_FRAME_RATE = 12  # tokens per second — Qwen3-TTS open source decoder
 
+        trim_started_at = time.monotonic()
         for i, wav in enumerate(wavs_all):
             ref_code_list = voice_clone_prompt_dict.get("ref_code", None)
-            # Run this once with a known ref audio of e.g. exactly 5 seconds
-            # ref_len / CODEC_FRAME_RATE should equal ~5.0
-            logger.info(
-                "Codec frame rate diagnostic: ref_len=%d tokens, implied_duration=%.3fs at 12Hz, fs=%d",
-                ref_len,
-                ref_len / 12,
-                fs,
-            )
             if ref_code_list is not None and ref_code_list[i] is not None:
                 ref_len = int(ref_code_list[i].shape[0])
                 ref_duration_samples = int(ref_len / CODEC_FRAME_RATE * fs)
+                logger.info(
+                    "Voice clone trim diagnostic: ref_len=%d tokens implied_duration=%.3fs fs=%d output_samples=%d",
+                    ref_len,
+                    ref_len / CODEC_FRAME_RATE,
+                    fs,
+                    wav.shape[0],
+                )
                 cut = min(ref_duration_samples, wav.shape[0])
                 wavs_out.append(wav[cut:])
             else:
                 wavs_out.append(wav)
 
+        logger.info(
+            "Voice clone model stages: texts=%d tokenize=%.3fs ref_ids=%.3fs generate=%.3fs decode=%.3fs trim=%.3fs total=%.3fs max_new_tokens=%s do_sample=%s",
+            len(texts),
+            tokenize_seconds,
+            ref_id_seconds,
+            model_generate_seconds,
+            decode_seconds,
+            time.monotonic() - trim_started_at,
+            time.monotonic() - generation_started_at,
+            gen_kwargs.get("max_new_tokens"),
+            gen_kwargs.get("do_sample"),
+        )
         return wavs_out, fs
 
     # voice design model

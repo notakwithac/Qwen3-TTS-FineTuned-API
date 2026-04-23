@@ -2240,7 +2240,17 @@ async def voice_clone_batch(req: VoiceCloneBatchRequest):
 
     pipeline.inference._touch()
     session_id = req.session_id or uuid.uuid4().hex[:8]
-    logger.info(f"Voice clone BATCH request: {len(req.items)} items, session_id={session_id}")
+    logger.info(
+        "Voice clone BATCH request: session_id=%s items=%d language=%s use_xvec=%s upload_to_s3=%s overwrite=%s chunk_size=%s storage_concurrency=%s",
+        session_id,
+        len(req.items),
+        req.language,
+        req.use_xvec,
+        req.upload_to_s3,
+        req.overwrite,
+        VOICE_CLONE_API_BATCH_SIZE,
+        BATCH_STORAGE_CONCURRENCY,
+    )
 
     existing_job = voice_clone_batch_jobs.get(session_id)
     if existing_job:
@@ -2266,6 +2276,7 @@ async def voice_clone_batch(req: VoiceCloneBatchRequest):
 
     async def run_batch_task():
         s3_prefix = f"audio/voice_clone/{session_id}"
+        batch_started_at = time.monotonic()
         try:
             job = voice_clone_batch_jobs[session_id]
             items_meta = [
@@ -2280,8 +2291,10 @@ async def voice_clone_batch(req: VoiceCloneBatchRequest):
                 meta["s3_key"] = f"{s3_prefix}/{meta['filename']}"
 
             pending_meta = list(items_meta)
+            skipped_existing = 0
 
             if req.upload_to_s3 and not req.overwrite:
+                exists_started_at = time.monotonic()
                 exists_limit = asyncio.Semaphore(BATCH_STORAGE_CONCURRENCY)
 
                 async def check_existing(meta: dict[str, Any]) -> bool:
@@ -2306,11 +2319,44 @@ async def voice_clone_batch(req: VoiceCloneBatchRequest):
                         }
                         job["completed"] += 1
                         job["results"].append(res)
+                        skipped_existing += 1
                     else:
                         pending_meta.append(meta)
 
-            for chunk in _chunked(pending_meta, VOICE_CLONE_API_BATCH_SIZE):
+                logger.info(
+                    "Voice clone batch %s existing-object scan finished in %.3fs: skipped=%d pending=%d total=%d",
+                    session_id,
+                    time.monotonic() - exists_started_at,
+                    skipped_existing,
+                    len(pending_meta),
+                    len(items_meta),
+                )
+
+            total_chunks = (
+                (len(pending_meta) + VOICE_CLONE_API_BATCH_SIZE - 1) // VOICE_CLONE_API_BATCH_SIZE
+                if pending_meta
+                else 0
+            )
+            logger.info(
+                "Voice clone batch %s generation plan: pending=%d chunks=%d chunk_size=%d",
+                session_id,
+                len(pending_meta),
+                total_chunks,
+                VOICE_CLONE_API_BATCH_SIZE,
+            )
+
+            for chunk_index, chunk in enumerate(_chunked(pending_meta, VOICE_CLONE_API_BATCH_SIZE), start=1):
                 loop = asyncio.get_running_loop()
+                chunk_started_at = time.monotonic()
+                logger.info(
+                    "Voice clone batch %s chunk %d/%d started: size=%d completed=%d failed=%d",
+                    session_id,
+                    chunk_index,
+                    total_chunks,
+                    len(chunk),
+                    job["completed"],
+                    job["failed"],
+                )
                 try:
                     wavs_chunk, sr = await loop.run_in_executor(
                         None,
@@ -2323,8 +2369,25 @@ async def voice_clone_batch(req: VoiceCloneBatchRequest):
                             x_vector_only_mode=req.use_xvec,
                         ),
                     )
+                    generation_seconds = time.monotonic() - chunk_started_at
+                    logger.info(
+                        "Voice clone batch %s chunk %d/%d generation finished in %.3fs: size=%d sample_rate=%s",
+                        session_id,
+                        chunk_index,
+                        total_chunks,
+                        generation_seconds,
+                        len(chunk),
+                        sr,
+                    )
                 except Exception as e:
-                    logger.error("Voice clone batch chunk failed: %s", e)
+                    logger.error(
+                        "Voice clone batch %s chunk %d/%d failed after %.3fs: %s",
+                        session_id,
+                        chunk_index,
+                        total_chunks,
+                        time.monotonic() - chunk_started_at,
+                        e,
+                    )
                     for meta in chunk:
                         job["failed"] += 1
                         job["results"].append({
@@ -2342,6 +2405,7 @@ async def voice_clone_batch(req: VoiceCloneBatchRequest):
                     continue
 
                 if req.upload_to_s3:
+                    upload_started_at = time.monotonic()
                     upload_limit = asyncio.Semaphore(BATCH_STORAGE_CONCURRENCY)
 
                     async def upload_result(meta: dict[str, Any], wav_bytes: bytes) -> dict[str, Any]:
@@ -2372,6 +2436,17 @@ async def voice_clone_batch(req: VoiceCloneBatchRequest):
                     for result in uploaded_results:
                         job["completed"] += 1
                         job["results"].append(result)
+                    logger.info(
+                        "Voice clone batch %s chunk %d/%d uploads finished in %.3fs: uploaded=%d cumulative_completed=%d cumulative_failed=%d elapsed=%.3fs",
+                        session_id,
+                        chunk_index,
+                        total_chunks,
+                        time.monotonic() - upload_started_at,
+                        len(uploaded_results),
+                        job["completed"],
+                        job["failed"],
+                        time.monotonic() - chunk_started_at,
+                    )
                 else:
                     for meta, wav_bytes in zip(chunk, wavs_chunk):
                         job["completed"] += 1
@@ -2386,10 +2461,30 @@ async def voice_clone_batch(req: VoiceCloneBatchRequest):
                             "filename": meta["filename"],
                             "status": "success",
                         })
+                    logger.info(
+                        "Voice clone batch %s chunk %d/%d completed without upload in %.3fs: produced=%d cumulative_completed=%d cumulative_failed=%d",
+                        session_id,
+                        chunk_index,
+                        total_chunks,
+                        time.monotonic() - chunk_started_at,
+                        len(chunk),
+                        job["completed"],
+                        job["failed"],
+                    )
 
             job = voice_clone_batch_jobs[session_id]
             if job["completed"] + job["failed"] >= job["total"]:
                 job["status"] = "completed" if job["failed"] == 0 else "completed_with_errors"
+            logger.info(
+                "Voice clone batch %s finished in %.3fs: status=%s completed=%d failed=%d skipped_existing=%d total=%d",
+                session_id,
+                time.monotonic() - batch_started_at,
+                job["status"],
+                job["completed"],
+                job["failed"],
+                skipped_existing,
+                job["total"],
+            )
         except Exception as e:
             logger.exception("Voice clone batch %s crashed", session_id)
             job = voice_clone_batch_jobs[session_id]
