@@ -1059,12 +1059,22 @@ class Qwen3TTSModel:
         wavs_all, fs = self._decode_audio_codes(codes_for_decode)
 
         wavs_out: List[np.ndarray] = []
+        CODEC_FRAME_RATE = 12  # tokens per second — Qwen3-TTS open source decoder
+
         for i, wav in enumerate(wavs_all):
             ref_code_list = voice_clone_prompt_dict.get("ref_code", None)
+            # Run this once with a known ref audio of e.g. exactly 5 seconds
+            # ref_len / CODEC_FRAME_RATE should equal ~5.0
+            logger.info(
+                "Codec frame rate diagnostic: ref_len=%d tokens, implied_duration=%.3fs at 12Hz, fs=%d",
+                ref_len,
+                ref_len / 12,
+                fs,
+            )
             if ref_code_list is not None and ref_code_list[i] is not None:
                 ref_len = int(ref_code_list[i].shape[0])
-                total_len = int(codes_for_decode[i].shape[0])
-                cut = int(ref_len / max(total_len, 1) * wav.shape[0])
+                ref_duration_samples = int(ref_len / CODEC_FRAME_RATE * fs)
+                cut = min(ref_duration_samples, wav.shape[0])
                 wavs_out.append(wav[cut:])
             else:
                 wavs_out.append(wav)

@@ -1342,11 +1342,16 @@ class InferenceManager:
                                 target_indexes = (
                                     pending_prompt_miss_positions.get(prompt_cache_key, [index])
                                     if prompt_cache_key is not None
-                                    else [index]
+                                    else [index]  # ✅ always use [index] when cache_key is None
                                 )
                                 for target_index in target_indexes:
                                     prompt_items[target_index] = prompt_item
-                                self._store_cached_clone_prompt_item(prompt_cache_key, prompt_item)
+                                if prompt_cache_key is not None:  # ✅ only store if key is valid
+                                    self._store_cached_clone_prompt_item(prompt_cache_key, prompt_item)
+
+                            # Add this assertion before calling the model
+                            assert all(p is not None for p in prompt_items), \
+                                f"prompt_items has None entries: {[i for i,p in enumerate(prompt_items) if p is None]}"
 
                             unique_ref_count = len({self._clone_prompt_cache_key(a, t, x) for a, t, x in zip(ref_audios, ref_texts, x_vector_only_modes)})
                             prompt_build_seconds = round(time.time() - prompt_build_started_at, 3)
