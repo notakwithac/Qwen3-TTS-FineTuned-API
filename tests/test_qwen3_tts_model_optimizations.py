@@ -10,8 +10,9 @@ from qwen_tts.inference.qwen3_tts_model import InferenceOptimizationConfig, Qwen
 
 
 class _FakeProcessor:
-    def __init__(self):
+    def __init__(self, padding_side="right"):
         self.calls = []
+        self.padding_side = padding_side
 
     def __call__(self, text, return_tensors="pt", padding=True):
         texts = text if isinstance(text, list) else [text]
@@ -22,8 +23,12 @@ class _FakeProcessor:
         for item in texts:
             row = [ord(ch) % 17 + 1 for ch in item]
             pad = max_len - len(row)
-            input_ids.append(row + ([0] * pad))
-            attention_mask.append(([1] * len(row)) + ([0] * pad))
+            if self.padding_side == "left":
+                input_ids.append(([0] * pad) + row)
+                attention_mask.append(([0] * pad) + ([1] * len(row)))
+            else:
+                input_ids.append(row + ([0] * pad))
+                attention_mask.append(([1] * len(row)) + ([0] * pad))
         return {
             "input_ids": torch.tensor(input_ids, dtype=torch.int64),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.int64),
@@ -73,6 +78,24 @@ def test_tokenize_texts_batches_unique_inputs():
 
     assert len(tokenized) == 3
     assert processor.calls == [["hello", "world"]]
+    assert torch.equal(tokenized[0], tokenized[2])
+
+
+def test_tokenize_texts_removes_left_padding():
+    processor = _FakeProcessor(padding_side="left")
+    wrapper = Qwen3TTSModel(
+        model=_FakeModel(),
+        processor=processor,
+        optimization_config=InferenceOptimizationConfig(enable_batched_tokenization=True),
+    )
+
+    tokenized = wrapper._tokenize_texts(["short", "much longer", "short"])
+
+    expected_short = torch.tensor(
+        [[ord(ch) % 17 + 1 for ch in "short"]],
+        dtype=torch.int64,
+    )
+    assert torch.equal(tokenized[0].cpu(), expected_short)
     assert torch.equal(tokenized[0], tokenized[2])
 
 

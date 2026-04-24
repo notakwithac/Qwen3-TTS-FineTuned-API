@@ -610,8 +610,7 @@ class Qwen3TTSModel:
         for idx, text in enumerate(unique_texts):
             row = input_ids_batch[idx]
             if attention_mask is not None:
-                valid_tokens = int(attention_mask[idx].sum().item())
-                row = row[:valid_tokens]
+                row = row[attention_mask[idx].bool()]
             by_text[text] = row.unsqueeze(0)
         return [by_text[text] for text in texts]
 
