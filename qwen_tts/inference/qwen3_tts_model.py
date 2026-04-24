@@ -19,6 +19,7 @@ import io
 import logging
 import time
 import random
+import threading
 import urllib.request
 import urllib.error
 from dataclasses import dataclass
@@ -702,6 +703,28 @@ class Qwen3TTSModel:
             return normalized
         return normalized[: limit - 3] + "..."
 
+    @contextlib.contextmanager
+    def _generation_heartbeat(self, *, label: str, details: dict[str, Any], interval_seconds: float = 30.0):
+        stop_event = threading.Event()
+        started_at = time.monotonic()
+
+        def _emit_heartbeat() -> None:
+            while not stop_event.wait(interval_seconds):
+                logger.info(
+                    "%s still running after %.1fs: %s",
+                    label,
+                    time.monotonic() - started_at,
+                    details,
+                )
+
+        thread = threading.Thread(target=_emit_heartbeat, daemon=True)
+        thread.start()
+        try:
+            yield
+        finally:
+            stop_event.set()
+            thread.join(timeout=1.0)
+
     def _decode_audio_codes(self, codes_list: List[torch.Tensor]) -> Tuple[List[np.ndarray], int]:
         return self.model.speech_tokenizer.decode([{"audio_codes": c} for c in codes_list])
 
@@ -1075,16 +1098,26 @@ class Qwen3TTSModel:
         ref_id_seconds = time.monotonic() - ref_id_started_at
 
         gen_kwargs = self._merge_generate_kwargs(**kwargs)
+        heartbeat_details = {
+            "texts": len(texts),
+            "language": list(dict.fromkeys(languages)),
+            "max_new_tokens": gen_kwargs.get("max_new_tokens"),
+            "do_sample": gen_kwargs.get("do_sample"),
+            "top_p": gen_kwargs.get("top_p"),
+            "temperature": gen_kwargs.get("temperature"),
+            "non_streaming_mode": non_streaming_mode,
+        }
 
         model_generate_started_at = time.monotonic()
-        talker_codes_list, _ = self._run_generate(
-            input_ids=input_ids,
-            ref_ids=ref_ids,
-            voice_clone_prompt=voice_clone_prompt_dict,
-            languages=languages,
-            non_streaming_mode=non_streaming_mode,
-            **gen_kwargs,
-        )
+        with self._generation_heartbeat(label="Voice clone model.generate", details=heartbeat_details):
+            talker_codes_list, _ = self._run_generate(
+                input_ids=input_ids,
+                ref_ids=ref_ids,
+                voice_clone_prompt=voice_clone_prompt_dict,
+                languages=languages,
+                non_streaming_mode=non_streaming_mode,
+                **gen_kwargs,
+            )
         model_generate_seconds = time.monotonic() - model_generate_started_at
 
         codes_for_decode = []

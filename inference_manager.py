@@ -1268,6 +1268,10 @@ class InferenceManager:
         ref_text: str,
         languages: list[str] = None,
         x_vector_only_mode: bool = False,
+        do_sample: Optional[bool] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        max_new_tokens: Optional[int] = None,
     ) -> tuple[list[bytes], int]:
         """Generate speech for multiple texts using zero-shot VoiceClone Base model (single reference)."""
         return self.generate_voice_clone_flexible_batch(
@@ -1275,7 +1279,11 @@ class InferenceManager:
             ref_audios=[ref_audio] * len(texts),
             ref_texts=[ref_text] * len(texts),
             languages=languages,
-            x_vector_only_modes=[x_vector_only_mode] * len(texts)
+            x_vector_only_modes=[x_vector_only_mode] * len(texts),
+            do_sample=do_sample,
+            temperature=temperature,
+            top_p=top_p,
+            max_new_tokens=max_new_tokens,
         )
 
     def generate_voice_clone_flexible_batch(
@@ -1285,6 +1293,10 @@ class InferenceManager:
         ref_texts: list[str],
         languages: list[str] = None,
         x_vector_only_modes: list[bool] = None,
+        do_sample: Optional[bool] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        max_new_tokens: Optional[int] = None,
     ) -> tuple[list[bytes], int]:
         """Generate speech for multiple texts using zero-shot VoiceClone Base model (flexible references)."""
         if not languages:
@@ -1388,6 +1400,10 @@ class InferenceManager:
                                 text=texts,
                                 language=languages,
                                 voice_clone_prompt=prompt_items,
+                                do_sample=do_sample,
+                                temperature=temperature,
+                                top_p=top_p,
+                                max_new_tokens=max_new_tokens,
                             )
                             generate_seconds = time.monotonic() - generate_started_at
                             logger.info(

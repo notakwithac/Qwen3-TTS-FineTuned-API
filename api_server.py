@@ -1447,6 +1447,10 @@ class VoiceCloneBatchRequest(APIModel):
     use_xvec: bool = False
     upload_to_s3: bool = True
     overwrite: bool = False
+    do_sample: Optional[bool] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    max_new_tokens: Optional[int] = None
 
     @field_validator("ref_audio_url")
     @classmethod
@@ -1482,6 +1486,27 @@ class VoiceCloneBatchRequest(APIModel):
             return None
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value):
             raise ValueError("session_id must be 1-64 characters of letters, numbers, underscore, or hyphen")
+        return value
+
+    @field_validator("temperature")
+    @classmethod
+    def validate_temperature(cls, value: Optional[float]) -> Optional[float]:
+        if value is not None and value <= 0:
+            raise ValueError("temperature must be > 0")
+        return value
+
+    @field_validator("top_p")
+    @classmethod
+    def validate_top_p(cls, value: Optional[float]) -> Optional[float]:
+        if value is not None and not (0 < value <= 1):
+            raise ValueError("top_p must be in (0, 1]")
+        return value
+
+    @field_validator("max_new_tokens")
+    @classmethod
+    def validate_max_new_tokens(cls, value: Optional[int]) -> Optional[int]:
+        if value is not None and value <= 0:
+            raise ValueError("max_new_tokens must be > 0")
         return value
 
 
@@ -2369,6 +2394,10 @@ async def voice_clone_batch(req: VoiceCloneBatchRequest):
                             ref_text=req.ref_text,
                             languages=[req.language] * len(chunk),
                             x_vector_only_mode=req.use_xvec,
+                            do_sample=req.do_sample,
+                            temperature=req.temperature,
+                            top_p=req.top_p,
+                            max_new_tokens=req.max_new_tokens,
                         ),
                     )
                     generation_seconds = time.monotonic() - chunk_started_at
