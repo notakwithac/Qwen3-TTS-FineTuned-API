@@ -76,3 +76,19 @@ def test_voice_clone_batch_request_rejects_items_above_limit():
             ref_text="Reference text",
             items=_build_items(api_server.MAX_CLONE_BATCH_ITEMS + 1),
         )
+
+
+def test_voice_clone_requests_accept_storage_refs():
+    single = api_server.VoiceCloneRequest(
+        text="Clone text",
+        ref_audio_url="s3://qwen3-tts/audio/voice_design/ref.wav",
+        ref_text="Reference text",
+    )
+    batch = api_server.VoiceCloneBatchRequest(
+        ref_audio_url="audio/voice_design/ref.wav",
+        ref_text="Reference text",
+        items=_build_items(1),
+    )
+
+    assert single.ref_audio_url == "s3://qwen3-tts/audio/voice_design/ref.wav"
+    assert batch.ref_audio_url == "audio/voice_design/ref.wav"

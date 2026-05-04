@@ -21,6 +21,7 @@ from pathlib import Path
 import torch
 import time
 import logging
+from cuda_cleanup import safe_cuda_cleanup
 from qwen_tts import Qwen3TTSTokenizer
 
 logger = logging.getLogger(__name__)
@@ -89,8 +90,7 @@ def main():
                 final_lines.append(line)
             batch_lines.clear()
             batch_audios.clear()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            safe_cuda_cleanup("after tokenizer batch")
 
     if len(batch_audios) > 0:
         enc_res = tokenizer_12hz.encode(batch_audios)
@@ -99,8 +99,7 @@ def main():
             final_lines.append(line)
         batch_lines.clear()
         batch_audios.clear()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        safe_cuda_cleanup("after final tokenizer batch")
 
     final_lines = [json.dumps(line, ensure_ascii=False) for line in final_lines]
 
@@ -184,8 +183,7 @@ def prepare_programmatic(
                 processed += 1
             batch_lines.clear()
             batch_audios.clear()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            safe_cuda_cleanup("after programmatic tokenizer batch")
             if on_progress:
                 on_progress(processed, total_count)
 
@@ -197,8 +195,7 @@ def prepare_programmatic(
             processed += 1
         batch_lines.clear()
         batch_audios.clear()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        safe_cuda_cleanup("after final programmatic tokenizer batch")
         if on_progress:
             on_progress(processed, total_count)
 

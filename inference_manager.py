@@ -6,6 +6,7 @@ Auto-unloads from VRAM after configurable idle timeout.
 """
 
 import collections
+import gc
 import io
 import logging
 import re
@@ -369,6 +370,20 @@ class InferenceManager:
             "reserved_gb": reserved_bytes / 1e9,
             "free_gb": max(free_bytes, 0) / 1e9,
         }
+
+    def _purge_cuda_allocator_cache(self) -> dict[str, float]:
+        """Release cached CUDA blocks after model references have been dropped."""
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            ipc_collect = getattr(torch.cuda, "ipc_collect", None)
+            if ipc_collect is not None:
+                try:
+                    ipc_collect()
+                except Exception as exc:
+                    logger.debug("CUDA IPC collection skipped: %s", exc)
+            torch.cuda.empty_cache()
+        return self._get_gpu_memory_snapshot()
 
     def _build_runtime_diagnostics_locked(self, **extra) -> dict[str, Any]:
         diagnostics: dict[str, Any] = {
@@ -843,15 +858,21 @@ class InferenceManager:
         self._execution_locks.clear()
         self._shared_replica_loads.clear()
         self._cancel_idle_timer()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        snapshot = self._purge_cuda_allocator_cache()
         if count > 0:
             self._total_unloads += count
-            logger.info(f"Unloaded {count} model(s) from VRAM cache.")
+        logger.info(
+            "Unloaded %d model(s) from VRAM cache. CUDA allocated=%.2fGB reserved=%.2fGB free=%.2fGB",
+            count,
+            snapshot["allocated_gb"],
+            snapshot["reserved_gb"],
+            snapshot["free_gb"],
+        )
 
     def unload(self):
         with self._lock:
             self._unload_all_unsafe()
+            return self._get_gpu_memory_snapshot()
 
     # -- Session-aware loading ------------------------------------------------
 
@@ -901,8 +922,7 @@ class InferenceManager:
                 self._session_pins.pop(cache_key, None)
                 self._execution_locks.pop(cache_key, None)
                 self._shared_replica_loads.pop(cache_key, None)
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                self._purge_cuda_allocator_cache()
                 logger.info(f"Unloaded specific model: {cache_key}")
                 return True
         return False

@@ -18,6 +18,7 @@ from typing import Any, Dict, Optional
 
 import torch
 
+from cuda_cleanup import safe_cuda_cleanup
 from inference_manager import InferenceManager
 from ops_logger import ops_log
 from enum import StrEnum
@@ -96,6 +97,15 @@ class JobStatus(StrEnum):
     READY = "ready"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+ACTIVE_JOB_STATUSES = {
+    JobStatus.QUEUED,
+    JobStatus.PREPARING,
+    JobStatus.TRAINING,
+    JobStatus.LOADING,
+    JobStatus.RESTORING,
+}
 
 
 class Job:
@@ -190,6 +200,69 @@ class Job:
             logger.error(f"Failed to save job {self.job_id}: {e}")
 
     @classmethod
+    def from_dict(
+        cls,
+        data: dict,
+        job_dir: str,
+        *,
+        mark_stale_active: bool = True,
+    ) -> 'Job':
+        config = data.get("config", {})
+        job = cls(
+            job_id=data["job_id"],
+            speaker_name=data["speaker_name"],
+            dataset_dir=str(Path(job_dir) / "dataset"),
+            output_dir=str(Path(job_dir) / "output"),
+            num_epochs=config.get("num_epochs", 10),
+            batch_size=config.get("batch_size", 1),
+            lr=config.get("lr", 2e-6),
+            flash_attn=config.get("flash_attn", True),
+            book_id=config.get("book_id"),
+            chapter_id=config.get("chapter_id"),
+            character_id=config.get("character_id"),
+            job_dir=job_dir,
+            base_model_path=config.get("base_model_path"),
+            s3_model_key=data.get("s3_model_key"),
+        )
+        job.status = data.get("status", JobStatus.QUEUED)
+        job.message = data.get("message", job.message)
+        job.progress = data.get("progress", {})
+        job.checkpoint_path = data.get("checkpoint_path")
+        job.available_checkpoint_epochs = [
+            int(epoch) for epoch in data.get("available_checkpoint_epochs", []) if str(epoch).isdigit()
+        ]
+        raw_checkpoint_s3_keys = data.get("checkpoint_s3_keys", {})
+        job.checkpoint_s3_keys = {
+            str(epoch): str(s3_key)
+            for epoch, s3_key in raw_checkpoint_s3_keys.items()
+            if s3_key
+        }
+        job.error = data.get("error")
+        job.created_at = data.get("created_at", job.created_at)
+        job.finished_at = data.get("finished_at")
+        if "last_accessed_at" in data:
+            job.last_accessed_at = data["last_accessed_at"]
+
+        # A loaded-from-disk job cannot have its original worker thread.
+        # If the API process restarted or crashed while it was active, expose
+        # it as failed instead of showing a phantom in-progress training job.
+        if mark_stale_active and job.status in ACTIVE_JOB_STATUSES:
+            job.status = JobStatus.FAILED
+            job.error = job.error or (
+                "Job was active when the API process stopped. "
+                "Retry with force=true to start it again."
+            )
+            job.finished_at = job.finished_at or datetime.now(timezone.utc).isoformat()
+            job.progress = {
+                "stage": "failed",
+                "detail": "Recovered stale active job from disk.",
+                "previous_status": str(data.get("status", "")),
+            }
+            job.save()
+
+        return job
+
+    @classmethod
     def load(cls, job_dir: str) -> Optional['Job']:
         """Load job state from disk."""
         job_file = Path(job_dir) / "job.json"
@@ -198,44 +271,7 @@ class Job:
         try:
             with open(job_file, "r") as f:
                 data = json.load(f)
-            
-            config = data.get("config", {})
-            job = cls(
-                job_id=data["job_id"],
-                speaker_name=data["speaker_name"],
-                dataset_dir=str(Path(job_dir) / "dataset"),
-                output_dir=str(Path(job_dir) / "output"),
-                num_epochs=config.get("num_epochs", 10),
-                batch_size=config.get("batch_size", 1),
-                lr=config.get("lr", 2e-6),
-                flash_attn=config.get("flash_attn", True),
-                book_id=config.get("book_id"),
-                chapter_id=config.get("chapter_id"),
-                character_id=config.get("character_id"),
-                job_dir=job_dir,
-                base_model_path=config.get("base_model_path"),
-                s3_model_key=data.get("s3_model_key"),
-            )
-            job.status = data.get("status", JobStatus.QUEUED)
-            job.message = data.get("message", job.message)
-            job.progress = data.get("progress", {})
-            job.checkpoint_path = data.get("checkpoint_path")
-            job.available_checkpoint_epochs = [
-                int(epoch) for epoch in data.get("available_checkpoint_epochs", []) if str(epoch).isdigit()
-            ]
-            raw_checkpoint_s3_keys = data.get("checkpoint_s3_keys", {})
-            job.checkpoint_s3_keys = {
-                str(epoch): str(s3_key)
-                for epoch, s3_key in raw_checkpoint_s3_keys.items()
-                if s3_key
-            }
-            job.error = data.get("error")
-            job.created_at = data.get("created_at", job.created_at)
-            job.finished_at = data.get("finished_at")
-            if "last_accessed_at" in data:
-                job.last_accessed_at = data["last_accessed_at"]
-                
-            return job
+            return cls.from_dict(data, job_dir, mark_stale_active=True)
         except Exception as e:
             logger.error(f"Failed to load job from {job_dir}: {e}")
             return None
@@ -373,7 +409,7 @@ class Pipeline:
     ) -> bool:
         from storage import storage
 
-        if not storage.is_configured:
+        if not getattr(storage, "has_read_backend", storage.is_configured):
             return False
 
         s3_ref = None
@@ -381,10 +417,10 @@ class Pipeline:
             s3_ref = job.checkpoint_s3_keys.get(str(checkpoint_epoch))
         if not s3_ref:
             s3_ref = job.s3_model_key
-        s3_key = _normalize_s3_object_key(s3_ref, bucket=getattr(storage, "bucket", None))
+        s3_key = _normalize_s3_object_key(s3_ref)
         if not s3_key:
             return False
-        return storage.object_exists(s3_key)
+        return storage.object_exists(s3_ref)
 
     def _has_verified_checkpoint_backup(self, job: Job) -> bool:
         latest_epoch = self._latest_checkpoint_epoch(job)
@@ -580,29 +616,94 @@ class Pipeline:
 
     def get_job(self, job_id: str) -> Optional[Job]:
         logger.info(f"Lookup job {job_id}")
-        job = self.jobs.get(job_id)
-        if job:
-            logger.info(f"Job {job_id} found in memory with status {job.status}")
-            return job
+        memory_job = self.jobs.get(job_id)
             
         # Try to load from disk if not in memory
+        disk_job = None
         job_dir = self.jobs_dir / job_id
-        if job_dir.exists():
-            job = Job.load(str(job_dir))
-            if job:
+        if memory_job:
+            logger.info(f"Job {job_id} found in memory with status {memory_job.status}")
+        elif job_dir.exists():
+            disk_job = Job.load(str(job_dir))
+            if disk_job:
                 logger.info(f"Job {job_id} found on disk at {job_dir}")
-                with self._lock:
-                    self.jobs[job_id] = job
-                return job
 
-        # Try to restore from S3
-        logger.info(f"Job {job_id} not found locally, checking S3...")
-        job = self._restore_job_from_s3(job_id)
+        local_job = memory_job or disk_job
+
+        # Always check S3 metadata too. A stale local failed job.json can remain
+        # after a crash even when the checkpoint/job metadata exists remotely.
+        logger.info(f"Checking S3 metadata for job {job_id}...")
+        s3_job = self._restore_job_from_s3(job_id, register=False)
+
+        job = self._choose_best_job_state(local_job, s3_job)
         if job:
+            job = self._reconcile_checkpoint_readiness(job)
+            with self._lock:
+                self.jobs[job_id] = job
+            job.save()
             return job
                 
         logger.warning(f"Job {job_id} not found anywhere (memory, disk, S3)")
         return None
+
+    def _job_state_score(self, job: Optional[Job]) -> int:
+        if job is None:
+            return -1
+        if self._has_local_checkpoint(job) or self._has_verified_checkpoint_backup(job):
+            return 100
+        if job.status == JobStatus.READY:
+            return 80
+        if job.status in (JobStatus.LOADING, JobStatus.RESTORING):
+            return 60
+        if job.status in (JobStatus.TRAINING, JobStatus.PREPARING, JobStatus.QUEUED):
+            return 40
+        if job.status == JobStatus.CANCELLED:
+            return 10
+        if job.status == JobStatus.FAILED:
+            return 0
+        return 20
+
+    def _choose_best_job_state(self, local_job: Optional[Job], s3_job: Optional[Job]) -> Optional[Job]:
+        if local_job is None:
+            return s3_job
+        if s3_job is None:
+            return local_job
+        local_score = self._job_state_score(local_job)
+        s3_score = self._job_state_score(s3_job)
+        chosen = s3_job if s3_score > local_score else local_job
+        other = local_job if chosen is s3_job else s3_job
+
+        if not chosen.s3_model_key and other.s3_model_key:
+            chosen.s3_model_key = other.s3_model_key
+        if not chosen.checkpoint_s3_keys and other.checkpoint_s3_keys:
+            chosen.checkpoint_s3_keys = dict(other.checkpoint_s3_keys)
+        if not chosen.available_checkpoint_epochs and other.available_checkpoint_epochs:
+            chosen.available_checkpoint_epochs = list(other.available_checkpoint_epochs)
+        if (
+            (not chosen.checkpoint_path or not os.path.exists(str(chosen.checkpoint_path)))
+            and other.checkpoint_path
+            and os.path.exists(str(other.checkpoint_path))
+        ):
+            chosen.checkpoint_path = other.checkpoint_path
+        return chosen
+
+    def _reconcile_checkpoint_readiness(self, job: Job) -> Job:
+        has_local = self._has_local_checkpoint(job)
+        has_s3 = self._has_verified_checkpoint_backup(job)
+        if has_local or has_s3:
+            if job.status != JobStatus.READY:
+                job.status = JobStatus.READY
+                job.error = None
+                job.finished_at = job.finished_at or datetime.now(timezone.utc).isoformat()
+                source = "local disk" if has_local else "S3"
+                job.progress = {
+                    "stage": "ready",
+                    "detail": f"Model checkpoint found on {source} and ready for inference",
+                    "inference_url": f"/infer/{job.job_id}",
+                }
+            if has_local and job.checkpoint_path and os.path.exists(str(job.checkpoint_path)):
+                job.checkpoint_path = str(Path(job.checkpoint_path).resolve())
+        return job
 
     def list_jobs(self) -> list:
         return [j.to_dict() for j in self.jobs.values()]
@@ -780,9 +881,7 @@ class Pipeline:
             cp, resolved_epoch = self.resolve_checkpoint_path(job)
 
             # Free GPU memory before loading
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            safe_cuda_cleanup("before smart-retry load")
 
             job.status = JobStatus.LOADING
             job.progress = {"stage": "loading", "detail": "Loading fine-tuned model for inference..."}
@@ -904,13 +1003,14 @@ class Pipeline:
                     "total": total,
                     "detail": f"Encoded {current}/{total} audio files",
                 }
+                job.save()
 
             prep_op = ops_log.start("prepare_data", job_id=job.job_id)
             prepare_programmatic(
                 input_jsonl=train_jsonl,
                 output_jsonl=prepared_jsonl,
                 device=self.device,
-                batch_size=16,
+                batch_size=int(os.environ.get("DATASET_PREP_BATCH_SIZE", "1")),
                 on_progress=on_prepare_progress,
             )
             ops_log.end(prep_op)
@@ -922,9 +1022,7 @@ class Pipeline:
                 return
 
             # Free tokenizer GPU memory before training
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            safe_cuda_cleanup("after data preparation", synchronize=True)
 
             # Stage 2: Training
             job.status = JobStatus.TRAINING
@@ -938,10 +1036,17 @@ class Pipeline:
                     "stage": "training",
                     **info,
                 }
+                job.save()
 
-            train_op = ops_log.start("training", job_id=job.job_id, extra={
-                "num_epochs": job.num_epochs, "batch_size": job.batch_size, "lr": job.lr,
-            })
+            training_config = {
+                "num_epochs": job.num_epochs,
+                "batch_size": job.batch_size,
+                "lr": job.lr,
+                "trainable_scope": os.environ.get("TRAIN_TRAINABLE_SCOPE", "full"),
+                "optimizer": os.environ.get("TRAIN_OPTIMIZER", "adamw"),
+                "max_total_tokens": int(os.environ.get("TRAIN_MAX_TOTAL_TOKENS", "0")),
+            }
+            train_op = ops_log.start("training", job_id=job.job_id, extra=training_config)
             
             init_model = job.base_model_path if job.base_model_path and os.path.exists(job.base_model_path) else "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
             
@@ -955,9 +1060,23 @@ class Pipeline:
                     "num_epochs": job.num_epochs,
                     "speaker_name": job.speaker_name,
                     "save_interval": job.num_epochs, # Only save the last/final one by default
-                    "save_from_epoch": MIN_CUSTOM_CHECKPOINT_EPOCH,
+                    "save_from_epoch": int(
+                        os.environ.get(
+                            "TRAIN_SAVE_FROM_EPOCH",
+                            str(max(job.num_epochs - 1, 0)),
+                        )
+                    ),
                     "save_last": True,
                     "flash_attn": job.flash_attn,
+                    "attn_implementation": os.environ.get("TRAIN_ATTN_IMPLEMENTATION", "sdpa"),
+                    "gradient_checkpointing": os.environ.get("TRAIN_GRADIENT_CHECKPOINTING", "1") == "1",
+                    "trainable_scope": training_config["trainable_scope"],
+                    "optimizer": training_config["optimizer"],
+                    "weight_decay": float(os.environ.get("TRAIN_WEIGHT_DECAY", "0.01")),
+                    "max_text_tokens": int(os.environ.get("TRAIN_MAX_TEXT_TOKENS", "0")),
+                    "max_codec_tokens": int(os.environ.get("TRAIN_MAX_CODEC_TOKENS", "0")),
+                    "max_total_tokens": int(os.environ.get("TRAIN_MAX_TOTAL_TOKENS", "0")),
+                    "output_hidden_states": os.environ.get("TRAIN_OUTPUT_HIDDEN_STATES", "0") == "1",
                     "lr_scheduler": "cosine",
                     "warmup_ratio": 0.05,
                     "resume": True,
@@ -1023,9 +1142,7 @@ class Pipeline:
             job.checkpoint_path = str(Path(checkpoint_path).resolve())  # always absolute — prevents HF from_pretrained misinterpreting as a repo id
 
             # Free training GPU memory before loading for inference
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            safe_cuda_cleanup("after training", synchronize=True)
 
             # Release GPU training lock before Stage 3 (Inference loading)
             if self._gpu_controller:
@@ -1073,9 +1190,7 @@ class Pipeline:
                     self._clear_hf_cache(job.base_model_path)
                 
                 # Free GPU and retry
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                safe_cuda_cleanup("before retry")
                 
                 # Release queue before recursive call (recursive call will re-acquire)
                 self._training_queue.release()
@@ -1174,36 +1289,39 @@ class Pipeline:
         except Exception as e:
             logger.error(f"Failed to upload job.json to S3 for {job.job_id}: {e}")
 
-    def _restore_job_from_s3(self, job_id: str) -> Optional[Job]:
+    def _restore_job_from_s3(self, job_id: str, *, register: bool = True) -> Optional[Job]:
         """Try to restore a job's metadata from S3 (lightweight — no model download)."""
         from storage import storage
-        if not storage.is_configured:
+        if not getattr(storage, "has_read_backend", storage.is_configured):
             logger.warning(f"S3 restoration skipped for {job_id}: Storage not configured")
             return None
 
         s3_key = f"jobs/{job_id}/job.json"
         try:
-            if not storage.object_exists(s3_key):
-                logger.warning(f"Job metadata not found on S3 at {s3_key}")
-                return None
-
+            describe_backends = getattr(storage, "describe_read_backends", None)
+            if callable(describe_backends):
+                logger.info(
+                    "Looking for job metadata key %s across storage backends: %s",
+                    s3_key,
+                    describe_backends(),
+                )
             data_bytes = storage.download_bytes(s3_key)
             data = json.loads(data_bytes.decode("utf-8"))
-
-            # Recreate local job directory with just job.json
             job_dir = self.jobs_dir / job_id
-            job_dir.mkdir(parents=True, exist_ok=True)
-            with open(job_dir / "job.json", "w") as f:
-                json.dump(data, f, indent=2)
+            if register:
+                job_dir.mkdir(parents=True, exist_ok=True)
+                with open(job_dir / "job.json", "w") as f:
+                    json.dump(data, f, indent=2)
 
-            job = Job.load(str(job_dir))
+            job = Job.from_dict(data, str(job_dir), mark_stale_active=False)
             if job:
-                with self._lock:
-                    self.jobs[job_id] = job
+                if register:
+                    with self._lock:
+                        self.jobs[job_id] = job
                 logger.info(f"Restored job {job_id} metadata from S3")
                 return job
         except Exception as e:
-            logger.error(f"Failed to restore job {job_id} from S3: {e}")
+            logger.warning(f"Job metadata not found or unreadable on S3 at {s3_key}: {e}")
         return None
 
     def _restore_checkpoint_from_s3(
@@ -1229,7 +1347,7 @@ class Pipeline:
 
         if not s3_key:
             raise ValueError(f"Job {job.job_id} has no S3 model key")
-        if not storage.is_configured:
+        if not getattr(storage, "has_read_backend", storage.is_configured):
             raise ValueError("Storage not configured, cannot restore checkpoint")
 
         # Ensure output directory exists

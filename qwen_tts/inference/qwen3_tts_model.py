@@ -452,6 +452,27 @@ class Qwen3TTSModel:
             if _parsed.query:
                 _safe_url += f"?<{len(_parsed.query)} chars>"
             logger.info(f"Downloading ref audio from: {_safe_url}")
+
+            try:
+                from storage import storage
+
+                if storage.has_read_backend and storage.can_resolve_storage_ref(x):
+                    audio_bytes = storage.download_bytes(x)
+                    logger.info(
+                        "Ref audio loaded from configured storage: %d bytes from %s in %.3fs",
+                        len(audio_bytes),
+                        _safe_url,
+                        time.monotonic() - load_started_at,
+                    )
+                    with io.BytesIO(audio_bytes) as f:
+                        audio, sr = sf.read(f, dtype="float32", always_2d=False)
+                    return audio.astype(np.float32), int(sr)
+            except Exception as e:
+                logger.warning(
+                    "Configured storage read failed for %s; falling back to HTTP download: %s",
+                    _safe_url,
+                    e,
+                )
             
             max_retries = 3
             last_err = None
