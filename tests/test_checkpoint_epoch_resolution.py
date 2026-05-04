@@ -1,5 +1,6 @@
 from pathlib import Path
 import sys
+import json
 
 import pytest
 
@@ -92,11 +93,12 @@ def test_has_verified_checkpoint_backup_checks_actual_object_existence(tmp_path,
 
     class _Storage:
         is_configured = True
+        has_read_backend = True
         bucket = "bucket"
 
         @staticmethod
         def object_exists(key):
-            return key == "9.zip"
+            return key == "s3://bucket/9.zip"
 
     monkeypatch.setattr("pipeline.storage", _Storage(), raising=False)
     import types
@@ -117,6 +119,7 @@ def test_retry_job_failed_with_only_job_json_falls_back_to_full_restart(tmp_path
 
     class _Storage:
         is_configured = True
+        has_read_backend = True
         bucket = "bucket"
 
         @staticmethod
@@ -132,3 +135,83 @@ def test_retry_job_failed_with_only_job_json_falls_back_to_full_restart(tmp_path
     assert retried is job
     assert job.status == pipeline.JobStatus.QUEUED
     assert started == [job.job_id]
+
+
+def test_get_job_prefers_s3_ready_metadata_over_local_failed_job(tmp_path, monkeypatch):
+    local_job = _make_job(tmp_path, num_epochs=10)
+    local_job.job_dir = str(tmp_path / "jobs" / local_job.job_id)
+    local_job.status = pipeline.JobStatus.FAILED
+    local_job.error = "local stale failure"
+    local_job.save()
+
+    remote_data = local_job.to_dict()
+    remote_data["status"] = pipeline.JobStatus.READY
+    remote_data["error"] = None
+    remote_data["available_checkpoint_epochs"] = [9]
+    remote_data["checkpoint_s3_keys"] = {"9": "s3://pathnam-ai/models/job-epoch-test/checkpoint-epoch-9.zip"}
+    remote_data["s3_model_key"] = "s3://pathnam-ai/models/job-epoch-test/checkpoint-epoch-9.zip"
+
+    class _Storage:
+        is_configured = True
+        has_read_backend = True
+
+        @staticmethod
+        def object_exists(key):
+            return key in {
+                "jobs/job-epoch-test/job.json",
+                "s3://pathnam-ai/models/job-epoch-test/checkpoint-epoch-9.zip",
+            }
+
+        @staticmethod
+        def download_bytes(key):
+            assert key == "jobs/job-epoch-test/job.json"
+            return json.dumps(remote_data).encode("utf-8")
+
+    pipe = pipeline.Pipeline.__new__(pipeline.Pipeline)
+    pipe.jobs = {}
+    pipe.jobs_dir = tmp_path / "jobs"
+    pipe._lock = __import__("threading").Lock()
+    monkeypatch.setitem(sys.modules, "storage", __import__("types").SimpleNamespace(storage=_Storage()))
+
+    job = pipeline.Pipeline.get_job(pipe, "job-epoch-test")
+
+    assert job.status == pipeline.JobStatus.READY
+    assert job.error is None
+    assert job.s3_model_key == "s3://pathnam-ai/models/job-epoch-test/checkpoint-epoch-9.zip"
+    saved = json.loads((Path(local_job.job_dir) / "job.json").read_text(encoding="utf-8"))
+    assert saved["status"] == "ready"
+
+
+def test_get_job_promotes_local_failed_job_when_checkpoint_exists_on_s3(tmp_path, monkeypatch):
+    job = _make_job(tmp_path, num_epochs=10)
+    job.job_dir = str(tmp_path / "jobs" / job.job_id)
+    job.status = pipeline.JobStatus.FAILED
+    job.error = "load failed after upload"
+    job.available_checkpoint_epochs = [9]
+    job.checkpoint_s3_keys = {"9": "s3://pathnam-ai/models/job-epoch-test/checkpoint-epoch-9.zip"}
+    job.s3_model_key = "s3://pathnam-ai/models/job-epoch-test/checkpoint-epoch-9.zip"
+    job.save()
+
+    class _Storage:
+        is_configured = True
+        has_read_backend = True
+
+        @staticmethod
+        def object_exists(key):
+            return key == "s3://pathnam-ai/models/job-epoch-test/checkpoint-epoch-9.zip"
+
+        @staticmethod
+        def download_bytes(_key):
+            raise AssertionError("remote job metadata should not be required")
+
+    pipe = pipeline.Pipeline.__new__(pipeline.Pipeline)
+    pipe.jobs = {}
+    pipe.jobs_dir = tmp_path / "jobs"
+    pipe._lock = __import__("threading").Lock()
+    monkeypatch.setitem(sys.modules, "storage", __import__("types").SimpleNamespace(storage=_Storage()))
+
+    resolved = pipeline.Pipeline.get_job(pipe, "job-epoch-test")
+
+    assert resolved.status == pipeline.JobStatus.READY
+    assert resolved.error is None
+    assert resolved.progress["stage"] == "ready"

@@ -344,7 +344,19 @@ async def _lifespan(app):
     session_mgr.start_cleanup_loop()
     metrics_collector.start()
     _log_flash_attn_runtime_diagnostics()
-    app.state.startup_preload_task = asyncio.create_task(_background_startup_preload_shared_models())
+    if STARTUP_PRELOAD_SHARED_MODELS:
+        app.state.startup_preload_task = asyncio.create_task(_background_startup_preload_shared_models())
+    else:
+        app.state.startup_preload_task = None
+        _set_startup_preload_state(
+            in_progress=False,
+            last_error="",
+            completed_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        )
+        ops_log.log_event(
+            "startup_preload_skipped",
+            extra={"reason": "STARTUP_PRELOAD_SHARED_MODELS=0", **_startup_preload_snapshot()},
+        )
     yield
     # Shutdown: disconnect broadcast
     await broadcast.disconnect()
@@ -530,6 +542,7 @@ CUSTOM_VOICE_SESSION_MAX_NEW_TOKENS_PER_CHAR = int(
     os.environ.get("CUSTOM_VOICE_SESSION_MAX_NEW_TOKENS_PER_CHAR", "4")
 )
 USE_TORCH_COMPILE = os.environ.get("USE_TORCH_COMPILE", "1") == "1"
+STARTUP_PRELOAD_SHARED_MODELS = os.environ.get("STARTUP_PRELOAD_SHARED_MODELS", "1") == "1"
 
 # Resource Isolation
 _allow_concurrent_val = os.environ.get("ALLOW_CONCURRENT_TRAINING_INFERENCE")
@@ -547,6 +560,9 @@ MAX_CONCURRENT_VOICE_DESIGNS = int(os.environ.get("MAX_CONCURRENT_VOICE_DESIGNS"
 BATCH_STORAGE_CONCURRENCY = int(os.environ.get("BATCH_STORAGE_CONCURRENCY", "8"))
 _configured_dataset_jobs = int(os.environ.get("MAX_CONCURRENT_DATASET_JOBS", "1"))
 MAX_CONCURRENT_DATASET_JOBS = max(1, min(3, _configured_dataset_jobs))
+TRAIN_BATCH_SIZE = int(os.environ.get("TRAIN_BATCH_SIZE", "1"))
+TRAIN_MAX_BATCH_SIZE = int(os.environ.get("TRAIN_MAX_BATCH_SIZE", str(TRAIN_BATCH_SIZE)))
+DATASET_PREP_BATCH_SIZE = int(os.environ.get("DATASET_PREP_BATCH_SIZE", "1"))
 DATASET_JOB_MIN_FREE_VRAM_GB = float(
     os.environ.get(
         "DATASET_JOB_MIN_FREE_VRAM_GB",
@@ -586,6 +602,7 @@ logger.info(
     f"{CUSTOM_VOICE_SESSION_MAX_NEW_TOKENS_PER_CHAR}"
 )
 logger.info(f"  - USE_TORCH_COMPILE: {USE_TORCH_COMPILE}")
+logger.info(f"  - STARTUP_PRELOAD_SHARED_MODELS: {STARTUP_PRELOAD_SHARED_MODELS}")
 logger.info(f"  - REPLICA_THRESHOLD: {REPLICA_THRESHOLD}")
 logger.info(f"  - MAX_CONCURRENT_VOICE_DESIGNS: {MAX_CONCURRENT_VOICE_DESIGNS}")
 logger.info(f"  - BATCH_STORAGE_CONCURRENCY: {BATCH_STORAGE_CONCURRENCY}")
@@ -596,6 +613,9 @@ if MAX_CONCURRENT_DATASET_JOBS != _configured_dataset_jobs:
         MAX_CONCURRENT_DATASET_JOBS,
     )
 logger.info(f"  - MAX_CONCURRENT_DATASET_JOBS: {MAX_CONCURRENT_DATASET_JOBS}")
+logger.info(f"  - TRAIN_BATCH_SIZE: {TRAIN_BATCH_SIZE}")
+logger.info(f"  - TRAIN_MAX_BATCH_SIZE: {TRAIN_MAX_BATCH_SIZE}")
+logger.info(f"  - DATASET_PREP_BATCH_SIZE: {DATASET_PREP_BATCH_SIZE}")
 logger.info(f"  - DATASET_JOB_MIN_FREE_VRAM_GB: {DATASET_JOB_MIN_FREE_VRAM_GB}")
 logger.info(f"  - DATASET_JOB_VRAM_WAIT_POLL_SEC: {DATASET_JOB_VRAM_WAIT_POLL_SEC}")
 logger.info(f"  - DATASET_JOB_VRAM_WAIT_TIMEOUT_SEC: {DATASET_JOB_VRAM_WAIT_TIMEOUT_SEC}")
@@ -1455,7 +1475,7 @@ class VoiceCloneBatchRequest(APIModel):
     @field_validator("ref_audio_url")
     @classmethod
     def validate_ref_audio_url(cls, value: str) -> str:
-        return _validate_http_url(value, "ref_audio_url")
+        return _normalize_storage_ref(value, "ref_audio_url")
 
     @field_validator("ref_text")
     @classmethod
@@ -1529,7 +1549,7 @@ class VoiceCloneRequest(APIModel):
     @field_validator("ref_audio_url")
     @classmethod
     def validate_ref_audio_url(cls, value: str) -> str:
-        return _validate_http_url(value, "ref_audio_url")
+        return _normalize_storage_ref(value, "ref_audio_url")
 
     @field_validator("ref_text")
     @classmethod
@@ -1571,7 +1591,7 @@ async def storage_status():
 class FinetuneRequest(APIModel):
     dataset_s3_key: str
     speaker_name: str
-    batch_size: int = 2
+    batch_size: int = TRAIN_BATCH_SIZE
     num_epochs: int = 15
     lr: float = 1e-6
     book_id: Optional[str] = None
@@ -1580,6 +1600,7 @@ class FinetuneRequest(APIModel):
     resume_job_id: Optional[str] = None
     job_id: Optional[str] = None
     force: bool = False
+    overwrite: bool = False
 
     @field_validator("dataset_s3_key")
     @classmethod
@@ -1602,8 +1623,8 @@ class FinetuneRequest(APIModel):
     @field_validator("batch_size")
     @classmethod
     def validate_batch_size(cls, value: int) -> int:
-        if value < 1 or value > 64:
-            raise ValueError("batch_size must be between 1 and 64")
+        if value < 1 or value > TRAIN_MAX_BATCH_SIZE:
+            raise ValueError(f"batch_size must be between 1 and {TRAIN_MAX_BATCH_SIZE}")
         return value
 
     @field_validator("num_epochs")
@@ -1780,20 +1801,22 @@ async def retry_job(job_id: str, req: Optional[FinetuneRequest] = None):
     If the job is not found in memory, disk, or S3, and a request body is provided,
     it will attempt to create a new job with the specified `job_id`.
     """
-    job = pipeline.retry_job(job_id)
-    if job:
-        # If it was already READY or safely transitioned (smart retry)
-        return JSONResponse(content=job.to_dict(), status_code=202 if job.status != JobStatus.READY else 200)
+    effective_force = bool(req and (req.force or req.overwrite))
+    if not effective_force:
+        job = pipeline.retry_job(job_id)
+        if job:
+            # If it was already READY or safely transitioned (smart retry)
+            return JSONResponse(content=job.to_dict(), status_code=202 if job.status != JobStatus.READY else 200)
 
     # Job not found OR not in a failed/cancelled state (e.g. QUEUED, TRAINING).
     if req:
         # User refinement: Only skip retry if it's currently active (QUEUED/TRAINING)
         existing = pipeline.get_job(job_id)
-        if existing and not req.force and existing.status in (JobStatus.QUEUED, JobStatus.TRAINING):
+        if existing and not effective_force and existing.status in (JobStatus.QUEUED, JobStatus.TRAINING):
             logger.info(f"Job {job_id} already active with status {existing.status}. Skipping restart.")
             return JSONResponse(content=existing.to_dict(), status_code=200)
             
-        logger.info(f"Retrying/Resurrecting job {job_id}. Status={existing.status if existing else 'None'}, Force={req.force}")
+        logger.info(f"Retrying/Resurrecting job {job_id}. Status={existing.status if existing else 'None'}, Force={effective_force}")
         # Re-use the creation logic but with our specific job_id
         # We need to handle the S3 download again here or refactor it.
         # For simplicity, we'll repeat the download logic since it's short.
@@ -3137,10 +3160,12 @@ async def gpu_status():
 async def gpu_unload():
     """Immediately unload the model from GPU to free VRAM."""
     was_loaded = pipeline.inference.is_loaded
-    pipeline.inference.unload()
+    snapshot = pipeline.inference.unload()
     return {
         "detail": "Model unloaded" if was_loaded else "No model was loaded",
-        "gpu_memory_allocated_gb": 0.0,
+        "gpu_memory_allocated_gb": round(snapshot.get("allocated_gb", 0.0), 2),
+        "gpu_memory_reserved_gb": round(snapshot.get("reserved_gb", 0.0), 2),
+        "gpu_memory_free_gb": round(snapshot.get("free_gb", 0.0), 2),
     }
 
 

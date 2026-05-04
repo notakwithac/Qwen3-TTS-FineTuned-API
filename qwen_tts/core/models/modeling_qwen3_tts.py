@@ -1757,11 +1757,15 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
             )
 
 
+        returned_hidden_states = outputs.hidden_states
+        if returned_hidden_states is None:
+            returned_hidden_states = (hidden_states,)
+
         return Qwen3TTSTalkerOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
-            hidden_states=(outputs.hidden_states, codec_ids),
+            hidden_states=(returned_hidden_states, codec_ids),
             attentions=outputs.attentions,
             past_hidden=hidden_states[:, -1:, :],
             generation_step=generation_step + 1,

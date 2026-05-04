@@ -25,13 +25,14 @@ import torch
 import time
 import logging
 from accelerate import Accelerator
+from cuda_cleanup import safe_cuda_cleanup
 from dataset import TTSDataset
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
 from safetensors.torch import save_file
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from transformers import AutoConfig, get_scheduler
+from transformers import Adafactor, AutoConfig, get_scheduler
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -40,6 +41,92 @@ except Exception:
 
 target_speaker_embedding = None
 DEFAULT_SAVE_FROM_EPOCH = 6
+ATTN_IMPLEMENTATION_CHOICES = ("eager", "sdpa", "flash_attention_2")
+TRAINABLE_SCOPE_CHOICES = ("full", "voice_embeddings", "voice_embeddings_and_heads")
+OPTIMIZER_CHOICES = ("adamw", "adafactor")
+
+
+def _matches_trainable_scope(name: str, scope: str) -> bool:
+    if scope == "full":
+        return True
+    if scope == "voice_embeddings":
+        return (
+            name.startswith("talker.model.codec_embedding")
+            or name.startswith("talker.code_predictor.model.codec_embedding")
+        )
+    if scope == "voice_embeddings_and_heads":
+        return (
+            name.startswith("talker.model.codec_embedding")
+            or name.startswith("talker.code_predictor.model.codec_embedding")
+            or name.startswith("talker.codec_head")
+            or name.startswith("talker.code_predictor.lm_head")
+            or name.startswith("talker.code_predictor.small_to_mtp_projection")
+        )
+    raise ValueError(f"Unknown trainable_scope: {scope}")
+
+
+def _configure_trainable_parameters(model, scope: str) -> list[torch.nn.Parameter]:
+    trainable_params = []
+    total_params = 0
+    trainable_count = 0
+    for name, param in model.named_parameters():
+        total_params += param.numel()
+        trainable = _matches_trainable_scope(name, scope)
+        param.requires_grad_(trainable)
+        if trainable:
+            trainable_params.append(param)
+            trainable_count += param.numel()
+
+    if not trainable_params:
+        raise ValueError(f"trainable_scope={scope!r} selected no parameters")
+
+    pct = (trainable_count / max(total_params, 1)) * 100.0
+    logging.getLogger(__name__).info(
+        "Training scope %s: trainable_params=%d total_params=%d trainable_pct=%.4f",
+        scope,
+        trainable_count,
+        total_params,
+        pct,
+    )
+    return trainable_params
+
+
+def _build_optimizer(params, args):
+    weight_decay = float(getattr(args, "weight_decay", 0.0))
+    optimizer_name = getattr(args, "optimizer", "adamw")
+    if optimizer_name == "adafactor":
+        return Adafactor(
+            params,
+            lr=args.lr,
+            scale_parameter=False,
+            relative_step=False,
+            warmup_init=False,
+            weight_decay=weight_decay,
+        )
+    return AdamW(params, lr=args.lr, weight_decay=weight_decay)
+
+
+def _resolve_attn_implementation(args) -> str:
+    attn_implementation = getattr(args, "attn_implementation", None)
+    if attn_implementation:
+        if attn_implementation not in ATTN_IMPLEMENTATION_CHOICES:
+            raise ValueError(
+                f"attn_implementation must be one of {', '.join(ATTN_IMPLEMENTATION_CHOICES)}"
+            )
+        return attn_implementation
+    return "flash_attention_2" if args.flash_attn else "eager"
+
+
+def _configure_training_memory(model, gradient_checkpointing: bool) -> None:
+    if not gradient_checkpointing:
+        return
+
+    if hasattr(model, "config"):
+        model.config.use_cache = False
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+    elif hasattr(model, "talker") and hasattr(model.talker, "gradient_checkpointing_enable"):
+        model.talker.gradient_checkpointing_enable()
 
 
 def _should_save_epoch(epoch_idx: int, save_from_epoch: int = DEFAULT_SAVE_FROM_EPOCH) -> bool:
@@ -174,6 +261,45 @@ def train():
         help="Enable FlashAttention-2 (default: enabled).",
     )
     parser.add_argument(
+        "--attn_implementation",
+        type=str,
+        default=None,
+        choices=ATTN_IMPLEMENTATION_CHOICES,
+        help="Override attention implementation: eager, sdpa, or flash_attention_2.",
+    )
+    parser.add_argument(
+        "--gradient-checkpointing/--no-gradient-checkpointing",
+        dest="gradient_checkpointing",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="Reduce activation VRAM by recomputing layers during backward.",
+    )
+    parser.add_argument(
+        "--trainable_scope",
+        type=str,
+        default="full",
+        choices=TRAINABLE_SCOPE_CHOICES,
+        help="Which model parameters to update during fine-tuning.",
+    )
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        default="adamw",
+        choices=OPTIMIZER_CHOICES,
+        help="Optimizer for trainable parameters.",
+    )
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--max_text_tokens", type=int, default=0)
+    parser.add_argument("--max_codec_tokens", type=int, default=0)
+    parser.add_argument("--max_total_tokens", type=int, default=0)
+    parser.add_argument(
+        "--output-hidden-states/--no-output-hidden-states",
+        dest="output_hidden_states",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="Return all decoder hidden states during training. Uses more VRAM.",
+    )
+    parser.add_argument(
         "--lr_scheduler",
         type=str,
         default="cosine",
@@ -235,7 +361,7 @@ def train():
             start_epoch = latest_epoch + 1
             resume_checkpoint = str(latest_ckpt)
 
-    attn_impl = "flash_attention_2" if args.flash_attn else "eager"
+    attn_impl = _resolve_attn_implementation(args)
     AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
     config_override = None
     config_path = Path(MODEL_PATH) / "config.json"
@@ -293,6 +419,8 @@ def train():
             else:
                 raise e
     config = config_override or AutoConfig.from_pretrained(MODEL_PATH)
+    _configure_training_memory(qwen3tts.model, args.gradient_checkpointing)
+    trainable_params = _configure_trainable_parameters(qwen3tts.model, args.trainable_scope)
 
     train_jsonl_path = Path(args.train_jsonl)
     train_base_dir = train_jsonl_path.parent
@@ -318,10 +446,17 @@ def train():
                 fallback = audio_parent / ref_audio_path
                 if fallback.exists():
                     item["ref_audio"] = str(fallback)
-    dataset = TTSDataset(train_data, qwen3tts.processor, config)
+    dataset = TTSDataset(
+        train_data,
+        qwen3tts.processor,
+        config,
+        max_text_tokens=args.max_text_tokens,
+        max_codec_tokens=args.max_codec_tokens,
+        max_total_tokens=args.max_total_tokens,
+    )
     train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate_fn)
 
-    optimizer = AdamW(qwen3tts.model.parameters(), lr=args.lr, weight_decay=0.01)
+    optimizer = _build_optimizer(trainable_params, args)
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / grad_accum_steps)
     max_train_steps = args.num_epochs * num_update_steps_per_epoch
     warmup_steps = args.warmup_steps
@@ -393,6 +528,7 @@ def train():
 
 
     for epoch in range(start_epoch, num_epochs):
+        epoch_started_at = time.time()
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(model):
 
@@ -429,7 +565,7 @@ def train():
                     inputs_embeds=input_embeddings,
                     attention_mask=attention_mask,
                     labels=codec_0_labels,
-                    output_hidden_states=True
+                    output_hidden_states=args.output_hidden_states,
                 )
                 # Use the timestep that predicts the next codec-0 token for sub-codec supervision.
                 hidden_states = outputs.hidden_states[0][-1][:, :-1, :]
@@ -461,6 +597,10 @@ def train():
         if accelerator.is_main_process and _should_save_epoch(epoch, save_from_epoch=args.save_from_epoch):
             _save_checkpoint(epoch)
 
+        safe_cuda_cleanup("end of cli training epoch", synchronize=True)
+        epoch_duration = time.time() - epoch_started_at
+        accelerator.print(f"Epoch {epoch} finished in {epoch_duration:.1f}s")
+
     if accelerator.is_main_process:
         final_epoch = num_epochs - 1
         if _needs_final_checkpoint(
@@ -489,7 +629,10 @@ def train_programmatic(
         config: Dict with keys matching CLI args:
             init_model_path, output_model_path, train_jsonl, batch_size,
             lr, num_epochs, speaker_name, save_interval, save_from_epoch, log_interval,
-            flash_attn, lr_scheduler, warmup_steps, warmup_ratio, resume.
+            flash_attn, attn_implementation, gradient_checkpointing, trainable_scope,
+            optimizer, weight_decay, max_text_tokens, max_codec_tokens,
+            max_total_tokens, output_hidden_states, lr_scheduler, warmup_steps,
+            warmup_ratio, resume.
         on_progress: Optional callback(info_dict) called each log_interval.
             info_dict has: epoch, step, loss, status ("training"|"saving"|"done").
     """
@@ -511,6 +654,15 @@ def train_programmatic(
         "resume": True,
         "accelerate_trackers": False,
         "flash_attn": True,
+        "attn_implementation": None,
+        "gradient_checkpointing": False,
+        "trainable_scope": "full",
+        "optimizer": "adamw",
+        "weight_decay": 0.01,
+        "max_text_tokens": 0,
+        "max_codec_tokens": 0,
+        "max_total_tokens": 0,
+        "output_hidden_states": False,
         "lr_scheduler": "cosine",
         "warmup_steps": 0,
         "warmup_ratio": 0.0,
@@ -558,7 +710,7 @@ def train_programmatic(
             start_epoch = latest_epoch + 1
             resume_checkpoint = str(latest_ckpt)
 
-    attn_impl = "flash_attention_2" if args.flash_attn else "eager"
+    attn_impl = _resolve_attn_implementation(args)
     AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
     config_override = None
     config_path = Path(MODEL_PATH) / "config.json"
@@ -591,6 +743,8 @@ def train_programmatic(
             else:
                 raise e
     model_config = config_override or AutoConfig.from_pretrained(MODEL_PATH)
+    _configure_training_memory(qwen3tts.model, args.gradient_checkpointing)
+    trainable_params = _configure_trainable_parameters(qwen3tts.model, args.trainable_scope)
 
     train_jsonl_path = Path(args.train_jsonl)
     train_base_dir = train_jsonl_path.parent
@@ -617,10 +771,17 @@ def train_programmatic(
                 if fallback.exists():
                     item["ref_audio"] = str(fallback)
 
-    dataset = TTSDataset(train_data, qwen3tts.processor, model_config)
+    dataset = TTSDataset(
+        train_data,
+        qwen3tts.processor,
+        model_config,
+        max_text_tokens=args.max_text_tokens,
+        max_codec_tokens=args.max_codec_tokens,
+        max_total_tokens=args.max_total_tokens,
+    )
     train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate_fn)
 
-    optimizer = AdamW(qwen3tts.model.parameters(), lr=args.lr, weight_decay=0.01)
+    optimizer = _build_optimizer(trainable_params, args)
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / grad_accum_steps)
     max_train_steps = args.num_epochs * num_update_steps_per_epoch
     warmup_steps = args.warmup_steps
@@ -692,6 +853,7 @@ def train_programmatic(
             json.dump({"next_epoch": epoch_idx + 1, "global_step": global_step}, f, indent=2)
 
     for epoch in range(start_epoch, num_epochs):
+        epoch_started_at = time.time()
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(model):
                 input_ids = batch['input_ids']
@@ -724,7 +886,7 @@ def train_programmatic(
                     inputs_embeds=input_embeddings,
                     attention_mask=attention_mask,
                     labels=codec_0_labels,
-                    output_hidden_states=True
+                    output_hidden_states=args.output_hidden_states
                 )
                 # Use the timestep that predicts the next codec-0 token for sub-codec supervision.
                 hidden_states = outputs.hidden_states[0][-1][:, :-1, :]
@@ -763,6 +925,10 @@ def train_programmatic(
                 on_progress({"status": "saving", "epoch": epoch, "total_epochs": num_epochs})
             _save_ckpt(epoch)
 
+        safe_cuda_cleanup("end of training epoch", synchronize=True)
+        epoch_duration = time.time() - epoch_started_at
+        accelerator.print(f"Epoch {epoch} finished in {epoch_duration:.1f}s")
+
     if accelerator.is_main_process:
         final_epoch = num_epochs - 1
         if _needs_final_checkpoint(
@@ -776,6 +942,9 @@ def train_programmatic(
     if tb_writer is not None:
         tb_writer.flush()
         tb_writer.close()
+
+    target_speaker_embedding = None
+    safe_cuda_cleanup("after programmatic training", synchronize=True)
 
     if on_progress:
         on_progress({"status": "done", "epoch": num_epochs - 1, "total_epochs": num_epochs})

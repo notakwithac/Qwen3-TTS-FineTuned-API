@@ -107,3 +107,70 @@ def test_job_save_creates_missing_job_directory(tmp_path):
     job.save()
 
     assert (job_dir / "job.json").exists()
+
+
+def test_forced_retry_recreates_failed_job_instead_of_returning_failed_json(tmp_path, monkeypatch):
+    _patch_startup_dependencies(monkeypatch)
+
+    existing = Job(
+        job_id="job-force-retry",
+        speaker_name="speaker_custom",
+        dataset_dir=str(tmp_path / "old" / "dataset"),
+        output_dir=str(tmp_path / "old" / "output"),
+        job_dir=str(tmp_path / "old"),
+    )
+    existing.status = JobStatus.FAILED
+    created_jobs = []
+    started_jobs = []
+
+    def fail_smart_retry(_job_id: str):
+        raise AssertionError("force=true should bypass pipeline.retry_job")
+
+    def get_job(job_id: str):
+        assert job_id == "job-force-retry"
+        return existing
+
+    def create_job(**kwargs):
+        job = Job(
+            job_id=kwargs["job_id"],
+            speaker_name=kwargs["speaker_name"],
+            dataset_dir=str(tmp_path / "new" / "dataset"),
+            output_dir=str(tmp_path / "new" / "output"),
+            job_dir=str(tmp_path / "new"),
+        )
+        job.status = JobStatus.QUEUED
+        created_jobs.append(kwargs)
+        return job
+
+    monkeypatch.setattr(api_server.pipeline, "retry_job", fail_smart_retry)
+    monkeypatch.setattr(api_server.pipeline, "get_job", get_job)
+    monkeypatch.setattr(api_server.pipeline, "create_job", create_job)
+    monkeypatch.setattr(api_server.pipeline, "start_job", lambda job_id: started_jobs.append(job_id))
+    monkeypatch.setattr(
+        api_server,
+        "storage",
+        SimpleNamespace(
+            is_configured=True,
+            download_file=lambda _key, path: open(path, "wb").write(b"zip"),
+        ),
+    )
+
+    with TestClient(api_server.app) as client:
+        response = client.post(
+            "/jobs/job-force-retry/retry",
+            json={
+                "dataset_s3_key": "datasets/book-1/char-1.zip",
+                "speaker_name": "speaker_custom",
+                "book_id": "book-1",
+                "chapter_id": "chapter-1",
+                "character_id": "char-1",
+                "force": True,
+                "overwrite": True,
+            },
+        )
+
+    assert response.status_code == 202
+    assert response.json()["job_id"] == "job-force-retry"
+    assert response.json()["status"] == "queued"
+    assert created_jobs[0]["job_id"] == "job-force-retry"
+    assert started_jobs == ["job-force-retry"]
