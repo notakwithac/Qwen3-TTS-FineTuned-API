@@ -8,6 +8,10 @@ services:
     image: qwen3-tts-api:local
     env_file:
       - .env
+    environment:
+      DOCKER_PRELOAD_SARVAM_TRANSLATE: ${DOCKER_PRELOAD_SARVAM_TRANSLATE:-0}
+      SARVAM_TRANSLATE_BACKEND: ${SARVAM_TRANSLATE_BACKEND:-openai}
+      SARVAM_TRANSLATE_BASE_URL: ${SARVAM_TRANSLATE_BASE_URL:-http://sarvam-translate:8000/v1}
     ports:
       - "8000:8000"
     gpus: all
@@ -21,10 +25,37 @@ services:
       - ./metrics:/app/metrics
       - ./runs:/app/runs
       - hf-cache:/root/.cache/huggingface
-    command: ["python", "-m", "uvicorn", "api_server:app", "--host", "0.0.0.0", "--port", "8000"]
+    command: ["/bin/bash", "/app/docker_start.sh"]
     depends_on:
       createbuckets:
         condition: service_completed_successfully
+
+  sarvam-translate:
+    image: vllm/vllm-openai:latest
+    profiles:
+      - translate
+    command:
+      - --model
+      - sarvamai/sarvam-translate
+      - --dtype
+      - bfloat16
+      - --max-model-len
+      - "8192"
+      - --gpu-memory-utilization
+      - "${SARVAM_TRANSLATE_GPU_MEMORY_UTILIZATION:-0.85}"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+    ports:
+      - "8001:8000"
+    gpus: all
+    networks:
+      - qwen-local
+    volumes:
+      - hf-cache:/root/.cache/huggingface
 
   minio:
     image: minio/minio:latest

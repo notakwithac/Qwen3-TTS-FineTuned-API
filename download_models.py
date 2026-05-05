@@ -6,8 +6,9 @@ Run this ONCE on the TIR instance to pre-cache all models before starting the AP
 This avoids download delays during fine-tuning or inference.
 
 Usage:
-    python download_models.py                    # download all
+    python download_models.py                    # download default Qwen TTS models
     python download_models.py --models base      # download only base
+    python download_models.py --models sarvam_translate  # download translation model
     python download_models.py --cache-dir /data/models  # custom cache dir
 
 Models downloaded:
@@ -15,6 +16,7 @@ Models downloaded:
     2. Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice   (~3.5 GB) — for custom voice inference
     3. Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign   (~3.5 GB) — for voice design inference
     4. Qwen/Qwen3-TTS-Tokenizer-12Hz          (~400 MB) — for audio tokenization
+    5. sarvamai/sarvam-translate              (~8 GB) — for /translate, opt-in
 """
 
 import argparse
@@ -35,21 +37,31 @@ MODELS = {
         "repo": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
         "desc": "Base model (for fine-tuning)",
         "size": "~3.5 GB",
+        "default": True,
     },
     "custom_voice": {
         "repo": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
         "desc": "CustomVoice model (inference with fine-tuned speakers)",
         "size": "~3.5 GB",
+        "default": True,
     },
     "voice_design": {
         "repo": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
         "desc": "VoiceDesign model (generate voices from text descriptions)",
         "size": "~3.5 GB",
+        "default": True,
     },
     "tokenizer": {
         "repo": "Qwen/Qwen3-TTS-Tokenizer-12Hz",
         "desc": "Audio tokenizer (data preparation)",
         "size": "~400 MB",
+        "default": True,
+    },
+    "sarvam_translate": {
+        "repo": "sarvamai/sarvam-translate",
+        "desc": "Sarvam-Translate model (text translation API)",
+        "size": "~8 GB",
+        "default": False,
     },
 }
 
@@ -103,7 +115,9 @@ def main():
     if args.hf_token:
         os.environ["HF_TOKEN"] = args.hf_token
 
-    models_to_download = list(MODELS.keys()) if "all" in args.models else args.models
+    models_to_download = [
+        name for name, info in MODELS.items() if info.get("default", True)
+    ] if "all" in args.models else args.models
 
     log.info(f"Downloading {len(models_to_download)} model(s)...")
     total_t0 = time.time()

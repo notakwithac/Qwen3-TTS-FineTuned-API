@@ -22,6 +22,9 @@
   - [POST /infer/{job_id}/batch](#post-inferjob_idbatch)
   - [POST /voice-design](#post-voice-design)
   - [POST /voice-clone/batch](#post-voice-clonebatch)
+- [Translation](#translation)
+  - [POST /translate](#post-translate)
+  - [GET /translate/status](#get-translatestatus)
 - [Resource Monitoring & Diagnostics](#resource-monitoring--diagnostics)
   - [GET /gpu/metrics](#get-gpumetrics)
   - [GET /gpu/metrics/history](#get-gpumetricshistory)
@@ -183,6 +186,61 @@ Notes:
 
 ---
 
+## Translation
+
+### POST /translate
+**Translate text with `sarvamai/sarvam-translate` from Hugging Face.**
+
+In Docker, `/translate` forwards to a separate OpenAI-compatible Sarvam service by default instead of loading the 4B model inside the Qwen API process. Start it with the compose profile:
+
+```bash
+docker compose --profile translate up --build
+```
+
+If the translate service is not running, `/translate` returns a controlled 503 instead of loading the model in-process. Sarvam-Translate is a Gemma3-4B BF16 model with an 8192-token context window, so the API checks `input_tokens + max_new_tokens` before generation.
+
+```bash
+curl -X POST "http://<TIR_GPU_IP>:8000/translate" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Be the change you wish to see in the world.",
+    "source_language": "English",
+    "target_language": "Hindi",
+    "max_new_tokens": 256
+  }'
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `text` | string | *required* | Text to translate |
+| `target_language` | string | *required* | One of the supported Sarvam languages |
+| `source_language` | string | `null` | Optional source language hint |
+| `max_new_tokens` | integer | `1024` | Output budget, capped by `SARVAM_TRANSLATE_MAX_NEW_TOKENS_LIMIT` |
+| `temperature` | number | `0.01` | Generation temperature |
+| `do_sample` | boolean | `true` | Matches the model-card quickstart default |
+
+Response:
+
+```json
+{
+  "text": "दुनिया में वह बदलाव बनें जो आप देखना चाहते हैं।",
+  "model_id": "sarvamai/sarvam-translate",
+  "source_language": "English",
+  "target_language": "Hindi",
+  "input_tokens": 28,
+  "output_tokens": 23,
+  "max_model_tokens": 8192,
+  "latency_seconds": 1.234
+}
+```
+
+Supported languages: `Assamese`, `Bengali`, `Bodo`, `Dogri`, `Gujarati`, `English`, `Hindi`, `Kannada`, `Kashmiri`, `Konkani`, `Maithili`, `Malayalam`, `Manipuri`, `Marathi`, `Nepali`, `Odia`, `Punjabi`, `Sanskrit`, `Santali`, `Sindhi`, `Tamil`, `Telugu`, `Urdu`.
+
+### GET /translate/status
+Returns lazy-load state, model ID, device, token caps, and supported language list.
+
+---
+
 ## Resource Monitoring & Diagnostics
 
 ### GET /gpu/metrics
@@ -285,6 +343,15 @@ Notes:
 | `VOICE_CLONE_REPLICAS` | `1` | Throughput-mode startup target for shared VoiceClone replicas. Prefer batching before increasing this target |
 | `SHARED_MODEL_MIN_HEADROOM_GB` | `4` | Minimum free VRAM headroom required before loading another shared replica |
 | `GPU_IDLE_TIMEOUT` | `0` | Throughput-mode recommendation for keeping the hot shared models resident. Use a larger value if you still want eventual idle unload |
+| `DOCKER_PRELOAD_SARVAM_TRANSLATE` | `0` | Docker-only optional cache pre-download in the API container; normally keep off because the `translate` profile owns the Sarvam model |
+| `SARVAM_TRANSLATE_MODEL_ID` | `sarvamai/sarvam-translate` | Hugging Face translation model repo |
+| `SARVAM_TRANSLATE_BACKEND` | `openai` in Docker, `local` otherwise | Use `openai` to forward to vLLM/OpenAI-compatible service, or `local` for in-process loading |
+| `SARVAM_TRANSLATE_BASE_URL` | `http://sarvam-translate:8000/v1` in Docker | OpenAI-compatible translation backend URL |
+| `SARVAM_TRANSLATE_DEVICE` | `DEVICE` | Device for the local translator when `SARVAM_TRANSLATE_DEVICE_MAP` is unset |
+| `SARVAM_TRANSLATE_DEVICE_MAP` | unset | Optional accelerate device map, e.g. `auto`, for multi-GPU/offload loading |
+| `SARVAM_TRANSLATE_MAX_MODEL_TOKENS` | `8192` | Hard context-window budget enforced as input tokens plus output budget |
+| `SARVAM_TRANSLATE_DEFAULT_MAX_NEW_TOKENS` | `1024` | Default output token budget for `/translate` |
+| `SARVAM_TRANSLATE_MAX_NEW_TOKENS_LIMIT` | `2048` | Per-request output token cap |
 | `E2E_BUCKET` | `qwen3-tts` | Default S3 bucket |
 
 **Throughput-mode guidance:**

@@ -14,6 +14,7 @@ import asyncio
 import base64
 import threading
 import torch
+import requests
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -34,6 +35,7 @@ from session_manager import (
 )
 from metrics_collector import metrics_collector
 from gpu_resource_controller import GPUResourceController
+from sarvam_translate import SUPPORTED_SARVAM_LANGUAGES, SarvamTranslateService
 from dataset_jobs import (
     load_existing_package_result,
     load_existing_prepare_result,
@@ -574,6 +576,23 @@ DATASET_JOB_VRAM_WAIT_TIMEOUT_SEC = float(os.environ.get("DATASET_JOB_VRAM_WAIT_
 VOICE_DESIGN_REPLICAS = int(os.environ.get("VOICE_DESIGN_REPLICAS", "1"))
 VOICE_CLONE_REPLICAS = int(os.environ.get("VOICE_CLONE_REPLICAS", "1"))
 SHARED_MODEL_MIN_HEADROOM_GB = float(os.environ.get("SHARED_MODEL_MIN_HEADROOM_GB", "4"))
+SARVAM_TRANSLATE_MODEL_ID = os.environ.get("SARVAM_TRANSLATE_MODEL_ID", "sarvamai/sarvam-translate")
+SARVAM_TRANSLATE_BACKEND = os.environ.get("SARVAM_TRANSLATE_BACKEND", "local").lower()
+SARVAM_TRANSLATE_BASE_URL = os.environ.get("SARVAM_TRANSLATE_BASE_URL") or None
+SARVAM_TRANSLATE_API_KEY = os.environ.get("SARVAM_TRANSLATE_API_KEY") or None
+SARVAM_TRANSLATE_DEVICE = os.environ.get("SARVAM_TRANSLATE_DEVICE", DEVICE)
+SARVAM_TRANSLATE_DTYPE = os.environ.get("SARVAM_TRANSLATE_DTYPE", "auto")
+SARVAM_TRANSLATE_DEVICE_MAP = os.environ.get("SARVAM_TRANSLATE_DEVICE_MAP") or None
+SARVAM_TRANSLATE_MAX_MODEL_TOKENS = int(os.environ.get("SARVAM_TRANSLATE_MAX_MODEL_TOKENS", "8192"))
+SARVAM_TRANSLATE_DEFAULT_MAX_NEW_TOKENS = int(
+    os.environ.get("SARVAM_TRANSLATE_DEFAULT_MAX_NEW_TOKENS", "1024")
+)
+SARVAM_TRANSLATE_MAX_NEW_TOKENS_LIMIT = int(
+    os.environ.get("SARVAM_TRANSLATE_MAX_NEW_TOKENS_LIMIT", "2048")
+)
+SARVAM_TRANSLATE_REQUEST_TIMEOUT_SECONDS = float(
+    os.environ.get("SARVAM_TRANSLATE_REQUEST_TIMEOUT_SECONDS", "120")
+)
 
 logger.info(f"Loaded Configuration:")
 logger.info(f"  - DEVICE: {DEVICE}")
@@ -622,6 +641,12 @@ logger.info(f"  - DATASET_JOB_VRAM_WAIT_TIMEOUT_SEC: {DATASET_JOB_VRAM_WAIT_TIME
 logger.info(f"  - VOICE_DESIGN_REPLICAS: {VOICE_DESIGN_REPLICAS}")
 logger.info(f"  - VOICE_CLONE_REPLICAS: {VOICE_CLONE_REPLICAS}")
 logger.info(f"  - SHARED_MODEL_MIN_HEADROOM_GB: {SHARED_MODEL_MIN_HEADROOM_GB}")
+logger.info(f"  - SARVAM_TRANSLATE_MODEL_ID: {SARVAM_TRANSLATE_MODEL_ID}")
+logger.info(f"  - SARVAM_TRANSLATE_BACKEND: {SARVAM_TRANSLATE_BACKEND}")
+logger.info(f"  - SARVAM_TRANSLATE_BASE_URL: {SARVAM_TRANSLATE_BASE_URL}")
+logger.info(f"  - SARVAM_TRANSLATE_DEVICE: {SARVAM_TRANSLATE_DEVICE}")
+logger.info(f"  - SARVAM_TRANSLATE_DTYPE: {SARVAM_TRANSLATE_DTYPE}")
+logger.info(f"  - SARVAM_TRANSLATE_MAX_MODEL_TOKENS: {SARVAM_TRANSLATE_MAX_MODEL_TOKENS}")
 logger.info(f"  - MAX_REPLICAS_PER_MODEL: {MAX_REPLICAS_PER_MODEL}")
 logger.info(f"  - SESSION_TIMEOUT: {SESSION_TIMEOUT}s")
 
@@ -756,6 +781,21 @@ voice_clone_batcher = DynamicBatcher(
     timeout_ms=100,
     process_fn=pipeline.inference.generate_voice_clone_flexible_batch,
     max_workers=1
+)
+
+sarvam_translator = SarvamTranslateService(
+    model_id=SARVAM_TRANSLATE_MODEL_ID,
+    backend=SARVAM_TRANSLATE_BACKEND,
+    base_url=SARVAM_TRANSLATE_BASE_URL,
+    api_key=SARVAM_TRANSLATE_API_KEY,
+    device=SARVAM_TRANSLATE_DEVICE,
+    dtype=SARVAM_TRANSLATE_DTYPE,
+    device_map=SARVAM_TRANSLATE_DEVICE_MAP,
+    max_model_tokens=SARVAM_TRANSLATE_MAX_MODEL_TOKENS,
+    default_max_new_tokens=SARVAM_TRANSLATE_DEFAULT_MAX_NEW_TOKENS,
+    max_new_tokens_limit=SARVAM_TRANSLATE_MAX_NEW_TOKENS_LIMIT,
+    request_timeout_seconds=SARVAM_TRANSLATE_REQUEST_TIMEOUT_SECONDS,
+    gpu_controller=gpu_controller,
 )
 
 custom_voice_batchers = {}  # Map (job_id, checkpoint_path, generation_config) -> DynamicBatcher
@@ -1162,6 +1202,66 @@ class DatasetJobStatusResponse(APIModel):
 class VoiceDesignResponse(AudioS3Result):
     job_id: str = "voice_design"
     instruct: str
+
+
+class TranslateRequest(APIModel):
+    text: str
+    target_language: str
+    source_language: Optional[str] = None
+    max_new_tokens: Optional[int] = None
+    temperature: float = 0.01
+    do_sample: bool = True
+
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        return _normalize_text(value, "text", MAX_TEXT_LENGTH)
+
+    @field_validator("target_language", "source_language")
+    @classmethod
+    def validate_language(cls, value: Optional[str], info) -> Optional[str]:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            if info.field_name == "target_language":
+                raise ValueError("target_language cannot be empty")
+            return None
+        if value not in SUPPORTED_SARVAM_LANGUAGES:
+            raise ValueError(
+                f"{info.field_name} must be one of: "
+                f"{', '.join(sorted(SUPPORTED_SARVAM_LANGUAGES))}"
+            )
+        return value
+
+    @field_validator("max_new_tokens")
+    @classmethod
+    def validate_max_new_tokens(cls, value: Optional[int]) -> Optional[int]:
+        if value is not None and value <= 0:
+            raise ValueError("max_new_tokens must be > 0")
+        if value is not None and value > SARVAM_TRANSLATE_MAX_NEW_TOKENS_LIMIT:
+            raise ValueError(
+                f"max_new_tokens exceeds limit of {SARVAM_TRANSLATE_MAX_NEW_TOKENS_LIMIT}"
+            )
+        return value
+
+    @field_validator("temperature")
+    @classmethod
+    def validate_temperature(cls, value: float) -> float:
+        if value <= 0 or value > 2:
+            raise ValueError("temperature must be in (0, 2]")
+        return value
+
+
+class TranslateResponse(APIModel):
+    text: str
+    model_id: str
+    source_language: Optional[str] = None
+    target_language: str
+    input_tokens: int
+    output_tokens: int
+    max_model_tokens: int
+    latency_seconds: float
 
 
 class InferRequest(APIModel):
@@ -1587,6 +1687,78 @@ async def storage_status():
         "endpoint": storage.endpoint_url,
         "bucket": storage.bucket,
     }
+
+
+@app.get("/translate/status", summary="Sarvam-Translate runtime status")
+async def translate_status():
+    """Check Sarvam-Translate model configuration and lazy-load status."""
+    return sarvam_translator.status()
+
+
+@app.post(
+    "/translate",
+    summary="Translate text with Sarvam-Translate",
+    response_model=TranslateResponse,
+)
+async def translate(req: TranslateRequest):
+    """Translate text with sarvamai/sarvam-translate.
+
+    The model is downloaded from Hugging Face on first use and kept resident in
+    memory. Requests are rejected before generation if prompt tokens plus
+    `max_new_tokens` would exceed the configured 8k context window.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        with ops_log.operation(
+            "sarvam_translate_api",
+            extra={
+                "text_length": len(req.text),
+                "source_language": req.source_language,
+                "target_language": req.target_language,
+                "max_new_tokens": req.max_new_tokens,
+                "temperature": req.temperature,
+                "do_sample": req.do_sample,
+            },
+        ):
+            result = await loop.run_in_executor(
+                None,
+                partial(
+                    sarvam_translator.translate,
+                    text=req.text,
+                    source_language=req.source_language,
+                    target_language=req.target_language,
+                    max_new_tokens=req.max_new_tokens,
+                    temperature=req.temperature,
+                    do_sample=req.do_sample,
+                ),
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except requests.exceptions.ConnectionError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Sarvam translation backend is not reachable. "
+                "Start the Docker translate profile or set SARVAM_TRANSLATE_BASE_URL."
+            ),
+        )
+    except requests.exceptions.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"Sarvam translation backend failed: {exc}")
+    except Exception as exc:
+        logger.exception("Sarvam-Translate request failed")
+        raise HTTPException(status_code=500, detail=f"Translation failed: {exc}")
+
+    return {
+        "text": result.text,
+        "model_id": result.model_id,
+        "source_language": result.source_language,
+        "target_language": result.target_language,
+        "input_tokens": result.input_tokens,
+        "output_tokens": result.output_tokens,
+        "max_model_tokens": result.max_model_tokens,
+        "latency_seconds": result.latency_seconds,
+    }
+
 
 class FinetuneRequest(APIModel):
     dataset_s3_key: str
