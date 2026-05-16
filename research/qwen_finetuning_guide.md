@@ -111,6 +111,12 @@ train17.bat
 uv run qwen-tts-demo runs/run1/checkpoint-epoch-10 --ip 0.0.0.0 --port 8001
 ```
 
+### Experimental SonoEdit Pronunciation Edits
+
+SonoEdit-style model edits must be applied only after fine-tuning is complete and only to a copied checkpoint. The experimental implementation in `research/sonoedit_qwen3_tts` targets `talker.model.layers` projection weights and writes `sonoedit_metadata.json` beside every edited checkpoint.
+
+Promotion rule: use an edited checkpoint only when target pronunciation examples improve in manual or automated review, preservation samples do not materially regress, and speaker identity remains unchanged for the intended voice mode. Store the source-vs-edited `results.jsonl` eval artifact with the edited checkpoint before serving it.
+
 ---
 
 ## ⚡ Phase 5: Production API (Recommended)
