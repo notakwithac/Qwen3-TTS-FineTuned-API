@@ -1,0 +1,16 @@
+.git
+.github
+.venv
+__pycache__
+.pytest_cache
+.uv-cache
+*.pyc
+*.wav
+logs
+metrics
+runs
+jobs
+research
+learnings
+gared_voice_qwen3_tts_dataset
+qwen_tts.egg-info

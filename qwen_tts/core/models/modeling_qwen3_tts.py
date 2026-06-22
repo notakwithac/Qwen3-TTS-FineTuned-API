@@ -52,6 +52,21 @@ from .configuration_qwen3_tts import (Qwen3TTSConfig,
 logger = logging.get_logger(__name__)
 
 
+def _reshape_speaker_embed_for_prefix(speaker_embed: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """Normalize speaker embeddings to [batch=1, speaker_tokens, hidden]."""
+    if speaker_embed is None:
+        return None
+    if speaker_embed.dim() == 1:
+        return speaker_embed.unsqueeze(0).unsqueeze(0)
+    if speaker_embed.dim() == 2:
+        return speaker_embed.unsqueeze(0)
+    if speaker_embed.dim() == 3:
+        return speaker_embed
+    raise ValueError(
+        f"Unsupported speaker embedding shape for prefix construction: {tuple(speaker_embed.shape)}"
+    )
+
+
 def download_weights_from_hf_specific(
     model_name_or_path: str,
     cache_dir: str | None,
@@ -1239,7 +1254,12 @@ class Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(Qwen3TTSPreTraine
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            import torch.nn.functional as F
+            loss = F.cross_entropy(
+                logits.reshape(-1, self.config.vocab_size),
+                labels.reshape(-1),
+                ignore_index=-100,
+            )
 
         return Qwen3TTSTalkerCodePredictorOutputWithPast(
             loss=loss,
@@ -1728,14 +1748,24 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            import torch.nn.functional as F
+            shift_labels = F.pad(labels, (0, 1), value=-100)[..., 1:].contiguous()
+            loss = F.cross_entropy(
+                logits.reshape(-1, self.config.vocab_size),
+                shift_labels.reshape(-1),
+                ignore_index=-100,
+            )
 
+
+        returned_hidden_states = outputs.hidden_states
+        if returned_hidden_states is None:
+            returned_hidden_states = (hidden_states,)
 
         return Qwen3TTSTalkerOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
-            hidden_states=(outputs.hidden_states, codec_ids),
+            hidden_states=(returned_hidden_states, codec_ids),
             attentions=outputs.attentions,
             past_hidden=hidden_states[:, -1:, :],
             generation_step=generation_step + 1,
@@ -2028,7 +2058,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         languages: list[str] = None,
         speakers: list[str] = None,
         non_streaming_mode = False,
-        max_new_tokens: int = 4096,
+        max_new_tokens: Optional[int] = None,
         do_sample: bool = True,
         top_k: int = 50,
         top_p: float = 1.0,
@@ -2042,7 +2072,6 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         **kwargs,
     ):
         talker_kwargs = {
-            "max_new_tokens": max_new_tokens,
             "min_new_tokens": 2,
             "do_sample": do_sample,
             "top_k": top_k,
@@ -2064,6 +2093,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             "output_hidden_states": getattr(kwargs, "output_hidden_states", True),
             "return_dict_in_generate": getattr(kwargs, "return_dict_in_generate", True)
         }
+        if max_new_tokens is not None:
+            talker_kwargs["max_new_tokens"] = max_new_tokens
         
         talker_input_embeds = [[] for _ in range(len(input_ids))]
 
@@ -2136,6 +2167,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                     else:
                         speaker_embed = None
 
+                speaker_embed = _reshape_speaker_embed_for_prefix(speaker_embed)
+
                 assert language is not None
 
                 if language.lower() == "auto":
@@ -2189,7 +2222,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                                                     codec_input_emebdding_1], dim=1)
                 else:
                     codec_input_emebdding = torch.cat([codec_input_emebdding_0,
-                                                    speaker_embed.view(1, 1, -1),
+                                                    speaker_embed,
                                                     codec_input_emebdding_1], dim=1)
 
                 # tts_pad * 4 + tts_bos

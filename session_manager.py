@@ -31,6 +31,17 @@ DEFAULT_REPLICA_THRESHOLD = 500   # Lines before adding a replica
 DEFAULT_MAX_REPLICAS = 4          # Max replicas of one model
 DEFAULT_SESSION_TIMEOUT = 3600    # Auto-cleanup after 1h idle
 MODEL_VRAM_GB = 5.5               # Measured per-model VRAM (bf16 weights + compiled overhead)
+DEFAULT_BATCH_TEXT_BUDGET = int(os.environ.get("SESSION_BATCH_MAX_CHARS", "4000"))
+DEFAULT_BATCH_PADDED_TEXT_BUDGET = int(os.environ.get("SESSION_BATCH_MAX_PADDED_CHARS", "0"))
+DEFAULT_CUSTOM_SESSION_MAX_NEW_TOKENS = int(
+    os.environ.get("CUSTOM_VOICE_SESSION_MAX_NEW_TOKENS", "1536")
+)
+DEFAULT_CUSTOM_SESSION_MIN_NEW_TOKENS = int(
+    os.environ.get("CUSTOM_VOICE_SESSION_MIN_NEW_TOKENS", "512")
+)
+DEFAULT_CUSTOM_SESSION_MAX_NEW_TOKENS_PER_CHAR = int(
+    os.environ.get("CUSTOM_VOICE_SESSION_MAX_NEW_TOKENS_PER_CHAR", "4")
+)
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +55,18 @@ class SessionStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+class DuplicateActiveSessionError(ValueError):
+    """Raised when the same chapter/job workload is already active."""
+
+    def __init__(self, message: str, active_session_id: str):
+        super().__init__(message)
+        self.active_session_id = active_session_id
+
+
+class TrainingConflictError(RuntimeError):
+    """Raised when exclusive GPU training blocks session preparation."""
 
 
 @dataclass
@@ -121,6 +144,13 @@ class CharacterWorker:
         speaker_name: str,
         batch_size: int = 32,
         batch_timeout_ms: int = 100,
+        batch_text_budget: int = DEFAULT_BATCH_TEXT_BUDGET,
+        batch_padded_text_budget: int = DEFAULT_BATCH_PADDED_TEXT_BUDGET,
+        initial_batch_size: int = 1,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
+        min_new_tokens: int = DEFAULT_CUSTOM_SESSION_MIN_NEW_TOKENS,
+        max_new_tokens: int = DEFAULT_CUSTOM_SESSION_MAX_NEW_TOKENS,
+        max_new_tokens_per_char: int = DEFAULT_CUSTOM_SESSION_MAX_NEW_TOKENS_PER_CHAR,
         storage=None,
         progress: Optional[CharacterProgress] = None,
     ):
@@ -132,11 +162,80 @@ class CharacterWorker:
         self.speaker_name = speaker_name
         self.batch_size = batch_size
         self.batch_timeout = batch_timeout_ms / 1000.0
+        self.batch_text_budget = max(0, int(batch_text_budget or 0))
+        self.batch_padded_text_budget = max(0, int(batch_padded_text_budget or 0))
+        self.initial_batch_size = max(1, min(int(initial_batch_size or batch_size), batch_size))
+        self.generation_kwargs = dict(generation_kwargs or {})
+        self.min_new_tokens = max(0, int(min_new_tokens or 0))
+        self.max_new_tokens = max(0, int(max_new_tokens or 0))
+        self.max_new_tokens_per_char = max(0, int(max_new_tokens_per_char or 0))
         self.storage = storage
         self.progress = progress or CharacterProgress()
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self._in_batch = False
+        self._first_batch_pending = True
+
+    @staticmethod
+    def _message_text_cost(msg: InferenceMessage) -> int:
+        return max(
+            1,
+            len((msg.text or "").strip()) + len((msg.instruct or "").strip()),
+        )
+
+    @staticmethod
+    def _estimate_padded_batch_cost(batch_size: int, batch_max_text_cost: int) -> int:
+        if batch_size <= 0 or batch_max_text_cost <= 0:
+            return 0
+        return batch_size * batch_max_text_cost
+
+    def _should_defer_message(
+        self,
+        batch: List[InferenceMessage],
+        batch_text_cost: int,
+        batch_max_text_cost: int,
+        msg: InferenceMessage,
+        batch_size_limit: int,
+    ) -> bool:
+        if len(batch) >= batch_size_limit:
+            return True
+        msg_cost = self._message_text_cost(msg)
+        # Always allow the first item in a batch, even if it exceeds the budget.
+        if not batch:
+            return False
+        if self.batch_text_budget > 0 and (batch_text_cost + msg_cost) > self.batch_text_budget:
+            return True
+        if self.batch_padded_text_budget > 0:
+            next_max_text_cost = max(batch_max_text_cost, msg_cost)
+            next_padded_cost = self._estimate_padded_batch_cost(len(batch) + 1, next_max_text_cost)
+            if next_padded_cost > self.batch_padded_text_budget:
+                return True
+        return False
+
+    def _current_batch_size_limit(self) -> int:
+        if self._first_batch_pending:
+            return self.initial_batch_size
+        return self.batch_size
+
+    @staticmethod
+    def _message_output_text_chars(msg: InferenceMessage) -> int:
+        return max(1, len((msg.text or "").strip()))
+
+    def _build_generation_kwargs(self, batch: List[InferenceMessage]) -> Dict[str, Any]:
+        kwargs = dict(self.generation_kwargs)
+        if batch and (self.max_new_tokens > 0 or self.max_new_tokens_per_char > 0):
+            max_text_chars = max(self._message_output_text_chars(msg) for msg in batch)
+            derived_limit = self.min_new_tokens
+            if self.max_new_tokens_per_char > 0:
+                derived_limit = max(
+                    derived_limit,
+                    max_text_chars * self.max_new_tokens_per_char,
+                )
+            if self.max_new_tokens > 0:
+                derived_limit = min(derived_limit, self.max_new_tokens)
+            if derived_limit > 0:
+                kwargs["max_new_tokens"] = derived_limit
+        return kwargs
 
     def start(self):
         """Start the worker coroutine."""
@@ -157,9 +256,17 @@ class CharacterWorker:
                 
         if self._task and not self._task.done():
             # Only cancel if it's polling the queue and NOT in the middle of a GPU generation.
-            # Cancelling mid-generation drops the results and aborts the S3 upload.
-            if getattr(self, '_in_batch', False):
-                logger.info(f"Worker {self.worker_id} detaching to finish active batch in background")
+            # When a batch is active we must wait for inference + upload to complete; otherwise
+            # an eager session teardown can race the caller and make "submit then delete" lose audio.
+            if getattr(self, "_in_batch", False):
+                logger.info(
+                    "Worker %s waiting for active batch to finish before stopping",
+                    self.worker_id,
+                )
+                try:
+                    await self._task
+                except asyncio.CancelledError:
+                    pass
             else:
                 self._task.cancel()
                 try:
@@ -171,14 +278,23 @@ class CharacterWorker:
     async def _run(self):
         """Main worker loop: pull from queue → batch → infer → upload."""
         loop = asyncio.get_running_loop()
+        carryover_msg: Optional[InferenceMessage] = None
 
         while self._running:
             batch: List[InferenceMessage] = []
+            batch_text_cost = 0
+            batch_max_text_cost = 0
 
             try:
                 # 1. Block until at least one item is available
-                msg = await asyncio.wait_for(self.queue.get(), timeout=5.0)
+                if carryover_msg is not None:
+                    msg = carryover_msg
+                    carryover_msg = None
+                else:
+                    msg = await asyncio.wait_for(self.queue.get(), timeout=5.0)
                 batch.append(msg)
+                batch_text_cost = self._message_text_cost(msg)
+                batch_max_text_cost = batch_text_cost
             except asyncio.TimeoutError:
                 continue  # No work, loop back
             except asyncio.CancelledError:
@@ -189,15 +305,28 @@ class CharacterWorker:
             async with self.worker_semaphore:
                 # 3. Drain the queue as much as possible while holding the slot
                 while self._running:
+                    batch_size_limit = self._current_batch_size_limit()
                     # Fill the batch up to batch_size
                     deadline = time.monotonic() + self.batch_timeout
-                    while len(batch) < self.batch_size:
+                    while len(batch) < batch_size_limit:
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             break
                         try:
                             msg = await asyncio.wait_for(self.queue.get(), timeout=remaining)
+                            if self._should_defer_message(
+                                batch,
+                                batch_text_cost,
+                                batch_max_text_cost,
+                                msg,
+                                batch_size_limit,
+                            ):
+                                carryover_msg = msg
+                                break
                             batch.append(msg)
+                            msg_cost = self._message_text_cost(msg)
+                            batch_text_cost += msg_cost
+                            batch_max_text_cost = max(batch_max_text_cost, msg_cost)
                         except asyncio.TimeoutError:
                             break
                         except asyncio.CancelledError:
@@ -206,6 +335,15 @@ class CharacterWorker:
                     if batch:
                         await self._process_batch(batch, loop)
                         batch.clear()
+                        batch_text_cost = 0
+                        batch_max_text_cost = 0
+
+                    if carryover_msg is not None:
+                        batch.append(carryover_msg)
+                        batch_text_cost = self._message_text_cost(carryover_msg)
+                        batch_max_text_cost = batch_text_cost
+                        carryover_msg = None
+                        continue
 
                     # Check if more items are queued
                     # Use a tiny timeout to briefly wait in case orchestrator is slightly behind,
@@ -213,6 +351,8 @@ class CharacterWorker:
                     try:
                         msg = await asyncio.wait_for(self.queue.get(), timeout=0.25)
                         batch.append(msg)
+                        batch_text_cost = self._message_text_cost(msg)
+                        batch_max_text_cost = batch_text_cost
                     except (asyncio.TimeoutError, asyncio.CancelledError):
                         break  # Queue is empty, yield the semaphore slot
 
@@ -225,11 +365,21 @@ class CharacterWorker:
             texts = [m.text for m in batch]
             languages = [m.language for m in batch]
             instructs = [m.instruct for m in batch]
+            generation_kwargs = self._build_generation_kwargs(batch)
 
             op = ops_log.start("session_worker_batch", extra={
                 "worker_id": self.worker_id,
                 "batch_size": len(batch),
+                "batch_text_chars": sum(self._message_text_cost(msg) for msg in batch),
+                "batch_max_text_chars": max(self._message_text_cost(msg) for msg in batch),
+                "batch_padded_text_chars": self._estimate_padded_batch_cost(
+                    len(batch),
+                    max(self._message_text_cost(msg) for msg in batch),
+                ),
                 "cache_key": self.cache_key,
+                "first_batch_mode": self._first_batch_pending,
+                "max_new_tokens": generation_kwargs.get("max_new_tokens"),
+                "do_sample": generation_kwargs.get("do_sample"),
             })
 
             try:
@@ -242,6 +392,7 @@ class CharacterWorker:
                         speaker_name=self.speaker_name,
                         languages=languages,
                         instructs=instructs,
+                        **generation_kwargs,
                     )
                 )
 
@@ -262,7 +413,8 @@ class CharacterWorker:
                         self.progress.completed += 1
 
                 if upload_tasks:
-                    await asyncio.gather(*upload_tasks)
+                    for upload_task in asyncio.as_completed(upload_tasks):
+                        await upload_task
 
                 ops_log.end(op, extra={"completed": len(batch)})
 
@@ -271,6 +423,7 @@ class CharacterWorker:
                 ops_log.fail(op, str(e))
                 self.progress.failed += len(batch)
         finally:
+            self._first_batch_pending = False
             self._in_batch = False
 
     async def _upload_single(
@@ -331,10 +484,12 @@ class Session:
         session_id: str,
         book_id: str = "",
         chapter_id: str = "",
+        requested_job_ids: Optional[List[str]] = None,
     ):
         self.session_id = session_id
         self.book_id = book_id
         self.chapter_id = chapter_id
+        self.requested_job_ids = tuple(sorted(requested_job_ids or []))
         self.status = SessionStatus.PREPARING
         self.created_at = time.time()
         self.last_active = time.time()
@@ -352,6 +507,10 @@ class Session:
 
     def touch(self):
         self.last_active = time.time()
+
+    @property
+    def queued_items(self) -> int:
+        return sum(q.qsize() for q in self.character_queues.values())
 
     @property
     def completed_lines(self) -> int:
@@ -395,6 +554,7 @@ class Session:
             "characters": characters,
             "error": self.error,
             "created_at": self.created_at,
+            "requested_job_ids": list(self.requested_job_ids),
         }
 
     def get_all_results(self) -> list:
@@ -425,6 +585,12 @@ class SessionManager:
         max_replicas: int = DEFAULT_MAX_REPLICAS,
         session_timeout: int = DEFAULT_SESSION_TIMEOUT,
         batch_size: int = 32,
+        batch_text_budget: int = DEFAULT_BATCH_TEXT_BUDGET,
+        batch_padded_text_budget: int = DEFAULT_BATCH_PADDED_TEXT_BUDGET,
+        custom_generation_kwargs: Optional[Dict[str, Any]] = None,
+        custom_min_new_tokens: int = DEFAULT_CUSTOM_SESSION_MIN_NEW_TOKENS,
+        custom_max_new_tokens: int = DEFAULT_CUSTOM_SESSION_MAX_NEW_TOKENS,
+        custom_max_new_tokens_per_char: int = DEFAULT_CUSTOM_SESSION_MAX_NEW_TOKENS_PER_CHAR,
     ):
         self.inference = inference_manager
         self.pipeline = pipeline
@@ -433,6 +599,12 @@ class SessionManager:
         self.max_replicas = max_replicas
         self.session_timeout = session_timeout
         self.batch_size = batch_size
+        self.batch_text_budget = max(0, int(batch_text_budget or 0))
+        self.batch_padded_text_budget = max(0, int(batch_padded_text_budget or 0))
+        self.custom_generation_kwargs = dict(custom_generation_kwargs or {})
+        self.custom_min_new_tokens = max(0, int(custom_min_new_tokens or 0))
+        self.custom_max_new_tokens = max(0, int(custom_max_new_tokens or 0))
+        self.custom_max_new_tokens_per_char = max(0, int(custom_max_new_tokens_per_char or 0))
         self.sessions: Dict[str, Session] = {}
 
         # Limit active workers to max_models to prevent cache thrashing
@@ -465,7 +637,10 @@ class SessionManager:
     # -- Replica Calculation --------------------------------------------------
 
     def _calculate_replicas(
-        self, characters: list, available_vram_gb: float,
+        self,
+        characters: list,
+        available_vram_gb: float,
+        additional_replica_slots: int = 0,
     ) -> Dict[str, int]:
         """Calculate how many replicas each character model needs.
 
@@ -486,7 +661,7 @@ class SessionManager:
         base_vram = len(unique_jobs) * MODEL_VRAM_GB
         remaining_vram = available_vram_gb - base_vram
 
-        if remaining_vram <= MODEL_VRAM_GB:
+        if remaining_vram <= MODEL_VRAM_GB or additional_replica_slots <= 0:
             # No room for replicas
             return replicas
 
@@ -494,6 +669,7 @@ class SessionManager:
         sorted_chars = sorted(characters, key=lambda c: c.get("line_count", 0), reverse=True)
 
         # Second pass: add replicas to high-traffic characters
+        remaining_slots = max(0, int(additional_replica_slots))
         for char in sorted_chars:
             job_id = char["job_id"]
             line_count = char.get("line_count", 0)
@@ -509,13 +685,14 @@ class SessionManager:
             # How many can we actually fit?
             additional = ideal - replicas[job_id]  # How many more beyond current
             can_fit = int(remaining_vram // MODEL_VRAM_GB)
-            to_add = min(additional, can_fit)
+            to_add = min(additional, can_fit, remaining_slots)
 
             if to_add > 0:
                 replicas[job_id] += to_add
                 remaining_vram -= to_add * MODEL_VRAM_GB
+                remaining_slots -= to_add
 
-            if remaining_vram < MODEL_VRAM_GB:
+            if remaining_vram < MODEL_VRAM_GB or remaining_slots <= 0:
                 break
 
         return replicas
@@ -525,10 +702,68 @@ class SessionManager:
         if not torch.cuda.is_available():
             return 40.0  # Default assumption
 
+        mem_get_info = getattr(torch.cuda, "mem_get_info", None)
+        if mem_get_info is not None:
+            try:
+                free_bytes, _ = mem_get_info(0)
+            except TypeError:
+                free_bytes, _ = mem_get_info()
+            except Exception:
+                free_bytes = None
+            if free_bytes is not None:
+                free_gb = free_bytes / 1e9
+                return max(0, free_gb - 2.0)
+
         total = torch.cuda.get_device_properties(0).total_memory / 1e9
-        allocated = torch.cuda.memory_allocated(0) / 1e9
+        reserved = torch.cuda.memory_reserved(0) / 1e9
         # Leave 2GB headroom for activations/KV-cache during inference
-        return max(0, total - allocated - 2.0)
+        return max(0, total - reserved - 2.0)
+
+    @staticmethod
+    def _build_replica_cache_key(checkpoint_path: str, replica_index: int) -> str:
+        if replica_index <= 0:
+            return checkpoint_path
+        return f"{checkpoint_path}::replica-{replica_index}"
+
+    def _shared_headroom_buffer_gb(self) -> float:
+        stats = getattr(self.inference, "stats", {})
+        if isinstance(stats, dict):
+            try:
+                return max(0.0, float(stats.get("shared_model_min_headroom_gb", 0.0) or 0.0))
+            except (TypeError, ValueError):
+                return 0.0
+        return 0.0
+
+    @staticmethod
+    def _is_active_status(status: SessionStatus) -> bool:
+        return status in (
+            SessionStatus.PREPARING,
+            SessionStatus.READY,
+            SessionStatus.PROCESSING,
+        )
+
+    def _find_duplicate_active_session(
+        self,
+        *,
+        session_id: str,
+        book_id: str,
+        chapter_id: str,
+        requested_job_ids: tuple[str, ...],
+    ) -> Optional[Session]:
+        if not book_id or not chapter_id or not requested_job_ids:
+            return None
+
+        for existing in self.sessions.values():
+            if existing.session_id == session_id:
+                continue
+            if not self._is_active_status(existing.status):
+                continue
+            if existing.book_id != book_id or existing.chapter_id != chapter_id:
+                continue
+            if existing.requested_job_ids != requested_job_ids:
+                continue
+            return existing
+        return None
 
     # -- Session Lifecycle ----------------------------------------------------
 
@@ -549,6 +784,22 @@ class SessionManager:
 
         Returns: Session object with model plan
         """
+        requested_job_ids = tuple(sorted({c["job_id"] for c in characters}))
+        duplicate = self._find_duplicate_active_session(
+            session_id=session_id,
+            book_id=book_id,
+            chapter_id=chapter_id,
+            requested_job_ids=requested_job_ids,
+        )
+        if duplicate is not None:
+            raise DuplicateActiveSessionError(
+                (
+                    "A matching session is already active for this chapter workload "
+                    f"({duplicate.session_id})."
+                ),
+                active_session_id=duplicate.session_id,
+            )
+
         if session_id in self.sessions:
             existing = self.sessions[session_id]
             if existing.status in (SessionStatus.PREPARING, SessionStatus.PROCESSING):
@@ -556,7 +807,12 @@ class SessionManager:
             # Teardown old session first
             await self.teardown_session(session_id)
 
-        session = Session(session_id=session_id, book_id=book_id, chapter_id=chapter_id)
+        session = Session(
+            session_id=session_id,
+            book_id=book_id,
+            chapter_id=chapter_id,
+            requested_job_ids=list(requested_job_ids),
+        )
         self.sessions[session_id] = session
 
         op = ops_log.start("session_prepare", extra={
@@ -577,44 +833,59 @@ class SessionManager:
 
             async def _resolve_job(char_dict):
                 job_id = char_dict["job_id"]
-                # get_job can hit S3, run in executor
-                job = await loop.run_in_executor(None, self.pipeline.get_job, job_id)
-                if not job:
-                    raise ValueError(f"Job {job_id} not found")
+                def _resolve_job_sync():
+                    self.pipeline.touch_job(job_id)
+                    job = self.pipeline.get_job(job_id)
+                    if not job:
+                        raise ValueError(f"Job {job_id} not found")
 
-                checkpoint_path = str(job.checkpoint_path) if job.checkpoint_path else None
-                if not checkpoint_path or not os.path.exists(checkpoint_path):
-                    if job.s3_model_key:
-                        # Large S3 download, must run in executor
-                        checkpoint_path = await loop.run_in_executor(
-                            None, self.pipeline._restore_checkpoint_from_s3, job
-                        )
-                    else:
-                        raise ValueError(
-                            f"Job {job_id} has no checkpoint and no S3 backup"
-                        )
+                    checkpoint_path = str(job.checkpoint_path) if job.checkpoint_path else None
+                    if not checkpoint_path or not os.path.exists(checkpoint_path):
+                        if job.s3_model_key:
+                            checkpoint_path = self.pipeline._restore_checkpoint_from_s3(job)
+                        else:
+                            raise ValueError(
+                                f"Job {job_id} has no checkpoint and no S3 backup"
+                            )
 
-                return job_id, checkpoint_path, job.character_id
+                    self.pipeline.touch_job(job_id)
+                    return job_id, checkpoint_path, job.character_id, job.speaker_name
+
+                return await loop.run_in_executor(None, _resolve_job_sync)
 
             # Resolve all unique jobs
             results = await asyncio.gather(*[_resolve_job(c) for c in unique_jobs.values()])
-            job_info = {r[0]: (r[1], r[2]) for r in results}
+            job_info = {r[0]: (r[1], r[2], r[3]) for r in results}
+
+            headroom_buffer_gb = self._shared_headroom_buffer_gb()
+            available_vram_gb = max(0.0, self._get_available_vram() - headroom_buffer_gb)
+            loaded_count = int(getattr(self.inference, "loaded_count", 0) or 0)
+            max_models = int(getattr(self.inference, "max_models", 1) or 1)
+            additional_replica_slots = max(0, max_models - loaded_count - len(job_info))
+            replica_counts = self._calculate_replicas(
+                list(unique_jobs.values()),
+                available_vram_gb=available_vram_gb,
+                additional_replica_slots=additional_replica_slots,
+            )
 
             # 2. Map all characters to their resolved plans
             for char_dict in characters:
                 job_id = char_dict["job_id"]
-                checkpoint_path, character_id = job_info[job_id]
+                checkpoint_path, character_id, speaker_name = job_info[job_id]
                 
                 plan = CharacterPlan(
                     job_id=job_id,
-                    character_name=char_dict["character_name"],
+                    character_name=speaker_name,
                     checkpoint_path=checkpoint_path,
                     line_count=char_dict.get("line_count", 0),
                     avg_word_count=char_dict.get("avg_word_count", 20),
                     character_id=character_id,
                 )
-                plan.replicas = 1
-                plan.replica_keys = [checkpoint_path]
+                plan.replicas = max(1, replica_counts.get(job_id, 1))
+                plan.replica_keys = [
+                    self._build_replica_cache_key(checkpoint_path, replica_index)
+                    for replica_index in range(plan.replicas)
+                ]
                 
                 # Note: If multiple character names share a job_id, we keep both in the session
                 # so the submission logic can find them, but they'll share a queue.
@@ -630,31 +901,63 @@ class SessionManager:
                     total=sum(c.get("line_count", 0) for c in characters if c["job_id"] == job_id)
                 )
 
-            # 4. Start workers (one per character)
+            # 4. Pre-load and pin planned replicas before any work is queued.
+            if self.inference.is_training_active_or_requested():
+                raise TrainingConflictError(
+                    "GPU training is active; session preparation must wait for training to finish."
+                )
+
+            preload_tasks = []
+            for plan in session.character_plans.values():
+                for cache_key in plan.replica_keys:
+                    preload_tasks.append(
+                        loop.run_in_executor(
+                            None,
+                            self.inference.load_for_session,
+                            cache_key,
+                            plan.checkpoint_path,
+                            plan.character_name,
+                            session_id,
+                        )
+                    )
+            if preload_tasks:
+                await asyncio.gather(*preload_tasks)
+
+            # 5. Start workers (one per replica)
             for job_id, plan in session.character_plans.items():
                 queue = session.character_queues[job_id]
                 progress = session.character_progress[job_id]
 
-                worker = CharacterWorker(
-                    worker_id=f"{session_id}/{plan.character_name}/w0",
-                    queue=queue,
-                    inference_manager=self.inference,
-                    worker_semaphore=self.worker_semaphore,
-                    cache_key=plan.checkpoint_path,
-                    speaker_name=plan.character_name,
-                    batch_size=self.batch_size,
-                    batch_timeout_ms=100,
-                    storage=self.storage,
-                    progress=progress,
-                )
-                worker.start()
-                session.workers.append(worker)
+                for replica_index, cache_key in enumerate(plan.replica_keys):
+                    worker = CharacterWorker(
+                        worker_id=f"{session_id}/{plan.character_name}/w{replica_index}",
+                        queue=queue,
+                        inference_manager=self.inference,
+                        worker_semaphore=self.worker_semaphore,
+                        cache_key=cache_key,
+                        speaker_name=plan.character_name,
+                        batch_size=self.batch_size,
+                        batch_timeout_ms=100,
+                        batch_text_budget=self.batch_text_budget,
+                        batch_padded_text_budget=self.batch_padded_text_budget,
+                        initial_batch_size=1,
+                        generation_kwargs=self.custom_generation_kwargs,
+                        min_new_tokens=self.custom_min_new_tokens,
+                        max_new_tokens=self.custom_max_new_tokens,
+                        max_new_tokens_per_char=self.custom_max_new_tokens_per_char,
+                        storage=self.storage,
+                        progress=progress,
+                    )
+                    worker.start()
+                    session.workers.append(worker)
 
             session.status = SessionStatus.READY
             ops_log.end(op, extra={
                 "characters": len(session.character_plans),
                 "total_lines": session.total_lines,
                 "max_concurrent_models": self.inference.max_models,
+                "workers_started": len(session.workers),
+                "replicas_planned": sum(plan.replicas for plan in session.character_plans.values()),
             })
 
             logger.info(
@@ -752,7 +1055,10 @@ class SessionManager:
 
         # 2. Unpin models from session protection (LRU can now evict them)
         for plan in session.character_plans.values():
-            self.inference.unpin_session(plan.checkpoint_path, session_id)
+            for cache_key in plan.replica_keys:
+                self.inference.unpin_session(cache_key, session_id)
+                if cache_key != plan.checkpoint_path:
+                    self.inference.unload_specific(cache_key)
 
         session.status = SessionStatus.CANCELLED
         session.workers.clear()
@@ -772,7 +1078,36 @@ class SessionManager:
                 "total_lines": s.total_lines,
                 "completed_lines": s.completed_lines,
                 "progress_pct": s.progress_pct,
+                "queued_items": s.queued_items,
                 "created_at": s.created_at,
             }
             for s in self.sessions.values()
         ]
+
+    def scheduler_snapshot(self) -> dict:
+        """Aggregate session backlog and runtime state for GPU schedulers."""
+        status_counts = {status.value: 0 for status in SessionStatus}
+        queued_session_items = 0
+        active_sessions = 0
+        active_workers = 0
+
+        for session in self.sessions.values():
+            status_counts[session.status.value] = status_counts.get(session.status.value, 0) + 1
+            queued_session_items += session.queued_items
+            active_workers += sum(
+                1 for worker in session.workers if getattr(worker, "_running", False)
+            )
+            if session.status in {
+                SessionStatus.PREPARING,
+                SessionStatus.READY,
+                SessionStatus.PROCESSING,
+            }:
+                active_sessions += 1
+
+        return {
+            "total_sessions": len(self.sessions),
+            "active_sessions": active_sessions,
+            "queued_session_items": queued_session_items,
+            "active_workers": active_workers,
+            "status_counts": status_counts,
+        }

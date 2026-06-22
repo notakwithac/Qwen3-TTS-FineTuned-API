@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import base64
+import contextlib
 import io
 import urllib.request
 from typing import List, Optional, Tuple, Union
@@ -23,7 +24,9 @@ import librosa
 import numpy as np
 import soundfile as sf
 import torch
+from torch import nn
 from torch.nn.utils.rnn import pad_sequence
+from transformers import modeling_utils as hf_modeling_utils
 from transformers import AutoConfig, AutoFeatureExtractor, AutoModel
 
 from ..core import (
@@ -39,6 +42,106 @@ AudioInput = Union[
     List[str],
     List[np.ndarray],
 ]
+
+
+def _normalize_single_device_map(load_kwargs):
+    normalized_kwargs = dict(load_kwargs)
+    device_map = normalized_kwargs.get("device_map")
+
+    if isinstance(device_map, dict):
+        return normalized_kwargs, None
+
+    if isinstance(device_map, str) and device_map == "auto":
+        return normalized_kwargs, None
+
+    if device_map is None:
+        return normalized_kwargs, None
+
+    if not isinstance(device_map, (str, torch.device, int)):
+        return normalized_kwargs, None
+
+    normalized_kwargs["device_map"] = {"": device_map}
+    return normalized_kwargs, normalized_kwargs["device_map"]
+
+
+@contextlib.contextmanager
+def _skip_dispatch_for_single_device(single_device_map):
+    if single_device_map is None:
+        yield
+        return
+
+    original_dispatch_model = hf_modeling_utils.dispatch_model
+
+    def _dispatch_model_noop(model, **kwargs):
+        return model
+
+    hf_modeling_utils.dispatch_model = _dispatch_model_noop
+    try:
+        yield
+    finally:
+        hf_modeling_utils.dispatch_model = original_dispatch_model
+
+
+def _is_meta_tensor_copy_error(exc):
+    message = str(exc).lower()
+    return "cannot copy out of meta tensor" in message and "to_empty()" in message
+
+
+def _coerce_device(device):
+    if isinstance(device, torch.device):
+        return device
+    if isinstance(device, int):
+        return torch.device(f"cuda:{device}")
+    return torch.device(device)
+
+
+def _move_single_tensor_to_device(model, tensor_name, tensor, target_device, *, is_parameter):
+    if "." in tensor_name:
+        module_name, leaf_name = tensor_name.rsplit(".", 1)
+        module = model.get_submodule(module_name)
+    else:
+        module = model
+        leaf_name = tensor_name
+
+    moved_tensor = tensor.detach().to(target_device)
+    if is_parameter:
+        module._parameters[leaf_name] = nn.Parameter(moved_tensor, requires_grad=tensor.requires_grad)
+    else:
+        module._buffers[leaf_name] = moved_tensor
+
+
+def _align_single_device_model_tensors(model, single_device_map):
+    if single_device_map is None:
+        return
+    if not hasattr(model, "named_parameters") or not hasattr(model, "named_buffers"):
+        return
+
+    target_device = _coerce_device(single_device_map[""])
+    meta_tensors = []
+
+    for name, param in model.named_parameters(recurse=True, remove_duplicate=False):
+        if param is None:
+            continue
+        if param.device.type == "meta":
+            meta_tensors.append(name)
+            continue
+        if param.device != target_device:
+            _move_single_tensor_to_device(model, name, param, target_device, is_parameter=True)
+
+    for name, buffer in model.named_buffers(recurse=True, remove_duplicate=False):
+        if buffer is None:
+            continue
+        if buffer.device.type == "meta":
+            meta_tensors.append(name)
+            continue
+        if buffer.device != target_device:
+            _move_single_tensor_to_device(model, name, buffer, target_device, is_parameter=False)
+
+    if meta_tensors:
+        preview = ", ".join(meta_tensors[:6])
+        raise RuntimeError(
+            f"Single-device tokenizer load left meta tensors after weight materialization: {preview}"
+        )
 
 
 class Qwen3TTSTokenizer:
@@ -84,8 +187,17 @@ class Qwen3TTSTokenizer:
         AutoConfig.register("qwen3_tts_tokenizer_12hz", Qwen3TTSTokenizerV2Config)
         AutoModel.register(Qwen3TTSTokenizerV2Config, Qwen3TTSTokenizerV2Model)
 
+        load_kwargs, single_device_map = _normalize_single_device_map(kwargs)
         inst.feature_extractor = AutoFeatureExtractor.from_pretrained(pretrained_model_name_or_path)
-        inst.model = AutoModel.from_pretrained(pretrained_model_name_or_path, **kwargs)
+        try:
+            inst.model = AutoModel.from_pretrained(pretrained_model_name_or_path, **load_kwargs)
+        except Exception as exc:
+            if single_device_map is None or not _is_meta_tensor_copy_error(exc):
+                raise
+            with _skip_dispatch_for_single_device(single_device_map):
+                inst.model = AutoModel.from_pretrained(pretrained_model_name_or_path, **load_kwargs)
+        if single_device_map is not None:
+            _align_single_device_model_tensors(inst.model, single_device_map)
         inst.config = inst.model.config
 
         inst.device = getattr(inst.model, "device", None)

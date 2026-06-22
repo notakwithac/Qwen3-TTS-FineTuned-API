@@ -1,0 +1,69 @@
+name: Docker Auto-Version and Publish
+
+on:
+  push:
+    branches: [ "docker", "sample", "PR-278" ]
+
+env:
+  REGISTRY: "" # Docker Hub
+  IMAGE_NAME: technocarsh/qwen3-tts-api
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Needed to push git tags
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Fetch all history for tagging logic
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Calculate Next Version
+        id: get_version
+        run: |
+          # Get the latest tag matching v* format
+          LATEST_TAG=$(git tag -l "v*" --sort=-v:refname | head -n 1 | sed 's/^v//')
+          
+          if [ -z "$LATEST_TAG" ]; then
+            # Starting version as requested by user
+            NEXT_VERSION="0.1.0"
+          else
+            # Split version into components
+            IFS='.' read -r major minor patch <<< "$LATEST_TAG"
+            
+            # Simple increment logic (e.g., 0.1.0 -> 0.1.1)
+            # This follows the "and so on" request by incrementing the patch number
+            NEXT_VERSION="$major.$minor.$((patch + 1))"
+          fi
+          
+          echo "version=$NEXT_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Next version will be: v$NEXT_VERSION"
+
+      - name: Create and push Git Tag
+        run: |
+          # Set up git user
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Create and push tag to GitHub
+          # This acts as the source of truth for the next version calculation
+          git tag v${{ steps.get_version.outputs.version }}
+          git push origin v${{ steps.get_version.outputs.version }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.tir
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:v${{ steps.get_version.outputs.version }}

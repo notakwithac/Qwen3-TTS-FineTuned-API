@@ -14,10 +14,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import base64
+import contextlib
 import io
 import logging
 import time
 import random
+import threading
 import urllib.request
 import urllib.error
 from dataclasses import dataclass
@@ -28,6 +30,8 @@ import librosa
 import numpy as np
 import soundfile as sf
 import torch
+from torch import nn
+from transformers import modeling_utils as hf_modeling_utils
 from transformers import AutoConfig, AutoModel, AutoProcessor
 
 from ..core.models import Qwen3TTSConfig, Qwen3TTSForConditionalGeneration, Qwen3TTSProcessor
@@ -41,6 +45,128 @@ AudioLike = Union[
 ]
 
 MaybeList = Union[Any, List[Any]]
+
+
+@dataclass
+class InferenceOptimizationConfig:
+    matmul_precision: Optional[str] = None
+    compile_enabled: bool = False
+    compile_mode: str = "reduce-overhead"
+    compile_fullgraph: bool = False
+    enable_batched_tokenization: bool = True
+
+
+def _normalize_single_device_map(load_kwargs: Dict[str, Any]) -> tuple[Dict[str, Any], Optional[Dict[str, Union[str, torch.device, int]]]]:
+    normalized_kwargs = dict(load_kwargs)
+    device_map = normalized_kwargs.get("device_map")
+
+    if isinstance(device_map, dict):
+        return normalized_kwargs, None
+
+    if isinstance(device_map, str) and device_map == "auto":
+        return normalized_kwargs, None
+
+    if device_map is None:
+        return normalized_kwargs, None
+
+    target_device_map: Optional[Dict[str, Union[str, torch.device, int]]] = None
+    if isinstance(device_map, (str, torch.device, int)):
+        target_device_map = {"": device_map}
+    else:
+        return normalized_kwargs, None
+
+    normalized_kwargs["device_map"] = target_device_map
+    return normalized_kwargs, target_device_map
+
+
+@contextlib.contextmanager
+def _skip_dispatch_for_single_device(single_device_map: Optional[Dict[str, Union[str, torch.device, int]]]):
+    if single_device_map is None:
+        yield
+        return
+
+    original_dispatch_model = hf_modeling_utils.dispatch_model
+
+    def _dispatch_model_noop(model, **kwargs):
+        return model
+
+    hf_modeling_utils.dispatch_model = _dispatch_model_noop
+    try:
+        yield
+    finally:
+        hf_modeling_utils.dispatch_model = original_dispatch_model
+
+
+def _is_meta_tensor_copy_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return "cannot copy out of meta tensor" in message and "to_empty()" in message
+
+
+def _coerce_device(device: Union[str, torch.device, int]) -> torch.device:
+    if isinstance(device, torch.device):
+        return device
+    if isinstance(device, int):
+        return torch.device(f"cuda:{device}")
+    return torch.device(device)
+
+
+def _move_single_tensor_to_device(
+    model: nn.Module,
+    tensor_name: str,
+    tensor: torch.Tensor,
+    target_device: torch.device,
+    *,
+    is_parameter: bool,
+) -> None:
+    if "." in tensor_name:
+        module_name, leaf_name = tensor_name.rsplit(".", 1)
+        module = model.get_submodule(module_name)
+    else:
+        module = model
+        leaf_name = tensor_name
+
+    moved_tensor = tensor.detach().to(target_device)
+    if is_parameter:
+        module._parameters[leaf_name] = nn.Parameter(moved_tensor, requires_grad=tensor.requires_grad)
+    else:
+        module._buffers[leaf_name] = moved_tensor
+
+
+def _align_single_device_model_tensors(
+    model: nn.Module,
+    single_device_map: Optional[Dict[str, Union[str, torch.device, int]]],
+) -> None:
+    if single_device_map is None:
+        return
+    if not hasattr(model, "named_parameters") or not hasattr(model, "named_buffers"):
+        return
+
+    target_device = _coerce_device(single_device_map[""])
+    meta_tensors: list[str] = []
+
+    for name, param in model.named_parameters(recurse=True, remove_duplicate=False):
+        if param is None:
+            continue
+        if param.device.type == "meta":
+            meta_tensors.append(name)
+            continue
+        if param.device != target_device:
+            _move_single_tensor_to_device(model, name, param, target_device, is_parameter=True)
+
+    for name, buffer in model.named_buffers(recurse=True, remove_duplicate=False):
+        if buffer is None:
+            continue
+        if buffer.device.type == "meta":
+            meta_tensors.append(name)
+            continue
+        if buffer.device != target_device:
+            _move_single_tensor_to_device(model, name, buffer, target_device, is_parameter=False)
+
+    if meta_tensors:
+        preview = ", ".join(meta_tensors[:6])
+        raise RuntimeError(
+            f"Single-device load left meta tensors after weight materialization: {preview}"
+        )
 
 
 @dataclass
@@ -73,10 +199,20 @@ class Qwen3TTSModel:
           model.get_supported_languages(), model.get_supported_speakers()
     """
 
-    def __init__(self, model: Qwen3TTSForConditionalGeneration, processor, generate_defaults: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self,
+        model: Qwen3TTSForConditionalGeneration,
+        processor,
+        generate_defaults: Optional[Dict[str, Any]] = None,
+        optimization_config: Optional[InferenceOptimizationConfig] = None,
+    ):
         self.model = model
         self.processor = processor
         self.generate_defaults = generate_defaults or {}
+        self.optimization_config = optimization_config or InferenceOptimizationConfig()
+        self._compiled_generate = None
+        self._compile_failure: Optional[str] = None
+        self._matmul_precision_applied = False
 
         self.device = getattr(model, "device", None)
         if self.device is None:
@@ -84,6 +220,8 @@ class Qwen3TTSModel:
                 self.device = next(model.parameters()).device
             except StopIteration:
                 self.device = torch.device("cpu")
+
+        self._apply_runtime_optimizations()
 
     @classmethod
     def from_pretrained(
@@ -111,20 +249,47 @@ class Qwen3TTSModel:
             Qwen3TTSModel:
                 Wrapper instance containing `model`, `processor`, and generation defaults.
         """
+        optimization_config = InferenceOptimizationConfig(
+            matmul_precision=kwargs.pop("matmul_precision", None),
+            compile_enabled=bool(kwargs.pop("compile_enabled", False)),
+            compile_mode=kwargs.pop("compile_mode", "reduce-overhead"),
+            compile_fullgraph=bool(kwargs.pop("compile_fullgraph", False)),
+            enable_batched_tokenization=bool(kwargs.pop("enable_batched_tokenization", True)),
+        )
+
         AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
         AutoModel.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
         AutoProcessor.register(Qwen3TTSConfig, Qwen3TTSProcessor)
 
-        model = AutoModel.from_pretrained(pretrained_model_name_or_path, **kwargs)
+        load_kwargs, single_device_map = _normalize_single_device_map(kwargs)
+
+        try:
+            model = AutoModel.from_pretrained(pretrained_model_name_or_path, **load_kwargs)
+        except Exception as exc:
+            if single_device_map is None or not _is_meta_tensor_copy_error(exc):
+                raise
+            logger.warning(
+                "Single-device load hit meta-tensor dispatch path for %s; retrying with safe dispatch bypass.",
+                pretrained_model_name_or_path,
+            )
+            with _skip_dispatch_for_single_device(single_device_map):
+                model = AutoModel.from_pretrained(pretrained_model_name_or_path, **load_kwargs)
         if not isinstance(model, Qwen3TTSForConditionalGeneration):
             raise TypeError(
                 f"AutoModel returned {type(model)}, expected Qwen3TTSForConditionalGeneration. "
             )
+        if single_device_map is not None:
+            _align_single_device_model_tensors(model, single_device_map)
 
         processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, fix_mistral_regex=True,)
 
         generate_defaults = model.generate_config
-        return cls(model=model, processor=processor, generate_defaults=generate_defaults)
+        return cls(
+            model=model,
+            processor=processor,
+            generate_defaults=generate_defaults,
+            optimization_config=optimization_config,
+        )
 
     def _supported_languages_set(self) -> Optional[set]:
         langs = getattr(self.model, "get_supported_languages", None)
@@ -134,6 +299,73 @@ class Qwen3TTSModel:
                 return None
             return set([str(x).lower() for x in v])
         return None
+
+    def _apply_runtime_optimizations(self) -> None:
+        self._maybe_set_matmul_precision()
+        if self.optimization_config.compile_enabled:
+            self._ensure_compiled_generate()
+
+    def _maybe_set_matmul_precision(self) -> None:
+        precision = self.optimization_config.matmul_precision
+        if not precision or self._matmul_precision_applied:
+            return
+        setter = getattr(torch, "set_float32_matmul_precision", None)
+        if setter is None:
+            logger.info("torch.set_float32_matmul_precision unavailable; skipping matmul precision change.")
+            return
+        try:
+            setter(precision)
+            self._matmul_precision_applied = True
+            logger.info("Enabled float32 matmul precision mode: %s", precision)
+        except Exception as exc:
+            logger.warning("Failed to set float32 matmul precision to %s: %s", precision, exc)
+
+    def _ensure_compiled_generate(self) -> Any:
+        if self._compiled_generate is not None:
+            return self._compiled_generate
+        if self._compile_failure is not None:
+            return self.model.generate
+        compile_fn = getattr(torch, "compile", None)
+        if compile_fn is None:
+            self._compile_failure = "torch.compile unavailable"
+            logger.info("torch.compile unavailable; using eager generation path.")
+            return self.model.generate
+        try:
+            self._compiled_generate = compile_fn(
+                self.model.generate,
+                mode=self.optimization_config.compile_mode,
+                fullgraph=self.optimization_config.compile_fullgraph,
+            )
+            logger.info(
+                "Compiled Qwen3 TTS generate path with mode=%s fullgraph=%s",
+                self.optimization_config.compile_mode,
+                self.optimization_config.compile_fullgraph,
+            )
+        except Exception as exc:
+            self._compile_failure = str(exc)
+            logger.warning("Failed to compile Qwen3 TTS generate path; falling back to eager mode. %s", exc)
+            return self.model.generate
+        return self._compiled_generate
+
+    def _run_generate(self, **kwargs):
+        generate_fn = self.model.generate
+        if self.optimization_config.compile_enabled:
+            generate_fn = self._ensure_compiled_generate()
+        try:
+            return generate_fn(**kwargs)
+        except Exception as exc:
+            if (
+                self.optimization_config.compile_enabled
+                and generate_fn is not self.model.generate
+            ):
+                self._compile_failure = str(exc)
+                self._compiled_generate = None
+                logger.warning(
+                    "Compiled Qwen3 TTS generate path failed at runtime; retrying eagerly. %s",
+                    exc,
+                )
+                return self.model.generate(**kwargs)
+            raise
 
     def _supported_speakers_set(self) -> Optional[set]:
         spks = getattr(self.model, "get_supported_speakers", None)
@@ -211,6 +443,7 @@ class Qwen3TTSModel:
         return base64.b64decode(b64)
 
     def _load_audio_to_np(self, x: str) -> Tuple[np.ndarray, int]:
+        load_started_at = time.monotonic()
         if self._is_url(x):
             # Truncate URL for logging (hide sensitive tokens but show host/path)
             from urllib.parse import urlparse as _urlparse
@@ -219,6 +452,27 @@ class Qwen3TTSModel:
             if _parsed.query:
                 _safe_url += f"?<{len(_parsed.query)} chars>"
             logger.info(f"Downloading ref audio from: {_safe_url}")
+
+            try:
+                from storage import storage
+
+                if storage.has_read_backend and storage.can_resolve_storage_ref(x):
+                    audio_bytes = storage.download_bytes(x)
+                    logger.info(
+                        "Ref audio loaded from configured storage: %d bytes from %s in %.3fs",
+                        len(audio_bytes),
+                        _safe_url,
+                        time.monotonic() - load_started_at,
+                    )
+                    with io.BytesIO(audio_bytes) as f:
+                        audio, sr = sf.read(f, dtype="float32", always_2d=False)
+                    return audio.astype(np.float32), int(sr)
+            except Exception as e:
+                logger.warning(
+                    "Configured storage read failed for %s; falling back to HTTP download: %s",
+                    _safe_url,
+                    e,
+                )
             
             max_retries = 3
             last_err = None
@@ -231,7 +485,12 @@ class Qwen3TTSModel:
                     )
                     with urllib.request.urlopen(req, timeout=30) as resp:
                         audio_bytes = resp.read()
-                    logger.info(f"Ref audio downloaded OK: {len(audio_bytes)} bytes from {_safe_url}")
+                    logger.info(
+                        "Ref audio downloaded OK: %d bytes from %s in %.3fs",
+                        len(audio_bytes),
+                        _safe_url,
+                        time.monotonic() - load_started_at,
+                    )
                     with io.BytesIO(audio_bytes) as f:
                         audio, sr = sf.read(f, dtype="float32", always_2d=False)
                     return audio.astype(np.float32), int(sr)
@@ -266,8 +525,17 @@ class Qwen3TTSModel:
             wav_bytes = self._decode_base64_to_wav_bytes(x)
             with io.BytesIO(wav_bytes) as f:
                 audio, sr = sf.read(f, dtype="float32", always_2d=False)
+            logger.info(
+                "Loaded ref audio from base64 payload in %.3fs",
+                time.monotonic() - load_started_at,
+            )
         else:
             audio, sr = librosa.load(x, sr=None, mono=True)
+            logger.info(
+                "Loaded ref audio from local path in %.3fs: %s",
+                time.monotonic() - load_started_at,
+                x,
+            )
 
         if audio.ndim > 1:
             audio = np.mean(audio, axis=-1)
@@ -322,6 +590,14 @@ class Qwen3TTSModel:
     def _ensure_list(self, x: MaybeList) -> List[Any]:
         return x if isinstance(x, list) else [x]
 
+    @staticmethod
+    def _expand_to_batch(values: List[Any], batch_size: int, field_name: str) -> List[Any]:
+        if len(values) == 1 and batch_size > 1:
+            return values * batch_size
+        if len(values) != batch_size:
+            raise ValueError(f"Batch size mismatch: {field_name}={len(values)}, expected={batch_size}")
+        return values
+
     def _build_assistant_text(self, text: str) -> str:
         return f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
 
@@ -332,13 +608,32 @@ class Qwen3TTSModel:
         return f"<|im_start|>user\n{instruct}<|im_end|>\n"
 
     def _tokenize_texts(self, texts: List[str]) -> List[torch.Tensor]:
-        input_ids = []
-        for text in texts:
-            input = self.processor(text=text, return_tensors="pt", padding=True)
-            input_id = input["input_ids"].to(self.device)
-            input_id = input_id.unsqueeze(0) if input_id.dim() == 1 else input_id
-            input_ids.append(input_id)
-        return input_ids
+        if not texts:
+            return []
+
+        if not self.optimization_config.enable_batched_tokenization:
+            input_ids = []
+            for text in texts:
+                input = self.processor(text=text, return_tensors="pt", padding=True)
+                input_id = input["input_ids"].to(self.device)
+                input_id = input_id.unsqueeze(0) if input_id.dim() == 1 else input_id
+                input_ids.append(input_id)
+            return input_ids
+
+        unique_texts = list(dict.fromkeys(texts))
+        batch = self.processor(text=unique_texts, return_tensors="pt", padding=True)
+        input_ids_batch = batch["input_ids"].to(self.device)
+        attention_mask = batch.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(self.device)
+
+        by_text: Dict[str, torch.Tensor] = {}
+        for idx, text in enumerate(unique_texts):
+            row = input_ids_batch[idx]
+            if attention_mask is not None:
+                row = row[attention_mask[idx].bool()]
+            by_text[text] = row.unsqueeze(0)
+        return [by_text[text] for text in texts]
 
     def _merge_generate_kwargs(
         self,
@@ -360,7 +655,8 @@ class Qwen3TTSModel:
         Rule:
           - If the user explicitly passes a value (not None), use it.
           - Otherwise, use the value from generate_config.json if present.
-          - Otherwise, fall back to the hard defaults.
+          - Otherwise, fall back to the hard defaults for common sampling args.
+          - `max_new_tokens` is only forwarded when the caller or checkpoint sets it.
 
         Args:
             do_sample, top_k, top_p, temperature, repetition_penalty,
@@ -382,7 +678,6 @@ class Qwen3TTSModel:
             subtalker_top_k=50,
             subtalker_top_p=1.0,
             subtalker_temperature=0.9,
-            max_new_tokens=2048,
         )
 
         def pick(name: str, user_val: Any) -> Any:
@@ -403,9 +698,111 @@ class Qwen3TTSModel:
             subtalker_top_k=pick("subtalker_top_k", subtalker_top_k),
             subtalker_top_p=pick("subtalker_top_p", subtalker_top_p),
             subtalker_temperature=pick("subtalker_temperature", subtalker_temperature),
-            max_new_tokens=pick("max_new_tokens", max_new_tokens),
         )
+        if max_new_tokens is not None:
+            merged["max_new_tokens"] = max_new_tokens
+        elif "max_new_tokens" in self.generate_defaults:
+            merged["max_new_tokens"] = self.generate_defaults["max_new_tokens"]
         return merged
+
+    @staticmethod
+    def _generated_token_count(audio_codes: Any) -> int:
+        if audio_codes is None:
+            return 0
+        if hasattr(audio_codes, "shape") and len(audio_codes.shape) > 0:
+            return int(audio_codes.shape[0])
+        try:
+            return len(audio_codes)
+        except TypeError:
+            return 0
+
+    @staticmethod
+    def _text_preview(text: Optional[str], limit: int = 80) -> str:
+        normalized = (text or "").strip().replace("\n", " ")
+        if len(normalized) <= limit:
+            return normalized
+        return normalized[: limit - 3] + "..."
+
+    @contextlib.contextmanager
+    def _generation_heartbeat(self, *, label: str, details: dict[str, Any], interval_seconds: float = 30.0):
+        stop_event = threading.Event()
+        started_at = time.monotonic()
+
+        def _emit_heartbeat() -> None:
+            while not stop_event.wait(interval_seconds):
+                logger.info(
+                    "%s still running after %.1fs: %s",
+                    label,
+                    time.monotonic() - started_at,
+                    details,
+                )
+
+        thread = threading.Thread(target=_emit_heartbeat, daemon=True)
+        thread.start()
+        try:
+            yield
+        finally:
+            stop_event.set()
+            thread.join(timeout=1.0)
+
+    def _decode_audio_codes(self, codes_list: List[torch.Tensor]) -> Tuple[List[np.ndarray], int]:
+        return self.model.speech_tokenizer.decode([{"audio_codes": c} for c in codes_list])
+
+    def _build_instruct_ids(self, instructs: List[Optional[str]]) -> List[Optional[torch.Tensor]]:
+        normalized = [(ins or "") for ins in instructs]
+        unique_non_empty = list(dict.fromkeys([ins for ins in normalized if ins]))
+        tokenized = {}
+        if unique_non_empty:
+            tokenized_batches = self._tokenize_texts([self._build_instruct_text(ins) for ins in unique_non_empty])
+            tokenized = dict(zip(unique_non_empty, tokenized_batches))
+        return [None if not ins else tokenized[ins] for ins in normalized]
+
+    def _build_ref_ids(self, ref_texts: List[Optional[str]]) -> List[Optional[torch.Tensor]]:
+        normalized = [(ref or "") for ref in ref_texts]
+        unique_non_empty = list(dict.fromkeys([ref for ref in normalized if ref]))
+        tokenized = {}
+        if unique_non_empty:
+            tokenized_batches = self._tokenize_texts([self._build_ref_text(ref) for ref in unique_non_empty])
+            tokenized = dict(zip(unique_non_empty, tokenized_batches))
+        return [None if not ref else tokenized[ref] for ref in normalized]
+
+    def _log_custom_voice_generation_stats(
+        self,
+        *,
+        texts: List[str],
+        speakers: List[str],
+        languages: List[str],
+        instructs: List[str],
+        talker_codes_list: List[Any],
+        gen_kwargs: Dict[str, Any],
+    ) -> None:
+        effective_max_new_tokens = gen_kwargs.get("max_new_tokens")
+        do_sample = gen_kwargs.get("do_sample")
+        subtalker_dosample = gen_kwargs.get("subtalker_dosample")
+
+        for idx, codes in enumerate(talker_codes_list):
+            actual_new_tokens = self._generated_token_count(codes)
+            cap_reached = (
+                effective_max_new_tokens is not None
+                and actual_new_tokens >= int(effective_max_new_tokens)
+            )
+            logger.info(
+                "CustomVoice generation stats | idx=%s | speaker=%s | language=%s | "
+                "text_chars=%s | instruct_chars=%s | actual_new_tokens=%s | "
+                "effective_max_new_tokens=%s | cap_reached=%s | do_sample=%s | "
+                "subtalker_dosample=%s | text_preview=%r",
+                idx,
+                speakers[idx],
+                languages[idx],
+                len(texts[idx]),
+                len(instructs[idx] or ""),
+                actual_new_tokens,
+                effective_max_new_tokens,
+                cap_reached,
+                do_sample,
+                subtalker_dosample,
+                self._text_preview(texts[idx]),
+            )
 
     # voice clone model
     @torch.inference_mode()
@@ -454,6 +851,7 @@ class Qwen3TTSModel:
                 - If x_vector_only_mode=False but ref_text is missing.
                 - If batch lengths mismatch.
         """
+        prompt_started_at = time.monotonic()
         if self.model.tts_model_type != "base":
             raise ValueError(
                 f"model with \ntokenizer_type: {self.model.tokenizer_type}\n"
@@ -471,7 +869,9 @@ class Qwen3TTSModel:
                 f"Batch size mismatch: ref_audio={len(ref_audio_list)}, ref_text={len(ref_text_list)}, x_vector_only_mode={len(xvec_list)}"
             )
 
+        normalize_started_at = time.monotonic()
         normalized = self._normalize_audio_inputs(ref_audio_list)
+        normalize_seconds = time.monotonic() - normalize_started_at
 
         ref_wavs_for_code: List[np.ndarray] = []
         ref_sr_for_code: List[int] = []
@@ -479,6 +879,7 @@ class Qwen3TTSModel:
             ref_wavs_for_code.append(wav)
             ref_sr_for_code.append(sr)
 
+        code_started_at = time.monotonic()
         if len(set(ref_sr_for_code)) == 1:
             enc = self.model.speech_tokenizer.encode(ref_wavs_for_code, sr=ref_sr_for_code[0])
             ref_codes = enc.audio_codes
@@ -486,8 +887,10 @@ class Qwen3TTSModel:
             ref_codes = []
             for wav, sr in normalized:
                 ref_codes.append(self.model.speech_tokenizer.encode(wav, sr=sr).audio_codes[0])
+        code_seconds = time.monotonic() - code_started_at
 
         items: List[VoiceClonePromptItem] = []
+        speaker_embed_started_at = time.monotonic()
         for i, ((wav, sr), code, rtext, xvec_only) in enumerate(zip(normalized, ref_codes, ref_text_list, xvec_list)):
             if not xvec_only:
                 if rtext is None or rtext == "":
@@ -511,7 +914,71 @@ class Qwen3TTSModel:
                     ref_text=rtext,
                 )
             )
+        speaker_embed_seconds = time.monotonic() - speaker_embed_started_at
+        logger.info(
+            "Voice clone prompt built: refs=%d unique_input_audio=%d normalize_audio=%.3fs code_encode=%.3fs speaker_embed=%.3fs total=%.3fs sample_rates=%s",
+            len(ref_audio_list),
+            len({id(wav) for wav, _ in normalized}),
+            normalize_seconds,
+            code_seconds,
+            speaker_embed_seconds,
+            time.monotonic() - prompt_started_at,
+            sorted(set(ref_sr_for_code)),
+        )
         return items
+
+    @torch.inference_mode()
+    def warmup_for_inference(
+        self,
+        *,
+        mode: str,
+        text: str = "Warm up.",
+        language: str = "Auto",
+        speaker: Optional[str] = None,
+        instruct: Optional[str] = None,
+        ref_audio: Optional[AudioLike] = None,
+        ref_text: Optional[str] = None,
+        x_vector_only_mode: bool = False,
+        max_new_tokens: int = 32,
+        **kwargs,
+    ) -> None:
+        warmup_kwargs = dict(kwargs)
+        warmup_kwargs.setdefault("max_new_tokens", max_new_tokens)
+        if mode == "custom_voice":
+            if speaker is None:
+                supported = self.get_supported_speakers()
+                if not supported:
+                    raise ValueError("speaker is required for custom_voice warmup when the model has no supported speaker list.")
+                speaker = supported[0]
+            self.generate_custom_voice(
+                text=text,
+                speaker=speaker,
+                language=language,
+                instruct=instruct,
+                **warmup_kwargs,
+            )
+            return
+        if mode == "voice_design":
+            self.generate_voice_design(
+                text=text,
+                instruct=instruct or "",
+                language=language,
+                **warmup_kwargs,
+            )
+            return
+        if mode == "voice_clone":
+            if ref_audio is None:
+                raise ValueError("ref_audio is required for voice_clone warmup.")
+            self.generate_voice_clone(
+                text=text,
+                language=language,
+                ref_audio=ref_audio,
+                ref_text=ref_text,
+                x_vector_only_mode=x_vector_only_mode,
+                **warmup_kwargs,
+            )
+            return
+        raise ValueError(f"Unsupported warmup mode: {mode}")
 
     def _prompt_items_to_voice_clone_prompt(self, items: List[VoiceClonePromptItem]) -> Dict[str, Any]:
         return dict(
@@ -601,6 +1068,7 @@ class Qwen3TTSModel:
             ValueError:
                 If batch sizes mismatch or required prompt inputs are missing.
         """
+        generation_started_at = time.monotonic()
         if self.model.tts_model_type != "base":
             raise ValueError(
                 f"model with \ntokenizer_type: {self.model.tokenizer_type}\n"
@@ -610,11 +1078,11 @@ class Qwen3TTSModel:
             )
         
         texts = self._ensure_list(text)
-        languages = self._ensure_list(language) if isinstance(language, list) else ([language] * len(texts) if language is not None else ["Auto"] * len(texts))
-        if len(languages) == 1 and len(texts) > 1:
-            languages = languages * len(texts)
-        if len(texts) != len(languages):
-            raise ValueError(f"Batch size mismatch: text={len(texts)}, language={len(languages)}")
+        languages = self._expand_to_batch(
+            self._ensure_list(language) if isinstance(language, list) else ([language] if language is not None else ["Auto"]),
+            len(texts),
+            "language",
+        )
 
         self._validate_languages(languages)
 
@@ -641,29 +1109,36 @@ class Qwen3TTSModel:
                 voice_clone_prompt_dict = voice_clone_prompt
                 ref_texts_for_ids = None
 
-        input_texts = [self._build_assistant_text(t) for t in texts]
-        input_ids = self._tokenize_texts(input_texts)
+        tokenize_started_at = time.monotonic()
+        input_ids = self._tokenize_texts([self._build_assistant_text(t) for t in texts])
+        tokenize_seconds = time.monotonic() - tokenize_started_at
 
-        ref_ids = None
-        if ref_texts_for_ids is not None:
-            ref_ids = []
-            for i, rt in enumerate(ref_texts_for_ids):
-                if rt is None or rt == "":
-                    ref_ids.append(None)
-                else:
-                    ref_tok = self._tokenize_texts([self._build_ref_text(rt)])[0]
-                    ref_ids.append(ref_tok)
+        ref_id_started_at = time.monotonic()
+        ref_ids = self._build_ref_ids(ref_texts_for_ids) if ref_texts_for_ids is not None else None
+        ref_id_seconds = time.monotonic() - ref_id_started_at
 
         gen_kwargs = self._merge_generate_kwargs(**kwargs)
+        heartbeat_details = {
+            "texts": len(texts),
+            "language": list(dict.fromkeys(languages)),
+            "max_new_tokens": gen_kwargs.get("max_new_tokens"),
+            "do_sample": gen_kwargs.get("do_sample"),
+            "top_p": gen_kwargs.get("top_p"),
+            "temperature": gen_kwargs.get("temperature"),
+            "non_streaming_mode": non_streaming_mode,
+        }
 
-        talker_codes_list, _ = self.model.generate(
-            input_ids=input_ids,
-            ref_ids=ref_ids,
-            voice_clone_prompt=voice_clone_prompt_dict,
-            languages=languages,
-            non_streaming_mode=non_streaming_mode,
-            **gen_kwargs,
-        )
+        model_generate_started_at = time.monotonic()
+        with self._generation_heartbeat(label="Voice clone model.generate", details=heartbeat_details):
+            talker_codes_list, _ = self._run_generate(
+                input_ids=input_ids,
+                ref_ids=ref_ids,
+                voice_clone_prompt=voice_clone_prompt_dict,
+                languages=languages,
+                non_streaming_mode=non_streaming_mode,
+                **gen_kwargs,
+            )
+        model_generate_seconds = time.monotonic() - model_generate_started_at
 
         codes_for_decode = []
         for i, codes in enumerate(talker_codes_list):
@@ -673,19 +1148,43 @@ class Qwen3TTSModel:
             else:
                 codes_for_decode.append(codes)
 
-        wavs_all, fs = self.model.speech_tokenizer.decode([{"audio_codes": c} for c in codes_for_decode])
+        decode_started_at = time.monotonic()
+        wavs_all, fs = self._decode_audio_codes(codes_for_decode)
+        decode_seconds = time.monotonic() - decode_started_at
 
         wavs_out: List[np.ndarray] = []
+        CODEC_FRAME_RATE = 12  # tokens per second — Qwen3-TTS open source decoder
+
+        trim_started_at = time.monotonic()
         for i, wav in enumerate(wavs_all):
             ref_code_list = voice_clone_prompt_dict.get("ref_code", None)
             if ref_code_list is not None and ref_code_list[i] is not None:
                 ref_len = int(ref_code_list[i].shape[0])
-                total_len = int(codes_for_decode[i].shape[0])
-                cut = int(ref_len / max(total_len, 1) * wav.shape[0])
+                ref_duration_samples = int(ref_len / CODEC_FRAME_RATE * fs)
+                logger.info(
+                    "Voice clone trim diagnostic: ref_len=%d tokens implied_duration=%.3fs fs=%d output_samples=%d",
+                    ref_len,
+                    ref_len / CODEC_FRAME_RATE,
+                    fs,
+                    wav.shape[0],
+                )
+                cut = min(ref_duration_samples, wav.shape[0])
                 wavs_out.append(wav[cut:])
             else:
                 wavs_out.append(wav)
 
+        logger.info(
+            "Voice clone model stages: texts=%d tokenize=%.3fs ref_ids=%.3fs generate=%.3fs decode=%.3fs trim=%.3fs total=%.3fs max_new_tokens=%s do_sample=%s",
+            len(texts),
+            tokenize_seconds,
+            ref_id_seconds,
+            model_generate_seconds,
+            decode_seconds,
+            time.monotonic() - trim_started_at,
+            time.monotonic() - generation_started_at,
+            gen_kwargs.get("max_new_tokens"),
+            gen_kwargs.get("do_sample"),
+        )
         return wavs_out, fs
 
     # voice design model
@@ -748,31 +1247,21 @@ class Qwen3TTSModel:
             )
         
         texts = self._ensure_list(text)
-        languages = self._ensure_list(language) if isinstance(language, list) else ([language] * len(texts) if language is not None else ["Auto"] * len(texts))
-        instructs = self._ensure_list(instruct)
-
-        if len(languages) == 1 and len(texts) > 1:
-            languages = languages * len(texts)
-        if len(instructs) == 1 and len(texts) > 1:
-            instructs = instructs * len(texts)
-
-        if not (len(texts) == len(languages) == len(instructs)):
-            raise ValueError(f"Batch size mismatch: text={len(texts)}, language={len(languages)}, instruct={len(instructs)}")
+        languages = self._expand_to_batch(
+            self._ensure_list(language) if isinstance(language, list) else ([language] if language is not None else ["Auto"]),
+            len(texts),
+            "language",
+        )
+        instructs = self._expand_to_batch(self._ensure_list(instruct), len(texts), "instruct")
 
         self._validate_languages(languages)
 
         input_ids = self._tokenize_texts([self._build_assistant_text(t) for t in texts])
-
-        instruct_ids: List[Optional[torch.Tensor]] = []
-        for ins in instructs:
-            if ins is None or ins == "":
-                instruct_ids.append(None)
-            else:
-                instruct_ids.append(self._tokenize_texts([self._build_instruct_text(ins)])[0])
+        instruct_ids = self._build_instruct_ids(instructs)
 
         gen_kwargs = self._merge_generate_kwargs(**kwargs)
 
-        talker_codes_list, _ = self.model.generate(
+        talker_codes_list, _ = self._run_generate(
             input_ids=input_ids,
             instruct_ids=instruct_ids,
             languages=languages,
@@ -780,7 +1269,7 @@ class Qwen3TTSModel:
             **gen_kwargs,
         )
 
-        wavs, fs = self.model.speech_tokenizer.decode([{"audio_codes": c} for c in talker_codes_list])
+        wavs, fs = self._decode_audio_codes(talker_codes_list)
         return wavs, fs
 
     # custom voice model
@@ -850,39 +1339,29 @@ class Qwen3TTSModel:
             )
 
         texts = self._ensure_list(text)
-        languages = self._ensure_list(language) if isinstance(language, list) else ([language] * len(texts) if language is not None else ["Auto"] * len(texts))
-        speakers = self._ensure_list(speaker)
+        languages = self._expand_to_batch(
+            self._ensure_list(language) if isinstance(language, list) else ([language] if language is not None else ["Auto"]),
+            len(texts),
+            "language",
+        )
+        speakers = self._expand_to_batch(self._ensure_list(speaker), len(texts), "speaker")
         if self.model.tts_model_size in "0b6": # for 0b6 model, instruct is not supported
             instruct = None
-        instructs = self._ensure_list(instruct) if isinstance(instruct, list) else ([instruct] * len(texts) if instruct is not None else [""] * len(texts))
-
-        if len(languages) == 1 and len(texts) > 1:
-            languages = languages * len(texts)
-        if len(speakers) == 1 and len(texts) > 1:
-            speakers = speakers * len(texts)
-        if len(instructs) == 1 and len(texts) > 1:
-            instructs = instructs * len(texts)
-
-        if not (len(texts) == len(languages) == len(speakers) == len(instructs)):
-            raise ValueError(
-                f"Batch size mismatch: text={len(texts)}, language={len(languages)}, speaker={len(speakers)}, instruct={len(instructs)}"
-            )
+        instructs = self._expand_to_batch(
+            self._ensure_list(instruct) if isinstance(instruct, list) else ([instruct] if instruct is not None else [""]),
+            len(texts),
+            "instruct",
+        )
 
         self._validate_languages(languages)
         self._validate_speakers(speakers)
 
         input_ids = self._tokenize_texts([self._build_assistant_text(t) for t in texts])
-
-        instruct_ids: List[Optional[torch.Tensor]] = []
-        for ins in instructs:
-            if ins is None or ins == "":
-                instruct_ids.append(None)
-            else:
-                instruct_ids.append(self._tokenize_texts([self._build_instruct_text(ins)])[0])
+        instruct_ids = self._build_instruct_ids(instructs)
 
         gen_kwargs = self._merge_generate_kwargs(**kwargs)
 
-        talker_codes_list, _ = self.model.generate(
+        talker_codes_list, _ = self._run_generate(
             input_ids=input_ids,
             instruct_ids=instruct_ids,
             languages=languages,
@@ -891,7 +1370,16 @@ class Qwen3TTSModel:
             **gen_kwargs,
         )
 
-        wavs, fs = self.model.speech_tokenizer.decode([{"audio_codes": c} for c in talker_codes_list])
+        self._log_custom_voice_generation_stats(
+            texts=texts,
+            speakers=speakers,
+            languages=languages,
+            instructs=instructs,
+            talker_codes_list=talker_codes_list,
+            gen_kwargs=gen_kwargs,
+        )
+
+        wavs, fs = self._decode_audio_codes(talker_codes_list)
         return wavs, fs
 
 

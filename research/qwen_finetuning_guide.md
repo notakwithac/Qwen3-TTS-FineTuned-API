@@ -39,7 +39,7 @@ cd Qwen3-TTS-FineTuned-API
 > Compiling Flash Attention on Windows manually usually fails. You **must** use a pre-compiled wheel.
 
 1.  Download the `.whl` file for Python 3.11 from the [jmica/flash_attention](https://huggingface.co/jmica/flash_attention) repo.
-2.  **Rename the file**: Browsers often escape the `+` sign as `%2B`. Rename it back to `+` (e.g., `flash_attn-2.8.3+cu128...`).
+2.  **Rename the file**: Browsers often escape the `+` sign as `%2B`. Rename it back to `+` (e.g., `flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl`).
 3.  Place the `.whl` in the root `Qwen3-TTS` folder.
 
 ### 3. Initialize Python Environment

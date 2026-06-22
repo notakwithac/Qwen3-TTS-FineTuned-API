@@ -11,6 +11,21 @@ export GPU_IDLE_TIMEOUT="${GPU_IDLE_TIMEOUT:-300}"    # 5 min idle unload
 export GPU_MAX_CONCURRENCY="${GPU_MAX_CONCURRENCY:-4}" # Concurrent tasks
 export GPU_MAX_MODELS="${GPU_MAX_MODELS:-4}"           # LRU Cache size (4 characters)
 
+# Ensure PyTorch native libs are discoverable for flash-attn / other CUDA extensions.
+TORCH_LIB_DIR="$(python - <<'PY'
+import os
+try:
+    import torch
+    print(os.path.join(os.path.dirname(torch.__file__), "lib"))
+except Exception:
+    print("")
+PY
+)"
+if [ -n "${TORCH_LIB_DIR}" ] && [ -d "${TORCH_LIB_DIR}" ]; then
+    export LD_LIBRARY_PATH="${TORCH_LIB_DIR}:/opt/conda/lib:${LD_LIBRARY_PATH}"
+    echo "   Torch native libs: ${TORCH_LIB_DIR}"
+fi
+
 # Clean up any stale signal file from a previous run
 if [ -f terminate_signal.tmp ]; then
     echo "⚠️  Removing stale terminate_signal.tmp from previous run"

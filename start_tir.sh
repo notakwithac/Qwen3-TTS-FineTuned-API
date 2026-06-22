@@ -24,8 +24,7 @@ if [ -f ".venv/bin/activate" ]; then
     echo "[INFO] Activating virtual environment..." | tee -a "${LOG_DIR}/startup.log"
     source .venv/bin/activate
 else
-    echo "[ERROR] .venv not found. Please run setup_tir.sh first." | tee -a "${LOG_DIR}/startup.log"
-    exit 1
+    echo "[INFO] .venv not found. Using the container's default Python environment." | tee -a "${LOG_DIR}/startup.log"
 fi
 
 # Load .env if it exists
@@ -39,6 +38,21 @@ export DEVICE="${DEVICE:-cuda:0}"
 export USE_FLASH_ATTN="${USE_FLASH_ATTN:-1}"
 export GPU_IDLE_TIMEOUT="${GPU_IDLE_TIMEOUT:-300}"
 export GPU_MAX_MODELS="${GPU_MAX_MODELS:-4}"
+
+# Ensure PyTorch native libs are discoverable for flash-attn / other CUDA extensions.
+TORCH_LIB_DIR="$(python - <<'PY'
+import os
+try:
+    import torch
+    print(os.path.join(os.path.dirname(torch.__file__), "lib"))
+except Exception:
+    print("")
+PY
+)"
+if [ -n "${TORCH_LIB_DIR}" ] && [ -d "${TORCH_LIB_DIR}" ]; then
+    export LD_LIBRARY_PATH="${TORCH_LIB_DIR}:/opt/conda/lib:${LD_LIBRARY_PATH}"
+    echo "[INFO] Added Torch native lib path to LD_LIBRARY_PATH: ${TORCH_LIB_DIR}" | tee -a "${LOG_DIR}/startup.log"
+fi
 
 # --- 4. EXECUTION ---
 echo "[INFO] Starting GPU Idle Watchdog..." | tee -a "${LOG_DIR}/startup.log"

@@ -11,17 +11,35 @@ import tempfile
 import time
 import uuid
 import asyncio
+import base64
+import threading
+import torch
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
+from functools import partial
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, Request
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from pipeline import Pipeline, JobStatus
 from storage import storage
 from ops_logger import ops_log
-from session_manager import SessionManager, SessionStatus
+from session_manager import (
+    DuplicateActiveSessionError,
+    SessionManager,
+    SessionStatus,
+    TrainingConflictError,
+)
+from metrics_collector import metrics_collector
+from gpu_resource_controller import GPUResourceController
+from dataset_jobs import (
+    load_existing_package_result,
+    load_existing_prepare_result,
+    package_dataset,
+    prepare_dataset_items,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -29,6 +47,113 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def _log_flash_attn_runtime_diagnostics() -> None:
+    torch_cuda = getattr(torch.version, "cuda", None)
+    torch_version = getattr(torch, "__version__", "unknown")
+    logger.info(
+        "Runtime diagnostics: torch=%s torch_cuda=%s cuda_available=%s",
+        torch_version,
+        torch_cuda,
+        torch.cuda.is_available(),
+    )
+    try:
+        import flash_attn  # type: ignore
+
+        flash_version = getattr(flash_attn, "__version__", "unknown")
+        flash_path = getattr(flash_attn, "__file__", "unknown")
+        logger.info(
+            "Runtime diagnostics: flash_attn=%s path=%s",
+            flash_version,
+            flash_path,
+        )
+    except Exception as exc:
+        logger.warning("Runtime diagnostics: flash_attn import failed: %s", exc)
+
+# --- Log Streaming & SSE Setup ---
+from sse_starlette.sse import EventSourceResponse
+from broadcaster import Broadcast
+import sys
+from collections import deque
+
+# Broadcast instance for efficient fan-out
+broadcast = Broadcast("memory://")
+
+# In-memory history buffer for new client context (last 200 logs)
+log_history = deque(maxlen=200)
+
+class LogStreamHandler(logging.Handler):
+    """Custom logging handler that publishes log records to a broadcast channel."""
+    def __init__(self):
+        super().__init__()
+        self.loop = None
+
+    @staticmethod
+    def _should_keep_ops_record(message: str) -> bool:
+        message = message.lower()
+        keep_keywords = (
+            "voice_design",
+            "voice_clone",
+            "session_worker_batch",
+            "session_prepare",
+            "session_teardown",
+        )
+        return any(keyword in message for keyword in keep_keywords)
+
+    def emit(self, record: logging.LogRecord):
+        # 1. General level filter for the stream: only INFO and above
+        if record.levelno < logging.INFO:
+            return
+
+        # 2. Filter out noisy operational and status logs from the SSE stream
+        if record.levelno < logging.WARNING:
+            if record.name in ("ops", "httpx", "httpcore", "urllib3"):
+                if record.name == "ops" and self._should_keep_ops_record(record.getMessage()):
+                    pass  # Allow inference/session ops that are useful during stress runs.
+                else:
+                    return
+            
+            msg_lower = record.getMessage().lower()
+            noise_filters = [
+                "/health", "/status", "/ops/", "/gpu/status", 
+                "/gpu/vram", "/sessions", "/docs", "/openapi.json", "/favicon.ico"
+            ]
+            if any(f in msg_lower for f in noise_filters):
+                return
+
+        try:
+            msg = self.format(record)
+            
+            # Add to history buffer
+            log_history.append(msg)
+            
+            # Publish to broadcast channel if loop is available
+            if self.loop:
+                self.loop.call_soon_threadsafe(
+                    lambda: asyncio.create_task(broadcast.publish("logs", msg))
+                )
+        except Exception:
+            self.handleError(record)
+
+class StreamToLogger:
+    """Utility to redirect stdout/stderr to a logger."""
+    def __init__(self, logger, log_level):
+        self.logger = logger
+        self.log_level = log_level
+        self.linebuf = ""
+
+    def write(self, buf):
+        for line in buf.rstrip().splitlines():
+            self.logger.log(self.log_level, line.rstrip())
+
+    def flush(self):
+        pass
+
+# Attach stream handler to root logger and 'ops' logger
+stream_handler = LogStreamHandler()
+stream_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+logging.getLogger().addHandler(stream_handler)
 
 # Suppress noisy model initialization logs
 logging.getLogger("qwen_tts.core.models.configuration_qwen3_tts").setLevel(logging.ERROR)
@@ -43,14 +168,206 @@ logging.getLogger("transformers.generation.utils").setLevel(logging.ERROR)
 
 from contextlib import asynccontextmanager
 
+
+def _startup_preload_snapshot() -> dict[str, Any]:
+    stats = pipeline.inference.stats
+    return {
+        "loaded_count": stats.get("loaded_count"),
+        "max_models": stats.get("max_models"),
+        "loaded_checkpoints": stats.get("loaded_checkpoints", []),
+        "shared_model_replicas": stats.get("shared_model_replicas", {}),
+        "shared_model_min_headroom_gb": stats.get("shared_model_min_headroom_gb"),
+        "inference_limiter": stats.get("inference_limiter", {}),
+        "gpu_memory": {
+            "total_gb": stats.get("gpu_memory_total_gb"),
+            "allocated_gb": stats.get("gpu_memory_allocated_gb"),
+            "reserved_gb": stats.get("gpu_memory_reserved_gb"),
+            "free_gb": stats.get("gpu_memory_free_gb"),
+        },
+    }
+
+
+GPU_COOLDOWN_SECONDS = int(os.getenv("GPU_COOLDOWN_SECONDS", "1200"))
+
+
+def _format_utc_ts(value: Optional[float]) -> Optional[str]:
+    if value is None:
+        return None
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(value))
+
+
+def _parse_utc_ts(value: Optional[str]) -> Optional[float]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def _gpu_scheduler_status() -> dict[str, Any]:
+    stats = dict(pipeline.inference.stats)
+    session_snapshot = session_mgr.scheduler_snapshot()
+    limiter = stats.get("inference_limiter", {})
+    limiter_waiting = sum((limiter.get("waiting") or {}).values())
+    running_operations = ops_log.get_running()
+
+    active_requests = int(stats.get("active_requests") or 0)
+    queued_session_items = int(session_snapshot.get("queued_session_items") or 0)
+    queued_requests = queued_session_items + limiter_waiting
+    is_idle = active_requests == 0 and queued_requests == 0
+
+    idle_started_at = stats.get("idle_started_at") if is_idle else None
+    idle_started_epoch = _parse_utc_ts(idle_started_at)
+    idle_seconds = None
+    cooldown_deadline_at = None
+    cooldown_remaining_seconds = None
+    cooldown_ready = False
+
+    if idle_started_epoch is not None:
+        now = time.time()
+        idle_seconds = round(max(now - idle_started_epoch, 0.0), 1)
+        cooldown_deadline_epoch = idle_started_epoch + GPU_COOLDOWN_SECONDS
+        cooldown_deadline_at = _format_utc_ts(cooldown_deadline_epoch)
+        cooldown_remaining_seconds = max(round(cooldown_deadline_epoch - now, 1), 0.0)
+        cooldown_ready = cooldown_remaining_seconds == 0.0
+
+    stats.update(
+        {
+            "active_sessions": session_snapshot["active_sessions"],
+            "total_sessions": session_snapshot["total_sessions"],
+            "active_workers": session_snapshot["active_workers"],
+            "queued_session_items": queued_session_items,
+            "limiter_waiting_requests": limiter_waiting,
+            "queued_requests": queued_requests,
+            "running_operations": len(running_operations),
+            "session_status_counts": session_snapshot["status_counts"],
+            "is_idle": is_idle,
+            "idle_started_at": idle_started_at,
+            "idle_seconds": idle_seconds,
+            "cooldown_seconds": GPU_COOLDOWN_SECONDS,
+            "cooldown_deadline_at": cooldown_deadline_at,
+            "cooldown_remaining_seconds": cooldown_remaining_seconds,
+            "cooldown_ready": cooldown_ready,
+        }
+    )
+    return stats
+
+
+async def _startup_preload_shared_models() -> None:
+    loop = asyncio.get_running_loop()
+    preload_steps = (
+        ("voice_design", pipeline.inference.load_voice_design),
+        ("voice_clone", pipeline.inference.load_voice_clone),
+    )
+
+    for model_type, loader in preload_steps:
+        ops_log.log_event(
+            "startup_preload_started",
+            extra={
+                "model_type": model_type,
+                "preload_policy": "warn_and_continue",
+                **_startup_preload_snapshot(),
+            },
+        )
+        try:
+            await loop.run_in_executor(None, loader)
+        except Exception as exc:
+            logger.warning(
+                "Startup preload failed for %s; continuing boot with lazy loading.",
+                model_type,
+                exc_info=True,
+            )
+            ops_log.log_event(
+                "startup_preload_failed",
+                extra={
+                    "model_type": model_type,
+                    "continue_boot": True,
+                    "error": str(exc),
+                    **_startup_preload_snapshot(),
+                },
+                level=logging.WARNING,
+            )
+        else:
+            ops_log.log_event(
+                "startup_preload_finished",
+                extra={
+                    "model_type": model_type,
+                    "preload_policy": "warn_and_continue",
+                    **_startup_preload_snapshot(),
+                },
+            )
+
+
+def _set_startup_preload_state(
+    *,
+    in_progress: Optional[bool] = None,
+    last_error: Optional[str] = None,
+    completed_at: Optional[str] = None,
+) -> None:
+    if in_progress is not None:
+        app.state.startup_preload_in_progress = in_progress
+    if last_error is not None:
+        app.state.startup_preload_last_error = last_error
+    if completed_at is not None:
+        app.state.startup_preload_completed_at = completed_at
+
+
+async def _background_startup_preload_shared_models() -> None:
+    _set_startup_preload_state(in_progress=True, last_error="", completed_at=None)
+    try:
+        await _startup_preload_shared_models()
+    except Exception as exc:
+        logger.warning("Background startup preload crashed unexpectedly.", exc_info=True)
+        _set_startup_preload_state(last_error=str(exc))
+        raise
+    else:
+        _set_startup_preload_state(last_error="")
+    finally:
+        _set_startup_preload_state(
+            in_progress=False,
+            completed_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        )
+
 @asynccontextmanager
 async def _lifespan(app):
-    # Startup: start session cleanup loop
+    # Startup: connect to broadcast
+    await broadcast.connect()
+    
+    # Startup: capture the main event loop for our stream handler
+    stream_handler.loop = asyncio.get_running_loop()
+    
+    # Redirect stdout to logger (so prints from sub-modules show up in stream)
+    sys.stdout = StreamToLogger(logger, logging.INFO)
+    
+    # Startup: start session cleanup loop and resource monitoring
     session_mgr.start_cleanup_loop()
+    metrics_collector.start()
+    _log_flash_attn_runtime_diagnostics()
+    if STARTUP_PRELOAD_SHARED_MODELS:
+        app.state.startup_preload_task = asyncio.create_task(_background_startup_preload_shared_models())
+    else:
+        app.state.startup_preload_task = None
+        _set_startup_preload_state(
+            in_progress=False,
+            last_error="",
+            completed_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        )
+        ops_log.log_event(
+            "startup_preload_skipped",
+            extra={"reason": "STARTUP_PRELOAD_SHARED_MODELS=0", **_startup_preload_snapshot()},
+        )
     yield
-    # Shutdown: wait for any in-progress S3 uploads
+    # Shutdown: disconnect broadcast
+    await broadcast.disconnect()
+    # Restore stdout
+    sys.stdout = sys.__stdout__
+    # Shutdown: stop metrics collector and wait for any in-progress S3 uploads
+    metrics_collector.stop()
+    preload_task = getattr(app.state, "startup_preload_task", None)
+    if preload_task is not None:
+        await preload_task
     logger.info("Server shutting down — waiting for pending S3 uploads...")
-    import asyncio
     await asyncio.get_event_loop().run_in_executor(None, pipeline.shutdown)
     logger.info("Shutdown complete.")
 
@@ -66,6 +383,58 @@ app = FastAPI(
 
 # Global draining flag - when True, the API rejects new work but allows status checks.
 IS_DRAINING = False
+
+# Finetune requests can be polled by orchestrators before pipeline.create_job()
+# has finished downloading/extracting the dataset and persisting job metadata.
+# Track those accepted-but-not-yet-created jobs so GET /jobs/{job_id} can return
+# a stable queued status instead of a transient 404.
+_pending_finetune_jobs: dict[str, dict[str, Any]] = {}
+_pending_finetune_jobs_lock = threading.Lock()
+
+
+def _build_pending_finetune_job(job_id: str, req: Any) -> dict[str, Any]:
+    return {
+        "job_id": job_id,
+        "status": JobStatus.QUEUED,
+        "speaker_name": req.speaker_name,
+        "progress": {
+            "stage": "queued",
+            "detail": "Finetune request accepted; creating job metadata and preparing dataset.",
+        },
+        "checkpoint_path": None,
+        "error": None,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "finished_at": None,
+        "config": {
+            "num_epochs": req.num_epochs,
+            "batch_size": req.batch_size,
+            "lr": req.lr,
+            "flash_attn": USE_FLASH_ATTN,
+            "book_id": req.book_id,
+            "chapter_id": req.chapter_id,
+            "character_id": req.character_id,
+            "base_model_path": None,
+        },
+        "message": "Job accepted and queued for creation.",
+    }
+
+
+def _register_pending_finetune_job(job_id: str, req: Any) -> dict[str, Any]:
+    pending = _build_pending_finetune_job(job_id, req)
+    with _pending_finetune_jobs_lock:
+        _pending_finetune_jobs[job_id] = pending
+    return pending
+
+
+def _get_pending_finetune_job(job_id: str) -> Optional[dict[str, Any]]:
+    with _pending_finetune_jobs_lock:
+        pending = _pending_finetune_jobs.get(job_id)
+        return dict(pending) if pending else None
+
+
+def _clear_pending_finetune_job(job_id: str) -> None:
+    with _pending_finetune_jobs_lock:
+        _pending_finetune_jobs.pop(job_id, None)
 
 # ---------------------------------------------------------------------------
 # Middleware: Request Logging
@@ -116,19 +485,95 @@ async def log_requests(request: Request, call_next):
         raise
 
 # GPU configuration
+def _default_gpu_max_models() -> int:
+    if not torch.cuda.is_available():
+        return 1
+    total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    if total_vram_gb >= 47.0:
+        return 7
+    if total_vram_gb >= 23.0:
+        return 4
+    return 1
+
+
 DEVICE = os.environ.get("DEVICE", "cuda:0")
 USE_FLASH_ATTN = os.environ.get("USE_FLASH_ATTN", "1") == "1"
 GPU_IDLE_TIMEOUT = int(os.environ.get("GPU_IDLE_TIMEOUT", "600"))
 GPU_MAX_CONCURRENCY = int(os.environ.get("GPU_MAX_CONCURRENCY", "16"))
-GPU_MAX_MODELS = int(os.environ.get("GPU_MAX_MODELS", "4"))
+GPU_MAX_MODELS = int(os.environ.get("GPU_MAX_MODELS", str(_default_gpu_max_models())))
 GPU_BATCH_SIZE = int(os.environ.get("GPU_BATCH_SIZE", "32"))
+VOICE_CLONE_API_BATCH_SIZE = int(
+    os.environ.get("VOICE_CLONE_API_BATCH_SIZE", "10")
+)
+SESSION_BATCH_MAX_CHARS = int(os.environ.get("SESSION_BATCH_MAX_CHARS", "4000"))
+CUSTOM_VOICE_SESSION_BATCH_SIZE = int(
+    os.environ.get("CUSTOM_VOICE_SESSION_BATCH_SIZE", "1")
+)
+CUSTOM_VOICE_API_BATCH_SIZE = int(
+    os.environ.get("CUSTOM_VOICE_API_BATCH_SIZE", "1")
+)
+CUSTOM_VOICE_SESSION_BATCH_PADDED_CHARS = int(
+    os.environ.get(
+        "CUSTOM_VOICE_SESSION_BATCH_PADDED_CHARS",
+        str(max(1, SESSION_BATCH_MAX_CHARS // 2)),
+    )
+)
+CUSTOM_VOICE_SESSION_DO_SAMPLE = os.environ.get(
+    "CUSTOM_VOICE_SESSION_DO_SAMPLE",
+    "1",
+) == "1"
+CUSTOM_VOICE_SESSION_SUBTALKER_DO_SAMPLE = os.environ.get(
+    "CUSTOM_VOICE_SESSION_SUBTALKER_DO_SAMPLE",
+    "1" if CUSTOM_VOICE_SESSION_DO_SAMPLE else "0",
+) == "1"
+CUSTOM_VOICE_SESSION_TEMPERATURE = float(
+    os.environ.get("CUSTOM_VOICE_SESSION_TEMPERATURE", "0.7")
+)
+CUSTOM_VOICE_SESSION_TOP_P = float(
+    os.environ.get("CUSTOM_VOICE_SESSION_TOP_P", "0.85")
+)
+CUSTOM_VOICE_SESSION_MAX_NEW_TOKENS = int(
+    os.environ.get("CUSTOM_VOICE_SESSION_MAX_NEW_TOKENS", "4096")
+)
+CUSTOM_VOICE_SESSION_MIN_NEW_TOKENS = int(
+    os.environ.get("CUSTOM_VOICE_SESSION_MIN_NEW_TOKENS", "512")
+)
+CUSTOM_VOICE_SESSION_MAX_NEW_TOKENS_PER_CHAR = int(
+    os.environ.get("CUSTOM_VOICE_SESSION_MAX_NEW_TOKENS_PER_CHAR", "4")
+)
 USE_TORCH_COMPILE = os.environ.get("USE_TORCH_COMPILE", "1") == "1"
+STARTUP_PRELOAD_SHARED_MODELS = os.environ.get("STARTUP_PRELOAD_SHARED_MODELS", "1") == "1"
+
+# Resource Isolation
+_allow_concurrent_val = os.environ.get("ALLOW_CONCURRENT_TRAINING_INFERENCE")
+ALLOW_CONCURRENT = None
+if _allow_concurrent_val is not None:
+    ALLOW_CONCURRENT = _allow_concurrent_val == "1"
+
+gpu_controller = GPUResourceController(allow_concurrent=ALLOW_CONCURRENT)
 
 # Session configuration
 REPLICA_THRESHOLD = int(os.environ.get("REPLICA_THRESHOLD", "500"))
 MAX_REPLICAS_PER_MODEL = int(os.environ.get("MAX_REPLICAS_PER_MODEL", "4"))
 SESSION_TIMEOUT = int(os.environ.get("SESSION_TIMEOUT", "3600"))
-MAX_CONCURRENT_VOICE_DESIGNS = int(os.environ.get("MAX_CONCURRENT_VOICE_DESIGNS", "4"))
+MAX_CONCURRENT_VOICE_DESIGNS = int(os.environ.get("MAX_CONCURRENT_VOICE_DESIGNS", str(GPU_BATCH_SIZE)))
+BATCH_STORAGE_CONCURRENCY = int(os.environ.get("BATCH_STORAGE_CONCURRENCY", "8"))
+_configured_dataset_jobs = int(os.environ.get("MAX_CONCURRENT_DATASET_JOBS", "1"))
+MAX_CONCURRENT_DATASET_JOBS = max(1, min(3, _configured_dataset_jobs))
+TRAIN_BATCH_SIZE = int(os.environ.get("TRAIN_BATCH_SIZE", "1"))
+TRAIN_MAX_BATCH_SIZE = int(os.environ.get("TRAIN_MAX_BATCH_SIZE", str(TRAIN_BATCH_SIZE)))
+DATASET_PREP_BATCH_SIZE = int(os.environ.get("DATASET_PREP_BATCH_SIZE", "1"))
+DATASET_JOB_MIN_FREE_VRAM_GB = float(
+    os.environ.get(
+        "DATASET_JOB_MIN_FREE_VRAM_GB",
+        os.environ.get("DATASET_PREP_CUDA_MIN_FREE_GB", "10"),
+    )
+)
+DATASET_JOB_VRAM_WAIT_POLL_SEC = float(os.environ.get("DATASET_JOB_VRAM_WAIT_POLL_SEC", "5"))
+DATASET_JOB_VRAM_WAIT_TIMEOUT_SEC = float(os.environ.get("DATASET_JOB_VRAM_WAIT_TIMEOUT_SEC", "0"))
+VOICE_DESIGN_REPLICAS = int(os.environ.get("VOICE_DESIGN_REPLICAS", "1"))
+VOICE_CLONE_REPLICAS = int(os.environ.get("VOICE_CLONE_REPLICAS", "1"))
+SHARED_MODEL_MIN_HEADROOM_GB = float(os.environ.get("SHARED_MODEL_MIN_HEADROOM_GB", "4"))
 
 logger.info(f"Loaded Configuration:")
 logger.info(f"  - DEVICE: {DEVICE}")
@@ -137,9 +582,46 @@ logger.info(f"  - GPU_IDLE_TIMEOUT: {GPU_IDLE_TIMEOUT}s")
 logger.info(f"  - GPU_MAX_CONCURRENCY: {GPU_MAX_CONCURRENCY}")
 logger.info(f"  - GPU_MAX_MODELS: {GPU_MAX_MODELS}")
 logger.info(f"  - GPU_BATCH_SIZE: {GPU_BATCH_SIZE}")
+logger.info(f"  - VOICE_CLONE_API_BATCH_SIZE: {VOICE_CLONE_API_BATCH_SIZE}")
+logger.info(f"  - SESSION_BATCH_MAX_CHARS: {SESSION_BATCH_MAX_CHARS}")
+logger.info(f"  - CUSTOM_VOICE_SESSION_BATCH_SIZE: {CUSTOM_VOICE_SESSION_BATCH_SIZE}")
+logger.info(f"  - CUSTOM_VOICE_API_BATCH_SIZE: {CUSTOM_VOICE_API_BATCH_SIZE}")
+logger.info(
+    f"  - CUSTOM_VOICE_SESSION_BATCH_PADDED_CHARS: {CUSTOM_VOICE_SESSION_BATCH_PADDED_CHARS}"
+)
+logger.info(f"  - CUSTOM_VOICE_SESSION_DO_SAMPLE: {CUSTOM_VOICE_SESSION_DO_SAMPLE}")
+logger.info(
+    f"  - CUSTOM_VOICE_SESSION_SUBTALKER_DO_SAMPLE: {CUSTOM_VOICE_SESSION_SUBTALKER_DO_SAMPLE}"
+)
+logger.info(f"  - CUSTOM_VOICE_SESSION_TEMPERATURE: {CUSTOM_VOICE_SESSION_TEMPERATURE}")
+logger.info(f"  - CUSTOM_VOICE_SESSION_TOP_P: {CUSTOM_VOICE_SESSION_TOP_P}")
+logger.info(f"  - CUSTOM_VOICE_SESSION_MAX_NEW_TOKENS: {CUSTOM_VOICE_SESSION_MAX_NEW_TOKENS}")
+logger.info(f"  - CUSTOM_VOICE_SESSION_MIN_NEW_TOKENS: {CUSTOM_VOICE_SESSION_MIN_NEW_TOKENS}")
+logger.info(
+    f"  - CUSTOM_VOICE_SESSION_MAX_NEW_TOKENS_PER_CHAR: "
+    f"{CUSTOM_VOICE_SESSION_MAX_NEW_TOKENS_PER_CHAR}"
+)
 logger.info(f"  - USE_TORCH_COMPILE: {USE_TORCH_COMPILE}")
+logger.info(f"  - STARTUP_PRELOAD_SHARED_MODELS: {STARTUP_PRELOAD_SHARED_MODELS}")
 logger.info(f"  - REPLICA_THRESHOLD: {REPLICA_THRESHOLD}")
 logger.info(f"  - MAX_CONCURRENT_VOICE_DESIGNS: {MAX_CONCURRENT_VOICE_DESIGNS}")
+logger.info(f"  - BATCH_STORAGE_CONCURRENCY: {BATCH_STORAGE_CONCURRENCY}")
+if MAX_CONCURRENT_DATASET_JOBS != _configured_dataset_jobs:
+    logger.warning(
+        "MAX_CONCURRENT_DATASET_JOBS=%s capped to %s (hard limit).",
+        _configured_dataset_jobs,
+        MAX_CONCURRENT_DATASET_JOBS,
+    )
+logger.info(f"  - MAX_CONCURRENT_DATASET_JOBS: {MAX_CONCURRENT_DATASET_JOBS}")
+logger.info(f"  - TRAIN_BATCH_SIZE: {TRAIN_BATCH_SIZE}")
+logger.info(f"  - TRAIN_MAX_BATCH_SIZE: {TRAIN_MAX_BATCH_SIZE}")
+logger.info(f"  - DATASET_PREP_BATCH_SIZE: {DATASET_PREP_BATCH_SIZE}")
+logger.info(f"  - DATASET_JOB_MIN_FREE_VRAM_GB: {DATASET_JOB_MIN_FREE_VRAM_GB}")
+logger.info(f"  - DATASET_JOB_VRAM_WAIT_POLL_SEC: {DATASET_JOB_VRAM_WAIT_POLL_SEC}")
+logger.info(f"  - DATASET_JOB_VRAM_WAIT_TIMEOUT_SEC: {DATASET_JOB_VRAM_WAIT_TIMEOUT_SEC}")
+logger.info(f"  - VOICE_DESIGN_REPLICAS: {VOICE_DESIGN_REPLICAS}")
+logger.info(f"  - VOICE_CLONE_REPLICAS: {VOICE_CLONE_REPLICAS}")
+logger.info(f"  - SHARED_MODEL_MIN_HEADROOM_GB: {SHARED_MODEL_MIN_HEADROOM_GB}")
 logger.info(f"  - MAX_REPLICAS_PER_MODEL: {MAX_REPLICAS_PER_MODEL}")
 logger.info(f"  - SESSION_TIMEOUT: {SESSION_TIMEOUT}s")
 
@@ -152,6 +634,12 @@ pipeline = Pipeline(
     max_concurrency=GPU_MAX_CONCURRENCY,
     max_models=GPU_MAX_MODELS,
     compile=USE_TORCH_COMPILE,
+    gpu_controller=gpu_controller,
+    shared_model_replicas={
+        "voice_design": VOICE_DESIGN_REPLICAS,
+        "voice_clone": VOICE_CLONE_REPLICAS,
+    },
+    shared_model_min_headroom_gb=SHARED_MODEL_MIN_HEADROOM_GB,
 )
 
 # Session-based inference manager
@@ -162,7 +650,18 @@ session_mgr = SessionManager(
     replica_threshold=REPLICA_THRESHOLD,
     max_replicas=MAX_REPLICAS_PER_MODEL,
     session_timeout=SESSION_TIMEOUT,
-    batch_size=GPU_BATCH_SIZE,
+    batch_size=CUSTOM_VOICE_SESSION_BATCH_SIZE,
+    batch_text_budget=SESSION_BATCH_MAX_CHARS,
+    batch_padded_text_budget=CUSTOM_VOICE_SESSION_BATCH_PADDED_CHARS,
+    custom_generation_kwargs={
+        "do_sample": CUSTOM_VOICE_SESSION_DO_SAMPLE,
+        "subtalker_dosample": CUSTOM_VOICE_SESSION_SUBTALKER_DO_SAMPLE,
+        "temperature": CUSTOM_VOICE_SESSION_TEMPERATURE,
+        "top_p": CUSTOM_VOICE_SESSION_TOP_P,
+    },
+    custom_min_new_tokens=CUSTOM_VOICE_SESSION_MIN_NEW_TOKENS,
+    custom_max_new_tokens=CUSTOM_VOICE_SESSION_MAX_NEW_TOKENS,
+    custom_max_new_tokens_per_char=CUSTOM_VOICE_SESSION_MAX_NEW_TOKENS_PER_CHAR,
 )
 
 # ---------------------------------------------------------------------------
@@ -253,41 +752,427 @@ voice_design_batcher = DynamicBatcher(
 )
 
 voice_clone_batcher = DynamicBatcher(
-    batch_size=GPU_BATCH_SIZE,
+    batch_size=VOICE_CLONE_API_BATCH_SIZE,
     timeout_ms=100,
     process_fn=pipeline.inference.generate_voice_clone_flexible_batch,
     max_workers=1
 )
 
-custom_voice_batchers = {}  # Map job_id -> DynamicBatcher
+custom_voice_batchers = {}  # Map (job_id, checkpoint_path, generation_config) -> DynamicBatcher
+voice_clone_batch_jobs = {} # session_id -> {status, completed, total, results, error, ...}
+dataset_jobs = {}  # job_id -> {kind, status, total, completed, failed, ...}
+dataset_job_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DATASET_JOBS)
 
-def get_custom_voice_batcher(job_id: str, checkpoint_path: str, speaker_name: str) -> DynamicBatcher:
-    if job_id not in custom_voice_batchers:
+
+def _derive_custom_voice_max_new_tokens(
+    texts: list[str],
+    requested_max_new_tokens: Optional[int],
+) -> Optional[int]:
+    if requested_max_new_tokens is not None:
+        return requested_max_new_tokens
+    if not texts:
+        return None
+
+    max_text_chars = max(1, max(len((text or "").strip()) for text in texts))
+    derived_limit = max(
+        CUSTOM_VOICE_SESSION_MIN_NEW_TOKENS,
+        max_text_chars * CUSTOM_VOICE_SESSION_MAX_NEW_TOKENS_PER_CHAR,
+    )
+    if CUSTOM_VOICE_SESSION_MAX_NEW_TOKENS > 0:
+        derived_limit = min(derived_limit, CUSTOM_VOICE_SESSION_MAX_NEW_TOKENS)
+    return derived_limit if derived_limit > 0 else None
+
+
+def get_custom_voice_batcher(
+    job_id: str,
+    checkpoint_path: str,
+    speaker_name: str,
+    generation_config: Optional[dict[str, Any]] = None,
+) -> DynamicBatcher:
+    config = {
+        key: value
+        for key, value in (generation_config or {}).items()
+        if value is not None
+    }
+    batcher_key = (job_id, checkpoint_path, tuple(sorted(config.items())))
+    if batcher_key not in custom_voice_batchers:
         def process_fn(texts: list[str], languages: list[str], instructs: list[str]):
+            effective_config = dict(config)
+            effective_max_new_tokens = _derive_custom_voice_max_new_tokens(
+                texts,
+                effective_config.get("max_new_tokens"),
+            )
+            if effective_max_new_tokens is not None:
+                effective_config["max_new_tokens"] = effective_max_new_tokens
             return pipeline.inference.generate_batch(
                 texts=texts,
                 checkpoint_path=checkpoint_path,
                 speaker_name=speaker_name,
                 languages=languages,
-                instructs=instructs
+                instructs=instructs,
+                **effective_config,
             )
-        custom_voice_batchers[job_id] = DynamicBatcher(
-            batch_size=GPU_BATCH_SIZE,
+        custom_voice_batchers[batcher_key] = DynamicBatcher(
+            batch_size=CUSTOM_VOICE_API_BATCH_SIZE,
             timeout_ms=100,
             process_fn=process_fn,
             max_workers=1  # Always 1 worker per job/model to ensure thread-safety
         )
-    return custom_voice_batchers[job_id]
+    return custom_voice_batchers[batcher_key]
+
+
+def _sorted_clone_batch_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        results,
+        key=lambda item: (
+            item.get("index") is None,
+            item.get("index", 0),
+            item.get("filename", ""),
+        ),
+    )
+
+
+def _chunked(items: list[Any], size: int) -> list[list[Any]]:
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
+
+def _build_voice_design_filename(item: "VoiceDesignBatchItem") -> str:
+    s3_filename = item.s3_filename
+    parts = []
+    if item.character_name:
+        safe_name = "".join(
+            c for c in item.character_name if c.isalnum() or c in ("-", "_", " ")
+        ).strip().replace(" ", "_")
+        if safe_name:
+            parts.append(safe_name)
+    if item.character_uuid:
+        parts.append(item.character_uuid)
+
+    if parts:
+        prefix = "_".join(parts)
+        if s3_filename:
+            if not s3_filename.startswith(prefix):
+                s3_filename = f"{prefix}_{s3_filename}"
+        else:
+            s3_filename = f"{prefix}.wav"
+    elif not s3_filename:
+        s3_filename = f"voice_design_{uuid.uuid4().hex[:8]}.wav"
+
+    return s3_filename
+
+
+async def _storage_object_exists_async(s3_key: str) -> bool:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, partial(storage.object_exists, s3_key))
+
+
+async def _upload_wav_async(
+    wav_bytes: bytes,
+    category: str,
+    *,
+    filename: Optional[str] = None,
+    prefix: Optional[str] = None,
+    model_id: str,
+) -> str:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        partial(
+            storage.upload_wav,
+            wav_bytes,
+            category,
+            filename=filename,
+            prefix=prefix,
+            model_id=model_id,
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
 # Request / Response models
 # ---------------------------------------------------------------------------
 
-class InferRequest(BaseModel):
+MAX_TEXT_LENGTH = int(os.environ.get("MAX_TEXT_LENGTH", "5000"))
+MAX_INSTRUCT_LENGTH = int(os.environ.get("MAX_INSTRUCT_LENGTH", "1000"))
+MAX_REF_TEXT_LENGTH = int(os.environ.get("MAX_REF_TEXT_LENGTH", "5000"))
+MAX_BATCH_ITEMS = int(os.environ.get("MAX_BATCH_ITEMS", str(GPU_BATCH_SIZE)))
+# This caps the accepted request envelope only. The endpoint still breaks the
+# work into smaller GPU sub-batches using VOICE_CLONE_API_BATCH_SIZE.
+MAX_CLONE_BATCH_ITEMS = int(os.environ.get("MAX_CLONE_BATCH_ITEMS", "128"))
+
+
+def _normalize_text(value: str, field_name: str, max_length: int) -> str:
+    value = (value or "").strip()
+    if not value:
+        raise ValueError(f"{field_name} cannot be empty")
+    if len(value) > max_length:
+        raise ValueError(f"{field_name} exceeds max length of {max_length}")
+    return value
+
+
+def _normalize_optional_id(value: Optional[str], field_name: str) -> Optional[str]:
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    if len(value) > 255:
+        raise ValueError(f"{field_name} exceeds max length of 255")
+    return value
+
+
+def _normalize_filename(value: Optional[str], field_name: str = "filename") -> Optional[str]:
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    if len(value) > 255:
+        raise ValueError(f"{field_name} exceeds max length of 255")
+    if value.startswith("/") or value.startswith("\\"):
+        raise ValueError(f"{field_name} must be a relative file name")
+    if ".." in value or "/" in value or "\\" in value:
+        raise ValueError(f"{field_name} must not contain path traversal or directory separators")
+    if not value.lower().endswith(".wav"):
+        raise ValueError(f"{field_name} must end with .wav")
+    if not re.fullmatch(r"[A-Za-z0-9._ -]+", value):
+        raise ValueError(f"{field_name} contains unsupported characters")
+    return value
+
+
+def _normalize_language(value: Optional[str]) -> str:
+    value = (value or "English").strip()
+    if not value:
+        return "English"
+    if len(value) > 64:
+        raise ValueError("language exceeds max length of 64")
+    return value
+
+
+def _validate_http_url(value: str, field_name: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        raise ValueError(f"{field_name} cannot be empty")
+    if not re.match(r"^https?://", value, re.IGNORECASE):
+        raise ValueError(f"{field_name} must be an http or https URL")
+    if len(value) > 2048:
+        raise ValueError(f"{field_name} exceeds max length of 2048")
+    return value
+
+
+class APIModel(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+
+class AudioS3Result(APIModel):
+    s3_url: str
+    presigned_url: Optional[str] = None
+    s3_key: str
+    sample_rate: int
+    text: str
+    job_id: str
+    checkpoint_epoch: Optional[int] = None
+    status: str = "success"
+
+
+class AsyncSubmissionResponse(APIModel):
+    session_id: str
+    finetune_job_id: str
+    status: str
+    total: int
+
+
+class VoiceCloneBatchResultItem(APIModel):
+    filename: str
+    status: str
+    index: Optional[int] = None
+    text: Optional[str] = None
+    s3_url: Optional[str] = None
+    presigned_url: Optional[str] = None
+    s3_key: Optional[str] = None
+    sample_rate: Optional[int] = None
+    job_id: Optional[str] = None
+    error: Optional[str] = None
+
+
+class VoiceCloneBatchStatusResponse(APIModel):
+    session_id: str
+    status: str
+    progress_pct: float = 0.0
+    total: int = 0
+    completed: int = 0
+    failed: int = 0
+    clones: list[VoiceCloneBatchResultItem] = Field(default_factory=list)
+    results: list[VoiceCloneBatchResultItem] = Field(default_factory=list)
+    error: Optional[str] = None
+    created_at: float
+
+
+def _normalize_storage_ref(value: str, field_name: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        raise ValueError(f"{field_name} cannot be empty")
+    if len(value) > 2048:
+        raise ValueError(f"{field_name} exceeds max length of 2048")
+    return value
+
+
+class DatasetPrepareItem(APIModel):
+    filename: str
+    prompt_id: Optional[str] = None
+    text: str
+    s3_url: str
+
+    @field_validator("filename")
+    @classmethod
+    def validate_filename(cls, value: str) -> str:
+        normalized = _normalize_filename(value, "filename")
+        if not normalized:
+            raise ValueError("filename cannot be empty")
+        return normalized
+
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        return _normalize_text(value, "text", MAX_TEXT_LENGTH)
+
+    @field_validator("s3_url")
+    @classmethod
+    def validate_s3_url(cls, value: str) -> str:
+        return _normalize_storage_ref(value, "s3_url")
+
+
+class DatasetPrepareRequest(APIModel):
+    job_id: Optional[str] = None
+    book_id: str
+    chapter_id: Optional[str] = None
+    character_id: str
+    character_name: Optional[str] = None
+    ref_audio_url: str
+    ref_text: str
+    items: list[DatasetPrepareItem] = Field(default_factory=list)
+    amplitude: float = 1.0
+    speed: float = 1.0
+    pitch_shift: float = 0.0
+    approval_mode: str = "manual"
+    overwrite: bool = False
+
+    @field_validator("job_id", "book_id", "chapter_id", "character_id")
+    @classmethod
+    def validate_ids(cls, value: Optional[str], info) -> Optional[str]:
+        return _normalize_optional_id(value, info.field_name)
+
+    @field_validator("character_name")
+    @classmethod
+    def validate_character_name(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        return _normalize_text(value, "character_name", 128)
+
+    @field_validator("ref_audio_url")
+    @classmethod
+    def validate_ref_audio_url(cls, value: str) -> str:
+        return _normalize_storage_ref(value, "ref_audio_url")
+
+    @field_validator("ref_text")
+    @classmethod
+    def validate_ref_text(cls, value: str) -> str:
+        return _normalize_text(value, "ref_text", MAX_REF_TEXT_LENGTH)
+
+    @field_validator("approval_mode")
+    @classmethod
+    def validate_approval_mode(cls, value: str) -> str:
+        value = (value or "").strip().lower()
+        if value not in {"manual", "auto"}:
+            raise ValueError("approval_mode must be either 'manual' or 'auto'")
+        return value
+
+
+class DatasetPackageItem(APIModel):
+    id: str
+    s3_url: Optional[str] = None
+    url: Optional[str] = None
+    text: str
+    is_reference: bool = False
+    included: bool = True
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, value: str) -> str:
+        return _normalize_text(value, "id", 256)
+
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        return _normalize_text(value, "text", MAX_TEXT_LENGTH)
+
+    @field_validator("s3_url", "url")
+    @classmethod
+    def validate_refs(cls, value: Optional[str], info) -> Optional[str]:
+        if value is None:
+            return None
+        return _normalize_storage_ref(value, info.field_name)
+
+
+class DatasetPackageRequest(APIModel):
+    job_id: Optional[str] = None
+    book_id: str
+    chapter_id: Optional[str] = None
+    character_id: str
+    dataset_items: list[DatasetPackageItem]
+    overwrite: bool = False
+
+    @field_validator("job_id", "book_id", "chapter_id", "character_id")
+    @classmethod
+    def validate_ids(cls, value: Optional[str], info) -> Optional[str]:
+        return _normalize_optional_id(value, info.field_name)
+
+    @field_validator("dataset_items")
+    @classmethod
+    def validate_dataset_items(cls, value: list[DatasetPackageItem]) -> list[DatasetPackageItem]:
+        if not value:
+            raise ValueError("dataset_items cannot be empty")
+        return value
+
+
+class DatasetJobSubmissionResponse(APIModel):
+    job_id: str
+    finetune_job_id: str
+    status: str
+    kind: str
+    total: int
+
+
+class DatasetJobStatusResponse(APIModel):
+    job_id: str
+    kind: str
+    status: str
+    phase: str
+    progress_pct: float = 0.0
+    total: int = 0
+    completed: int = 0
+    failed: int = 0
+    dataset_items: list[dict[str, Any]] = Field(default_factory=list)
+    dataset_s3_key: Optional[str] = None
+    dataset_s3_url: Optional[str] = None
+    error: Optional[str] = None
+    created_at: float
+
+
+class VoiceDesignResponse(AudioS3Result):
+    job_id: str = "voice_design"
+    instruct: str
+
+
+class InferRequest(APIModel):
     text: str
     language: str = "English"
     instruct: str = ""
+    checkpoint_epoch: Optional[int] = None
+    do_sample: Optional[bool] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    max_new_tokens: Optional[int] = None
     upload_to_s3: bool = True  # Now default to True
     s3_filename: Optional[str] = None
     book_id: Optional[str] = None
@@ -295,46 +1180,178 @@ class InferRequest(BaseModel):
     character_id: Optional[str] = None
     overwrite: bool = False  # If false, skips generation if file already exists on S3
 
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        return _normalize_text(value, "text", MAX_TEXT_LENGTH)
 
-class InferS3Response(BaseModel):
-    s3_url: str
-    presigned_url: Optional[str] = None
-    s3_key: str
-    sample_rate: int
+    @field_validator("language")
+    @classmethod
+    def validate_language(cls, value: str) -> str:
+        return _normalize_language(value)
+
+    @field_validator("instruct")
+    @classmethod
+    def validate_instruct(cls, value: str) -> str:
+        value = (value or "").strip()
+        if len(value) > MAX_INSTRUCT_LENGTH:
+            raise ValueError(f"instruct exceeds max length of {MAX_INSTRUCT_LENGTH}")
+        return value
+
+    @field_validator("s3_filename")
+    @classmethod
+    def validate_s3_filename(cls, value: Optional[str]) -> Optional[str]:
+        return _normalize_filename(value, "s3_filename")
+
+    @field_validator("book_id", "chapter_id", "character_id")
+    @classmethod
+    def validate_ids(cls, value: Optional[str], info) -> Optional[str]:
+        return _normalize_optional_id(value, info.field_name)
+
+    @field_validator("checkpoint_epoch")
+    @classmethod
+    def validate_checkpoint_epoch(cls, value: Optional[int]) -> Optional[int]:
+        if value is not None and value < 0:
+            raise ValueError("checkpoint_epoch must be >= 0")
+        return value
+
+    @field_validator("temperature")
+    @classmethod
+    def validate_temperature(cls, value: Optional[float]) -> Optional[float]:
+        if value is not None and value <= 0:
+            raise ValueError("temperature must be > 0")
+        return value
+
+    @field_validator("top_p")
+    @classmethod
+    def validate_top_p(cls, value: Optional[float]) -> Optional[float]:
+        if value is not None and not (0 < value <= 1):
+            raise ValueError("top_p must be in (0, 1]")
+        return value
+
+    @field_validator("max_new_tokens")
+    @classmethod
+    def validate_max_new_tokens(cls, value: Optional[int]) -> Optional[int]:
+        if value is not None and value <= 0:
+            raise ValueError("max_new_tokens must be > 0")
+        return value
+
+
+class BatchInferItem(APIModel):
     text: str
-    job_id: str
+    filename: str
+    language: Optional[str] = None
+    instruct: str = ""
+    overwrite: Optional[bool] = None
+
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        return _normalize_text(value, "text", MAX_TEXT_LENGTH)
+
+    @field_validator("filename")
+    @classmethod
+    def validate_filename(cls, value: str) -> str:
+        normalized = _normalize_filename(value, "filename")
+        if not normalized:
+            raise ValueError("filename cannot be empty")
+        return normalized
+
+    @field_validator("language")
+    @classmethod
+    def validate_language(cls, value: Optional[str]) -> str:
+        return _normalize_language(value)
+
+    @field_validator("instruct")
+    @classmethod
+    def validate_instruct(cls, value: str) -> str:
+        value = (value or "").strip()
+        if len(value) > MAX_INSTRUCT_LENGTH:
+            raise ValueError(f"instruct exceeds max length of {MAX_INSTRUCT_LENGTH}")
+        return value
 
 
-class BatchInferRequest(BaseModel):
+class BatchInferRequest(APIModel):
     """Generate multiple audio files in one call, all uploaded to S3."""
-    items: list  # list of {"text": str, "language": str, "instruct": str, "filename": str, "overwrite": bool, "character_id": str}
+    items: list[BatchInferItem]
     language: str = "English"
+    checkpoint_epoch: Optional[int] = None
+    do_sample: Optional[bool] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    max_new_tokens: Optional[int] = None
     book_id: Optional[str] = None
     chapter_id: Optional[str] = None
     character_id: Optional[str] = None
     overwrite: bool = False  # Default overwrite flag for all items
 
+    @field_validator("items")
+    @classmethod
+    def validate_items(cls, value: list[BatchInferItem]) -> list[BatchInferItem]:
+        if not value:
+            raise ValueError("items cannot be empty")
+        if len(value) > MAX_BATCH_ITEMS:
+            raise ValueError(f"items exceeds max batch size of {MAX_BATCH_ITEMS}")
+        return value
 
-class JobSummary(BaseModel):
+    @field_validator("language")
+    @classmethod
+    def validate_language(cls, value: str) -> str:
+        return _normalize_language(value)
+
+    @field_validator("checkpoint_epoch")
+    @classmethod
+    def validate_checkpoint_epoch(cls, value: Optional[int]) -> Optional[int]:
+        if value is not None and value < 0:
+            raise ValueError("checkpoint_epoch must be >= 0")
+        return value
+
+    @field_validator("temperature")
+    @classmethod
+    def validate_temperature(cls, value: Optional[float]) -> Optional[float]:
+        if value is not None and value <= 0:
+            raise ValueError("temperature must be > 0")
+        return value
+
+    @field_validator("top_p")
+    @classmethod
+    def validate_top_p(cls, value: Optional[float]) -> Optional[float]:
+        if value is not None and not (0 < value <= 1):
+            raise ValueError("top_p must be in (0, 1]")
+        return value
+
+    @field_validator("max_new_tokens")
+    @classmethod
+    def validate_max_new_tokens(cls, value: Optional[int]) -> Optional[int]:
+        if value is not None and value <= 0:
+            raise ValueError("max_new_tokens must be > 0")
+        return value
+
+
+class JobSummary(APIModel):
     job_id: str
-    status: str
+    status: JobStatus
     speaker_name: str
-    progress: dict = {}
+    progress: dict[str, Any] = Field(default_factory=dict)
     checkpoint_path: Optional[str] = None
     error: Optional[str] = None
     created_at: str
     finished_at: Optional[str] = None
-    config: dict = {}
+    config: dict[str, Any] = Field(default_factory=dict)
+    available_checkpoint_epochs: list[int] = Field(default_factory=list)
     inference_url: Optional[str] = None
+    message: Optional[str] = None
+    s3_checkpoint_present: bool = False
+    has_durable_checkpoint: bool = False
 
 
-class StorageStatus(BaseModel):
+class StorageStatus(APIModel):
     configured: bool
     endpoint: str
     bucket: str
 
 
-class VoiceDesignRequest(BaseModel):
+class VoiceDesignRequest(APIModel):
     """Generate speech using VoiceDesign model (no fine-tuning needed)."""
     text: str
     instruct: str  # Voice description, e.g. "A warm male voice, middle-aged, calm"
@@ -345,8 +1362,33 @@ class VoiceDesignRequest(BaseModel):
     character_uuid: Optional[str] = None
     overwrite: bool = False  # If false, skips generation if file already exists on S3
 
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        return _normalize_text(value, "text", MAX_TEXT_LENGTH)
 
-class VoiceDesignBatchItem(BaseModel):
+    @field_validator("instruct")
+    @classmethod
+    def validate_instruct(cls, value: str) -> str:
+        return _normalize_text(value, "instruct", MAX_INSTRUCT_LENGTH)
+
+    @field_validator("language")
+    @classmethod
+    def validate_language(cls, value: str) -> str:
+        return _normalize_language(value)
+
+    @field_validator("s3_filename")
+    @classmethod
+    def validate_s3_filename(cls, value: Optional[str]) -> Optional[str]:
+        return _normalize_filename(value, "s3_filename")
+
+    @field_validator("character_name", "character_uuid")
+    @classmethod
+    def validate_character_fields(cls, value: Optional[str], info) -> Optional[str]:
+        return _normalize_optional_id(value, info.field_name)
+
+
+class VoiceDesignBatchItem(APIModel):
     """A single item in a voice design batch request."""
     text: str
     instruct: str  # Voice description, e.g. "A warm male voice, middle-aged, calm"
@@ -355,20 +1397,69 @@ class VoiceDesignBatchItem(BaseModel):
     character_uuid: Optional[str] = None
     s3_filename: Optional[str] = None
 
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        return _normalize_text(value, "text", MAX_TEXT_LENGTH)
 
-class VoiceDesignBatchRequest(BaseModel):
+    @field_validator("instruct")
+    @classmethod
+    def validate_instruct(cls, value: str) -> str:
+        return _normalize_text(value, "instruct", MAX_INSTRUCT_LENGTH)
+
+    @field_validator("language")
+    @classmethod
+    def validate_language(cls, value: str) -> str:
+        return _normalize_language(value)
+
+    @field_validator("character_name", "character_uuid")
+    @classmethod
+    def validate_character_fields(cls, value: Optional[str], info) -> Optional[str]:
+        return _normalize_optional_id(value, info.field_name)
+
+    @field_validator("s3_filename")
+    @classmethod
+    def validate_filename(cls, value: Optional[str]) -> Optional[str]:
+        return _normalize_filename(value, "s3_filename")
+
+
+class VoiceDesignBatchRequest(APIModel):
     """Generate multiple voice designs concurrently for rapid character voice iteration."""
     items: list[VoiceDesignBatchItem]
     upload_to_s3: bool = True
     overwrite: bool = False
 
+    @field_validator("items")
+    @classmethod
+    def validate_items(cls, value: list[VoiceDesignBatchItem]) -> list[VoiceDesignBatchItem]:
+        if not value:
+            raise ValueError("items cannot be empty")
+        if len(value) > MAX_CONCURRENT_VOICE_DESIGNS:
+            raise ValueError(f"items exceeds max batch size of {MAX_CONCURRENT_VOICE_DESIGNS}")
+        return value
 
-class VoiceCloneBatchItem(BaseModel):
+
+class VoiceCloneBatchItem(APIModel):
     text: str
-    filename: Optional[str] = None
+    filename: str
 
-class VoiceCloneBatchRequest(BaseModel):
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        return _normalize_text(value, "text", MAX_TEXT_LENGTH)
+
+    @field_validator("filename")
+    @classmethod
+    def validate_filename(cls, value: str) -> str:
+        normalized = _normalize_filename(value, "filename")
+        if not normalized:
+            raise ValueError("filename cannot be empty")
+        return normalized
+
+
+class VoiceCloneBatchRequest(APIModel):
     """Batch generate zero-shot voice cloning from a reference audio and upload to S3."""
+    session_id: Optional[str] = None
     ref_audio_url: str
     ref_text: str
     items: list[VoiceCloneBatchItem]
@@ -376,8 +1467,70 @@ class VoiceCloneBatchRequest(BaseModel):
     use_xvec: bool = False
     upload_to_s3: bool = True
     overwrite: bool = False
+    do_sample: Optional[bool] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    max_new_tokens: Optional[int] = None
 
-class VoiceCloneRequest(BaseModel):
+    @field_validator("ref_audio_url")
+    @classmethod
+    def validate_ref_audio_url(cls, value: str) -> str:
+        return _normalize_storage_ref(value, "ref_audio_url")
+
+    @field_validator("ref_text")
+    @classmethod
+    def validate_ref_text(cls, value: str) -> str:
+        return _normalize_text(value, "ref_text", MAX_REF_TEXT_LENGTH)
+
+    @field_validator("language")
+    @classmethod
+    def validate_language(cls, value: str) -> str:
+        return _normalize_language(value)
+
+    @field_validator("items")
+    @classmethod
+    def validate_items(cls, value: list[VoiceCloneBatchItem]) -> list[VoiceCloneBatchItem]:
+        if not value:
+            raise ValueError("items cannot be empty")
+        if len(value) > MAX_CLONE_BATCH_ITEMS:
+            raise ValueError(f"items exceeds max batch size of {MAX_CLONE_BATCH_ITEMS}")
+        return value
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value):
+            raise ValueError("session_id must be 1-64 characters of letters, numbers, underscore, or hyphen")
+        return value
+
+    @field_validator("temperature")
+    @classmethod
+    def validate_temperature(cls, value: Optional[float]) -> Optional[float]:
+        if value is not None and value <= 0:
+            raise ValueError("temperature must be > 0")
+        return value
+
+    @field_validator("top_p")
+    @classmethod
+    def validate_top_p(cls, value: Optional[float]) -> Optional[float]:
+        if value is not None and not (0 < value <= 1):
+            raise ValueError("top_p must be in (0, 1]")
+        return value
+
+    @field_validator("max_new_tokens")
+    @classmethod
+    def validate_max_new_tokens(cls, value: Optional[int]) -> Optional[int]:
+        if value is not None and value <= 0:
+            raise ValueError("max_new_tokens must be > 0")
+        return value
+
+
+class VoiceCloneRequest(APIModel):
     """Generate speech using zero-shot VoiceClone Base model."""
     text: str
     ref_audio_url: str
@@ -387,6 +1540,31 @@ class VoiceCloneRequest(BaseModel):
     upload_to_s3: bool = True
     s3_filename: Optional[str] = None
     overwrite: bool = False
+
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        return _normalize_text(value, "text", MAX_TEXT_LENGTH)
+
+    @field_validator("ref_audio_url")
+    @classmethod
+    def validate_ref_audio_url(cls, value: str) -> str:
+        return _normalize_storage_ref(value, "ref_audio_url")
+
+    @field_validator("ref_text")
+    @classmethod
+    def validate_ref_text(cls, value: str) -> str:
+        return _normalize_text(value, "ref_text", MAX_REF_TEXT_LENGTH)
+
+    @field_validator("language")
+    @classmethod
+    def validate_language(cls, value: str) -> str:
+        return _normalize_language(value)
+
+    @field_validator("s3_filename")
+    @classmethod
+    def validate_s3_filename(cls, value: Optional[str]) -> Optional[str]:
+        return _normalize_filename(value, "s3_filename")
 
 # ---------------------------------------------------------------------------
 # Endpoints
@@ -410,10 +1588,10 @@ async def storage_status():
         "bucket": storage.bucket,
     }
 
-class FinetuneRequest(BaseModel):
+class FinetuneRequest(APIModel):
     dataset_s3_key: str
     speaker_name: str
-    batch_size: int = 2
+    batch_size: int = TRAIN_BATCH_SIZE
     num_epochs: int = 15
     lr: float = 1e-6
     book_id: Optional[str] = None
@@ -421,6 +1599,52 @@ class FinetuneRequest(BaseModel):
     character_id: Optional[str] = None
     resume_job_id: Optional[str] = None
     job_id: Optional[str] = None
+    force: bool = False
+    overwrite: bool = False
+
+    @field_validator("dataset_s3_key")
+    @classmethod
+    def validate_dataset_key(cls, value: str) -> str:
+        value = (value or "").strip()
+        if not value:
+            raise ValueError("dataset_s3_key cannot be empty")
+        if len(value) > 1024:
+            raise ValueError("dataset_s3_key exceeds max length of 1024")
+        return value
+
+    @field_validator("speaker_name")
+    @classmethod
+    def validate_speaker_name(cls, value: str) -> str:
+        value = _normalize_text(value, "speaker_name", 128)
+        if not re.fullmatch(r"[A-Za-z0-9_ -]+", value):
+            raise ValueError("speaker_name contains unsupported characters")
+        return value
+
+    @field_validator("batch_size")
+    @classmethod
+    def validate_batch_size(cls, value: int) -> int:
+        if value < 1 or value > TRAIN_MAX_BATCH_SIZE:
+            raise ValueError(f"batch_size must be between 1 and {TRAIN_MAX_BATCH_SIZE}")
+        return value
+
+    @field_validator("num_epochs")
+    @classmethod
+    def validate_num_epochs(cls, value: int) -> int:
+        if value < 1 or value > 200:
+            raise ValueError("num_epochs must be between 1 and 200")
+        return value
+
+    @field_validator("lr")
+    @classmethod
+    def validate_lr(cls, value: float) -> float:
+        if value <= 0 or value > 1:
+            raise ValueError("lr must be greater than 0 and at most 1")
+        return value
+
+    @field_validator("book_id", "chapter_id", "character_id", "resume_job_id", "job_id")
+    @classmethod
+    def validate_ids(cls, value: Optional[str], info) -> Optional[str]:
+        return _normalize_optional_id(value, info.field_name)
 
 @app.post("/finetune", summary="Start a fine-tuning job", response_model=JobSummary)
 def create_finetune_job(req: FinetuneRequest):
@@ -444,6 +1668,8 @@ def create_finetune_job(req: FinetuneRequest):
             status_code=400,
             detail="Speaker name cannot contain an underscore followed by a number (e.g. avoid 'Voice_1'). Use 'Voice1' instead."
         )
+
+    effective_job_id = req.job_id or uuid.uuid4().hex[:12]
 
     # Download dataset from S3 to a temporary file
     with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
@@ -469,17 +1695,26 @@ def create_finetune_job(req: FinetuneRequest):
 
         # If job_id is provided, check if it already exists
         if req.job_id:
+            pending_job = _get_pending_finetune_job(req.job_id)
+            if pending_job and not req.force:
+                logger.info(
+                    "Job %s is already pending local creation. Returning queued snapshot.",
+                    req.job_id,
+                )
+                return JSONResponse(content=pending_job, status_code=202)
+
             existing_job = pipeline.get_job(req.job_id)
             if existing_job:
-                # If job exists, we return it. If the user wanted a fresh start with same ID, 
-                # the pipeline.create_job logic will handle cleanup if called.
-                # However, to match the "create" intent, we only return existing if it's already active/ready.
-                # If they explicitly want to RE-CREATE, they should probably delete first or we can allow it.
-                # Given the user's request "create a finetune job with the same dataset and same job_id if job is not found",
-                # it implies they'll only call this if it's NOT found. 
-                # But if it IS found, returning it is the safest "idempotent" behavior.
-                logger.info(f"Job {req.job_id} already exists. Returning existing job.")
-                return JSONResponse(content=existing_job.to_dict(), status_code=200)
+                # User refinement: Only return if status is QUEUED or TRAINING, 
+                # unless force is true in which case we restart anyway.
+                # All other states (FAILED, READY, etc) trigger a restart if force=False isn't enough.
+                if not req.force and existing_job.status in (JobStatus.QUEUED, JobStatus.TRAINING):
+                    logger.info(f"Job {req.job_id} already exists with active status {existing_job.status}. Returning existing.")
+                    return JSONResponse(content=existing_job.to_dict(), status_code=200)
+                else:
+                    logger.warning(f"Re-creating/Retrying job {req.job_id} (Status: {existing_job.status}, Force={req.force})")
+
+        _register_pending_finetune_job(effective_job_id, req)
 
         # Download the file from S3
         storage.download_file(req.dataset_s3_key, tmp_path)
@@ -494,10 +1729,12 @@ def create_finetune_job(req: FinetuneRequest):
             chapter_id=req.chapter_id,
             character_id=req.character_id,
             base_model_path=base_model_path,
-            job_id=req.job_id,
+            job_id=effective_job_id,
         )
+        _clear_pending_finetune_job(effective_job_id)
         ops_log.end(op, extra={"job_id": job.job_id})
     except Exception as e:
+        _clear_pending_finetune_job(effective_job_id)
         ops_log.fail(op, str(e))
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
@@ -521,17 +1758,32 @@ async def trigger_cleanup(threshold_gb: float = 40.0):
 @app.get("/jobs", summary="List all jobs")
 async def list_jobs():
     """List all fine-tuning jobs and their statuses."""
-    return pipeline.list_jobs()
+    jobs = pipeline.list_jobs()
+    with _pending_finetune_jobs_lock:
+        pending_jobs = [
+            dict(job)
+            for job_id, job in _pending_finetune_jobs.items()
+            if job_id not in {item.get("job_id") for item in jobs}
+        ]
+    return pending_jobs + jobs
 
 
 @app.get("/jobs/{job_id}", summary="Get job status", response_model=JobSummary)
 async def get_job(job_id: str):
     """Get the current status and progress of a fine-tuning job."""
+    pending_job = _get_pending_finetune_job(job_id)
+    if pending_job:
+        return pending_job
     loop = asyncio.get_running_loop()
     job = await loop.run_in_executor(None, pipeline.get_job, job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
-    return job.to_dict()
+    payload = job.to_dict()
+    s3_present = await loop.run_in_executor(None, pipeline._has_verified_checkpoint_backup, job)
+    has_local = await loop.run_in_executor(None, pipeline._has_local_checkpoint, job)
+    payload["s3_checkpoint_present"] = s3_present
+    payload["has_durable_checkpoint"] = bool(s3_present or has_local)
+    return payload
 
 
 @app.delete("/jobs/{job_id}", summary="Cancel or delete a job")
@@ -549,14 +1801,22 @@ async def retry_job(job_id: str, req: Optional[FinetuneRequest] = None):
     If the job is not found in memory, disk, or S3, and a request body is provided,
     it will attempt to create a new job with the specified `job_id`.
     """
-    job = pipeline.retry_job(job_id)
-    if job:
-        # If it was already READY or successfully retried
-        return JSONResponse(content=job.to_dict(), status_code=202 if job.status != JobStatus.READY else 200)
+    effective_force = bool(req and (req.force or req.overwrite))
+    if not effective_force:
+        job = pipeline.retry_job(job_id)
+        if job:
+            # If it was already READY or safely transitioned (smart retry)
+            return JSONResponse(content=job.to_dict(), status_code=202 if job.status != JobStatus.READY else 200)
 
-    # Job not found or not in a retryable state. If we have a body, fallback to creation.
+    # Job not found OR not in a failed/cancelled state (e.g. QUEUED, TRAINING).
     if req:
-        logger.info(f"Job {job_id} not found for retry. Falling back to creation as requested.")
+        # User refinement: Only skip retry if it's currently active (QUEUED/TRAINING)
+        existing = pipeline.get_job(job_id)
+        if existing and not effective_force and existing.status in (JobStatus.QUEUED, JobStatus.TRAINING):
+            logger.info(f"Job {job_id} already active with status {existing.status}. Skipping restart.")
+            return JSONResponse(content=existing.to_dict(), status_code=200)
+            
+        logger.info(f"Retrying/Resurrecting job {job_id}. Status={existing.status if existing else 'None'}, Force={effective_force}")
         # Re-use the creation logic but with our specific job_id
         # We need to handle the S3 download again here or refactor it.
         # For simplicity, we'll repeat the download logic since it's short.
@@ -635,7 +1895,7 @@ async def infer(job_id: str, req: InferRequest):
             )
 
     pipeline.touch_job(job_id) # Update LRU timestamp
-    pipeline._cleanup_disk_lru(30.0) # Background check usage
+    pipeline._cleanup_disk_lru(200.0) # Background check usage
 
     # Enhanced Fast-path check
     s3_key_found = None
@@ -661,24 +1921,37 @@ async def infer(job_id: str, req: InferRequest):
             "sample_rate": 24000,
             "text": req.text,
             "job_id": job_id,
+            "checkpoint_epoch": req.checkpoint_epoch,
         }
 
     try:
-        checkpoint_path = str(job.checkpoint_path) if job.checkpoint_path else None
-        # Resolve to absolute path — relative paths (e.g. "jobs/id/output/ckpt") cause
-        # HuggingFace from_pretrained to misinterpret them as Hub repo IDs.
-        if checkpoint_path and not os.path.isabs(checkpoint_path):
-            checkpoint_path = str(Path(checkpoint_path).resolve())
-        # If checkpoint is missing locally, restore from S3
-        if not checkpoint_path or not os.path.exists(checkpoint_path):
-            if job.s3_model_key:
-                checkpoint_path = pipeline._restore_checkpoint_from_s3(job)
-            else:
-                raise HTTPException(status_code=500, detail=f"Job {job_id} has no checkpoint and no S3 backup")
-        batcher = get_custom_voice_batcher(job_id, checkpoint_path, job.speaker_name)
+        checkpoint_path, resolved_epoch = await loop.run_in_executor(
+            None,
+            pipeline.resolve_checkpoint_path,
+            job,
+            req.checkpoint_epoch,
+        )
+        generation_config = {
+            "do_sample": req.do_sample,
+            "temperature": req.temperature,
+            "top_p": req.top_p,
+            "max_new_tokens": req.max_new_tokens,
+        }
+        batcher = get_custom_voice_batcher(
+            job_id,
+            checkpoint_path,
+            job.speaker_name,
+            generation_config=generation_config,
+        )
         
         with ops_log.operation("inference_api", job_id=job_id, extra={
-            "text_length": len(req.text), "upload_to_s3": req.upload_to_s3,
+            "text_length": len(req.text),
+            "upload_to_s3": req.upload_to_s3,
+            "checkpoint_epoch": resolved_epoch,
+            "do_sample": req.do_sample,
+            "temperature": req.temperature,
+            "top_p": req.top_p,
+            "max_new_tokens": req.max_new_tokens,
         }):
             wav_bytes, sr = await batcher.submit(
                 texts=req.text,
@@ -721,6 +1994,7 @@ async def infer(job_id: str, req: InferRequest):
             "sample_rate": sr,
             "text": req.text,
             "job_id": job_id,
+            "checkpoint_epoch": resolved_epoch,
         }
 
     # Otherwise return raw audio (if user explicitly set upload_to_s3=False)
@@ -737,7 +2011,7 @@ async def infer(job_id: str, req: InferRequest):
 @app.post(
     "/infer/{job_id}/batch",
     summary="Batch generate speech and upload to S3",
-    response_model=list[InferS3Response],
+    response_model=list[AudioS3Result],
 )
 async def infer_batch(job_id: str, req: BatchInferRequest):
     """Generate multiple audio files and upload all to E2E Object Storage.
@@ -778,13 +2052,22 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
             )
 
     pipeline.touch_job(job_id)
-    pipeline._cleanup_disk_lru(30.0)
+    pipeline._cleanup_disk_lru(200.0)
+
+    try:
+        resolved_checkpoint_path, resolved_epoch = await loop.run_in_executor(
+            None,
+            pipeline.resolve_checkpoint_path,
+            job,
+            req.checkpoint_epoch,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Inference failed: {str(e)}")
 
     from functools import partial
 
-    # Create a Semaphore to limit concurrent S3 checks and generation launching
-    # Allowing up to GPU_BATCH_SIZE concurrent submissions ensures we fill our fusion batches efficiently.
-    concurrency_limit = asyncio.Semaphore(GPU_BATCH_SIZE)
+    # Keep custom-voice batch jobs strictly serial to avoid padded-batch latency spikes.
+    concurrency_limit = asyncio.Semaphore(max(1, CUSTOM_VOICE_API_BATCH_SIZE))
     
     # Generate one session code for the entire batch request so they are grouped together
     batch_session_code = uuid.uuid4().hex[:8]
@@ -793,11 +2076,11 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
 
     async def process_item(item, index):
         async with concurrency_limit:
-            text = item.get("text", "")
-            language = item.get("language", req.language)
-            instruct = item.get("instruct", "")
-            filename = item.get("filename", f"audio_{index:04d}.wav")
-            overwrite = item.get("overwrite", req.overwrite)
+            text = item.text
+            language = item.language or req.language
+            instruct = item.instruct
+            filename = item.filename or f"audio_{index:04d}.wav"
+            overwrite = req.overwrite if item.overwrite is None else item.overwrite
             
             # Construct S3 prefix for the upload phase
             s3_prefix = s3_prefix_base
@@ -826,31 +2109,24 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
                     "sample_rate": 24000,
                     "text": text,
                     "job_id": job_id,
+                    "checkpoint_epoch": resolved_epoch,
                 }
 
             # Run generation using the local batcher (fuses multiple requests into one GPU pass)
             try:
                 loop = asyncio.get_running_loop()
-
-                # Resolve to absolute path — prevents HF from_pretrained treating a relative
-                # path like 'jobs/id/output/checkpoint-epoch-14' as a Hub repo ID.
-                checkpoint_path = str(job.checkpoint_path) if job.checkpoint_path else None
-                if checkpoint_path and not os.path.isabs(checkpoint_path):
-                    checkpoint_path = str(Path(checkpoint_path).resolve())
-
-                # If the local epoch folder was LRU-evicted or never restored, fall back to S3.
-                if not checkpoint_path or not os.path.exists(checkpoint_path):
-                    if job.s3_model_key:
-                        logger.info(f"Batch infer: checkpoint missing locally for job {job_id}, restoring from S3...")
-                        checkpoint_path = await loop.run_in_executor(
-                            None, pipeline._restore_checkpoint_from_s3, job
-                        )
-                    else:
-                        raise RuntimeError(
-                            f"Job {job_id} has no local checkpoint and no S3 backup to restore from."
-                        )
-
-                batcher = get_custom_voice_batcher(job_id, checkpoint_path, job.speaker_name)
+                generation_config = {
+                    "do_sample": req.do_sample,
+                    "temperature": req.temperature,
+                    "top_p": req.top_p,
+                    "max_new_tokens": req.max_new_tokens,
+                }
+                batcher = get_custom_voice_batcher(
+                    job_id,
+                    resolved_checkpoint_path,
+                    job.speaker_name,
+                    generation_config=generation_config,
+                )
                 
                 wav_bytes, sr = await batcher.submit(
                     texts=text,
@@ -877,6 +2153,7 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
                     "sample_rate": sr,
                     "text": text,
                     "job_id": job_id,
+                    "checkpoint_epoch": resolved_epoch,
                 }
             except Exception as e:
                 logger.error(f"Inference failed for item {index}: {e}")
@@ -926,6 +2203,7 @@ def list_storage(job_id: str, book_id: Optional[str] = None, chapter_id: Optiona
             "description": "WAV audio or JSON with S3 URL",
         }
     },
+    response_model=AudioS3Result,
 )
 async def voice_clone(req: VoiceCloneRequest):
     """Generate speech using zero-shot VoiceClone Base model.
@@ -946,8 +2224,7 @@ async def voice_clone(req: VoiceCloneRequest):
 
     # Fast-path check
     if not req.overwrite and req.upload_to_s3 and storage.is_configured:
-        loop = asyncio.get_running_loop()
-        if await loop.run_in_executor(None, storage.object_exists, s3_key):
+        if await _storage_object_exists_async(s3_key):
             presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
             return {
                 "s3_url": storage._object_url(s3_key),
@@ -970,11 +2247,12 @@ async def voice_clone(req: VoiceCloneRequest):
         raise HTTPException(status_code=500, detail=f"Voice clone failed: {str(e)}")
 
     if req.upload_to_s3:
-        loop = asyncio.get_running_loop()
-        from functools import partial
-        s3_url = await loop.run_in_executor(
-            None,
-            partial(storage.upload_wav, wav_bytes, "voice_clone", filename=filename, prefix=s3_prefix, model_id="voice_clone_qwen")
+        s3_url = await _upload_wav_async(
+            wav_bytes,
+            "voice_clone",
+            filename=filename,
+            prefix=s3_prefix,
+            model_id="voice_clone_qwen",
         )
         presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
         return {
@@ -997,12 +2275,12 @@ async def voice_clone(req: VoiceCloneRequest):
 
 @app.post(
     "/voice-clone/batch",
-    summary="Batch generate zero-shot voice cloning",
-    response_model=list[InferS3Response],
+    summary="Batch generate zero-shot voice cloning (ASYNCHRONOUS)",
+    response_model=AsyncSubmissionResponse,
 )
 async def voice_clone_batch(req: VoiceCloneBatchRequest):
     """Generate multiple audio files in parallel using zero-shot VoiceClone Base model and upload to S3.
-    This uses the global voice_clone_batcher to fuse requests from different users/calls into single GPU passes.
+    This is asynchronous: returns a session_id immediately, poll status via GET /voice-clone/batch/{id}.
     """
     if req.upload_to_s3 and not storage.is_configured:
         raise HTTPException(
@@ -1011,75 +2289,582 @@ async def voice_clone_batch(req: VoiceCloneBatchRequest):
         )
 
     pipeline.inference._touch()
-    logger.info(f"Voice clone BATCH request: {len(req.items)} items, ref_audio_url={req.ref_audio_url[:120]}...")
+    session_id = req.session_id or uuid.uuid4().hex[:8]
+    logger.info(
+        "Voice clone BATCH request: session_id=%s items=%d language=%s use_xvec=%s upload_to_s3=%s overwrite=%s chunk_size=%s storage_concurrency=%s",
+        session_id,
+        len(req.items),
+        req.language,
+        req.use_xvec,
+        req.upload_to_s3,
+        req.overwrite,
+        VOICE_CLONE_API_BATCH_SIZE,
+        BATCH_STORAGE_CONCURRENCY,
+    )
 
-    concurrency_limit = asyncio.Semaphore(10)
-    batch_session_code = uuid.uuid4().hex[:8]
-    s3_prefix = f"audio/voice_clone/{batch_session_code}"
+    existing_job = voice_clone_batch_jobs.get(session_id)
+    if existing_job:
+        logger.info("Voice clone batch %s already exists in memory. Returning existing status.", session_id)
+        return {
+            "session_id": session_id,
+            "finetune_job_id": session_id,
+            "status": existing_job.get("status", "processing"),
+            "total": existing_job.get("total", len(req.items)),
+        }
 
-    async def process_item(item: VoiceCloneBatchItem, index: int):
-        async with concurrency_limit:
-            filename = item.filename or f"clone_batch_{index:04d}.wav"
-            s3_key = f"{s3_prefix}/{filename}"
-            
-            # S3 fast-path
-            if not req.overwrite and req.upload_to_s3 and storage.is_configured:
-                loop = asyncio.get_running_loop()
-                if await loop.run_in_executor(None, storage.object_exists, s3_key):
-                    presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
-                    return {
-                        "s3_url": storage._object_url(s3_key),
-                        "presigned_url": presigned_url,
-                        "s3_key": s3_key,
-                        "sample_rate": 24000,
-                        "text": item.text,
-                        "job_id": "voice_clone",
-                    }
+    # Initialize status
+    voice_clone_batch_jobs[session_id] = {
+        "session_id": session_id,
+        "status": "processing",
+        "total": len(req.items),
+        "completed": 0,
+        "failed": 0,
+        "results": [],
+        "error": None,
+        "created_at": time.time(),
+    }
 
-            # Generate via batcher
-            try:
-                wav_bytes, sr = await voice_clone_batcher.submit(
-                    texts=item.text,
-                    ref_audios=req.ref_audio_url,
-                    ref_texts=req.ref_text,
-                    languages=req.language,
-                    x_vector_only_modes=req.use_xvec,
-                )
-            except Exception as e:
-                logger.error(f"Voice clone batch item {index} failed: {e} | ref_audio_url={req.ref_audio_url[:120]}")
-                return None
-
-            # Upload to S3
-            if req.upload_to_s3:
-                loop = asyncio.get_running_loop()
-                from functools import partial
-                s3_url = await loop.run_in_executor(
-                    None,
-                    partial(storage.upload_wav, wav_bytes, "voice_clone", filename=filename, prefix=s3_prefix, model_id="voice_clone_qwen")
-                )
-                presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
-                return {
-                    "s3_url": s3_url,
-                    "presigned_url": presigned_url,
-                    "s3_key": s3_key,
-                    "sample_rate": sr,
-                    "text": item.text,
-                    "job_id": "voice_clone",
+    async def run_batch_task():
+        s3_prefix = f"audio/voice_clone/{session_id}"
+        batch_started_at = time.monotonic()
+        try:
+            job = voice_clone_batch_jobs[session_id]
+            items_meta = [
+                {
+                    "index": index,
+                    "item": item,
+                    "filename": item.filename or f"clone_batch_{index:04d}.wav",
                 }
-            else:
-                import base64
-                return {
-                    "s3_url": "",
-                    "presigned_url": f"data:audio/wav;base64,{base64.b64encode(wav_bytes).decode('utf-8')}",
-                    "s3_key": filename,
-                    "sample_rate": sr,
-                    "text": item.text,
-                    "job_id": "voice_clone_local",
-                }
+                for index, item in enumerate(req.items)
+            ]
+            for meta in items_meta:
+                meta["s3_key"] = f"{s3_prefix}/{meta['filename']}"
 
-    tasks = [process_item(item, i) for i, item in enumerate(req.items)]
-    results_raw = await asyncio.gather(*tasks)
-    return [r for r in results_raw if r is not None]
+            pending_meta = list(items_meta)
+            skipped_existing = 0
+
+            if req.upload_to_s3 and not req.overwrite:
+                exists_started_at = time.monotonic()
+                exists_limit = asyncio.Semaphore(BATCH_STORAGE_CONCURRENCY)
+
+                async def check_existing(meta: dict[str, Any]) -> bool:
+                    async with exists_limit:
+                        return await _storage_object_exists_async(meta["s3_key"])
+
+                existing_flags = await asyncio.gather(*(check_existing(meta) for meta in items_meta))
+                pending_meta = []
+                for meta, exists in zip(items_meta, existing_flags):
+                    if exists:
+                        presigned_url = storage.get_presigned_url(meta["s3_key"], expires_in=86400)
+                        res = {
+                            "index": meta["index"],
+                            "s3_url": storage._object_url(meta["s3_key"]),
+                            "presigned_url": presigned_url,
+                            "s3_key": meta["s3_key"],
+                            "sample_rate": 24000,
+                            "text": meta["item"].text,
+                            "job_id": "voice_clone",
+                            "filename": meta["filename"],
+                            "status": "success",
+                        }
+                        job["completed"] += 1
+                        job["results"].append(res)
+                        skipped_existing += 1
+                    else:
+                        pending_meta.append(meta)
+
+                logger.info(
+                    "Voice clone batch %s existing-object scan finished in %.3fs: skipped=%d pending=%d total=%d",
+                    session_id,
+                    time.monotonic() - exists_started_at,
+                    skipped_existing,
+                    len(pending_meta),
+                    len(items_meta),
+                )
+
+            total_chunks = (
+                (len(pending_meta) + VOICE_CLONE_API_BATCH_SIZE - 1) // VOICE_CLONE_API_BATCH_SIZE
+                if pending_meta
+                else 0
+            )
+            logger.info(
+                "Voice clone batch %s generation plan: pending=%d chunks=%d chunk_size=%d",
+                session_id,
+                len(pending_meta),
+                total_chunks,
+                VOICE_CLONE_API_BATCH_SIZE,
+            )
+
+            for chunk_index, chunk in enumerate(_chunked(pending_meta, VOICE_CLONE_API_BATCH_SIZE), start=1):
+                loop = asyncio.get_running_loop()
+                chunk_started_at = time.monotonic()
+                logger.info(
+                    "Voice clone batch %s chunk %d/%d started: size=%d completed=%d failed=%d",
+                    session_id,
+                    chunk_index,
+                    total_chunks,
+                    len(chunk),
+                    job["completed"],
+                    job["failed"],
+                )
+                try:
+                    wavs_chunk, sr = await loop.run_in_executor(
+                        None,
+                        partial(
+                            pipeline.inference.generate_voice_clone_batch,
+                            texts=[meta["item"].text for meta in chunk],
+                            ref_audio=req.ref_audio_url,
+                            ref_text=req.ref_text,
+                            languages=[req.language] * len(chunk),
+                            x_vector_only_mode=req.use_xvec,
+                            do_sample=req.do_sample,
+                            temperature=req.temperature,
+                            top_p=req.top_p,
+                            max_new_tokens=req.max_new_tokens,
+                        ),
+                    )
+                    generation_seconds = time.monotonic() - chunk_started_at
+                    logger.info(
+                        "Voice clone batch %s chunk %d/%d generation finished in %.3fs: size=%d sample_rate=%s",
+                        session_id,
+                        chunk_index,
+                        total_chunks,
+                        generation_seconds,
+                        len(chunk),
+                        sr,
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Voice clone batch %s chunk %d/%d failed after %.3fs: %s",
+                        session_id,
+                        chunk_index,
+                        total_chunks,
+                        time.monotonic() - chunk_started_at,
+                        e,
+                    )
+                    for meta in chunk:
+                        job["failed"] += 1
+                        job["results"].append({
+                            "index": meta["index"],
+                            "s3_url": "",
+                            "presigned_url": None,
+                            "s3_key": meta["s3_key"],
+                            "sample_rate": 0,
+                            "text": meta["item"].text,
+                            "job_id": "voice_clone",
+                            "filename": meta["filename"],
+                            "status": "failed",
+                            "error": str(e),
+                        })
+                    continue
+
+                if req.upload_to_s3:
+                    upload_started_at = time.monotonic()
+                    upload_limit = asyncio.Semaphore(BATCH_STORAGE_CONCURRENCY)
+
+                    async def upload_result(meta: dict[str, Any], wav_bytes: bytes) -> dict[str, Any]:
+                        async with upload_limit:
+                            s3_url = await _upload_wav_async(
+                                wav_bytes,
+                                "voice_clone",
+                                filename=meta["filename"],
+                                prefix=s3_prefix,
+                                model_id="voice_clone_qwen",
+                            )
+                        presigned_url = storage.get_presigned_url(meta["s3_key"], expires_in=86400)
+                        return {
+                            "index": meta["index"],
+                            "s3_url": s3_url,
+                            "presigned_url": presigned_url,
+                            "s3_key": meta["s3_key"],
+                            "sample_rate": sr,
+                            "text": meta["item"].text,
+                            "job_id": "voice_clone",
+                            "filename": meta["filename"],
+                            "status": "success",
+                        }
+
+                    uploaded_results = await asyncio.gather(
+                        *(upload_result(meta, wav_bytes) for meta, wav_bytes in zip(chunk, wavs_chunk))
+                    )
+                    for result in uploaded_results:
+                        job["completed"] += 1
+                        job["results"].append(result)
+                    logger.info(
+                        "Voice clone batch %s chunk %d/%d uploads finished in %.3fs: uploaded=%d cumulative_completed=%d cumulative_failed=%d elapsed=%.3fs",
+                        session_id,
+                        chunk_index,
+                        total_chunks,
+                        time.monotonic() - upload_started_at,
+                        len(uploaded_results),
+                        job["completed"],
+                        job["failed"],
+                        time.monotonic() - chunk_started_at,
+                    )
+                else:
+                    for meta, wav_bytes in zip(chunk, wavs_chunk):
+                        job["completed"] += 1
+                        job["results"].append({
+                            "index": meta["index"],
+                            "s3_url": "",
+                            "presigned_url": f"data:audio/wav;base64,{base64.b64encode(wav_bytes).decode('utf-8')}",
+                            "s3_key": meta["filename"],
+                            "sample_rate": sr,
+                            "text": meta["item"].text,
+                            "job_id": "voice_clone_local",
+                            "filename": meta["filename"],
+                            "status": "success",
+                        })
+                    logger.info(
+                        "Voice clone batch %s chunk %d/%d completed without upload in %.3fs: produced=%d cumulative_completed=%d cumulative_failed=%d",
+                        session_id,
+                        chunk_index,
+                        total_chunks,
+                        time.monotonic() - chunk_started_at,
+                        len(chunk),
+                        job["completed"],
+                        job["failed"],
+                    )
+
+            job = voice_clone_batch_jobs[session_id]
+            if job["completed"] + job["failed"] >= job["total"]:
+                job["status"] = "completed" if job["failed"] == 0 else "completed_with_errors"
+            logger.info(
+                "Voice clone batch %s finished in %.3fs: status=%s completed=%d failed=%d skipped_existing=%d total=%d",
+                session_id,
+                time.monotonic() - batch_started_at,
+                job["status"],
+                job["completed"],
+                job["failed"],
+                skipped_existing,
+                job["total"],
+            )
+        except Exception as e:
+            logger.exception("Voice clone batch %s crashed", session_id)
+            job = voice_clone_batch_jobs[session_id]
+            job["status"] = "failed"
+            job["error"] = str(e)
+
+    # Start background task WITHOUT waiting
+    asyncio.create_task(run_batch_task())
+    
+    return {
+        "session_id": session_id,
+        "finetune_job_id": session_id,
+        "status": "processing",
+        "total": len(req.items)
+    }
+
+@app.get(
+    "/voice-clone/batch/{session_id}",
+    summary="Get status of an asynchronous voice clone batch",
+    response_model=VoiceCloneBatchStatusResponse,
+)
+async def get_voice_clone_batch_status(session_id: str):
+    """Poll for the status and results of a voice clone batch initiated via POST /voice-clone/batch."""
+    job = voice_clone_batch_jobs.get(session_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Voice clone batch {session_id} not found")
+    
+    # Calculate progress percentage
+    total = job["total"]
+    completed = job["completed"]
+    failed = job["failed"]
+    
+    progress_pct = 0.0
+    if total > 0:
+        progress_pct = round(((completed + failed) / total) * 100, 1)
+
+    sorted_results = _sorted_clone_batch_results(job["results"])
+    
+    return {
+        **job,
+        "progress_pct": progress_pct,
+        "clones": sorted_results,
+        "results": sorted_results,
+    }
+
+
+def _dataset_progress_pct(job: dict[str, Any]) -> float:
+    total = job.get("total", 0)
+    if total <= 0:
+        return 0.0
+    return round(((job.get("completed", 0) + job.get("failed", 0)) / total) * 100, 1)
+
+
+def _dataset_status_payload(job: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "job_id": job["job_id"],
+        "kind": job["kind"],
+        "status": job["status"],
+        "phase": job.get("phase", job["kind"]),
+        "progress_pct": _dataset_progress_pct(job),
+        "total": job.get("total", 0),
+        "completed": job.get("completed", 0),
+        "failed": job.get("failed", 0),
+        "dataset_items": job.get("dataset_items", []),
+        "dataset_s3_key": job.get("dataset_s3_key"),
+        "dataset_s3_url": job.get("dataset_s3_url"),
+        "error": job.get("error"),
+        "created_at": job["created_at"],
+    }
+
+
+def _get_cuda_free_vram_gb() -> float | None:
+    try:
+        if not torch.cuda.is_available():
+            return None
+        mem_get_info = getattr(torch.cuda, "mem_get_info", None)
+        if mem_get_info is None:
+            return None
+        try:
+            free_bytes, _total_bytes = mem_get_info(0)
+        except TypeError:
+            free_bytes, _total_bytes = mem_get_info()
+        return max(float(free_bytes), 0.0) / (1024 ** 3)
+    except Exception:
+        return None
+
+
+async def _wait_for_dataset_job_vram_headroom(*, job_id: str, kind: str) -> None:
+    if DATASET_JOB_MIN_FREE_VRAM_GB <= 0:
+        return
+    if not torch.cuda.is_available():
+        return
+
+    started_at = time.monotonic()
+    poll_sec = max(0.1, DATASET_JOB_VRAM_WAIT_POLL_SEC)
+    timeout_sec = DATASET_JOB_VRAM_WAIT_TIMEOUT_SEC if DATASET_JOB_VRAM_WAIT_TIMEOUT_SEC > 0 else None
+    logged_wait = False
+
+    while True:
+        free_gb = _get_cuda_free_vram_gb()
+        if free_gb is None or free_gb >= DATASET_JOB_MIN_FREE_VRAM_GB:
+            if logged_wait:
+                waited = time.monotonic() - started_at
+                if free_gb is None:
+                    logger.info(
+                        "Dataset %s job %s resumed after waiting %.1fs for VRAM headroom.",
+                        kind,
+                        job_id,
+                        waited,
+                    )
+                else:
+                    logger.info(
+                        "Dataset %s job %s resumed after waiting %.1fs (free %.1f GB).",
+                        kind,
+                        job_id,
+                        waited,
+                        free_gb,
+                    )
+            return
+
+        waited = time.monotonic() - started_at
+        if timeout_sec is not None and waited >= timeout_sec:
+            raise RuntimeError(
+                f"Timed out waiting for VRAM headroom: {free_gb:.1f} GB free, "
+                f"need at least {DATASET_JOB_MIN_FREE_VRAM_GB:.1f} GB."
+            )
+
+        if not logged_wait or waited >= poll_sec:
+            logger.info(
+                "Dataset %s job %s waiting for VRAM headroom: %.1f/%.1f GB free.",
+                kind,
+                job_id,
+                free_gb,
+                DATASET_JOB_MIN_FREE_VRAM_GB,
+            )
+            logged_wait = True
+        await asyncio.sleep(poll_sec)
+
+
+async def _run_dataset_prepare_job(job_id: str, req: DatasetPrepareRequest) -> None:
+    job = dataset_jobs[job_id]
+    async with dataset_job_semaphore:
+        try:
+            await _wait_for_dataset_job_vram_headroom(job_id=job_id, kind="prepare")
+            dataset_items = await prepare_dataset_items(
+                storage,
+                book_id=req.book_id,
+                character_id=req.character_id,
+                character_name=req.character_name or req.character_id,
+                job_id=job_id,
+                ref_audio_url=req.ref_audio_url,
+                ref_text=req.ref_text,
+                items=[item.model_dump() for item in req.items],
+                amplitude=req.amplitude,
+                speed=req.speed,
+                pitch_shift=req.pitch_shift,
+            )
+            job["completed"] = job["total"]
+            job["dataset_items"] = dataset_items
+            job["phase"] = "awaiting_approval"
+            job["status"] = "completed"
+        except Exception as exc:
+            logger.exception("Dataset prepare job %s failed", job_id)
+            job["status"] = "failed"
+            job["failed"] = max(1, job.get("failed", 0))
+            job["error"] = str(exc)
+
+
+async def _run_dataset_package_job(job_id: str, req: DatasetPackageRequest) -> None:
+    job = dataset_jobs[job_id]
+    async with dataset_job_semaphore:
+        try:
+            await _wait_for_dataset_job_vram_headroom(job_id=job_id, kind="package")
+            packaged = await package_dataset(
+                storage,
+                book_id=req.book_id,
+                character_id=req.character_id,
+                job_id=job_id,
+                dataset_items=[item.model_dump() for item in req.dataset_items],
+            )
+            job["completed"] = job["total"]
+            job["dataset_s3_key"] = packaged["dataset_s3_key"]
+            job["dataset_s3_url"] = packaged["dataset_s3_url"]
+            job["phase"] = "packaged"
+            job["status"] = "completed"
+        except Exception as exc:
+            logger.exception("Dataset package job %s failed", job_id)
+            job["status"] = "failed"
+            job["failed"] = max(1, job.get("failed", 0))
+            job["error"] = str(exc)
+
+
+@app.post(
+    "/dataset/prepare",
+    summary="Prepare dataset items from cloned audio",
+    response_model=DatasetJobSubmissionResponse,
+)
+async def dataset_prepare(req: DatasetPrepareRequest):
+    if not storage.is_configured:
+        raise HTTPException(status_code=503, detail="Storage not configured.")
+
+    job_id = req.job_id or uuid.uuid4().hex[:8]
+    existing_job = dataset_jobs.get(job_id)
+    if existing_job:
+        return {
+            "job_id": job_id,
+            "finetune_job_id": job_id,
+            "status": existing_job["status"],
+            "kind": existing_job["kind"],
+            "total": existing_job.get("total", len(req.items)),
+        }
+
+    existing_items = None
+    if not req.overwrite:
+        existing_items = await load_existing_prepare_result(
+            storage,
+            book_id=req.book_id,
+            character_id=req.character_id,
+            job_id=job_id,
+        )
+
+    dataset_jobs[job_id] = {
+        "job_id": job_id,
+        "kind": "prepare",
+        "status": "processing",
+        "phase": "preparing_dataset_items",
+        "total": len(req.items),
+        "completed": 0,
+        "failed": 0,
+        "dataset_items": [],
+        "error": None,
+        "created_at": time.time(),
+    }
+
+    job = dataset_jobs[job_id]
+    if existing_items is not None:
+        job["dataset_items"] = existing_items
+        job["completed"] = job["total"]
+        job["status"] = "completed"
+        job["phase"] = "awaiting_approval"
+    else:
+        asyncio.create_task(_run_dataset_prepare_job(job_id, req))
+
+    return {
+        "job_id": job_id,
+        "finetune_job_id": job_id,
+        "status": job["status"],
+        "kind": job["kind"],
+        "total": job["total"],
+    }
+
+
+@app.post(
+    "/dataset/package",
+    summary="Package approved dataset items into the final finetune zip",
+    response_model=DatasetJobSubmissionResponse,
+)
+async def dataset_package(req: DatasetPackageRequest):
+    if not storage.is_configured:
+        raise HTTPException(status_code=503, detail="Storage not configured.")
+
+    job_id = req.job_id or uuid.uuid4().hex[:8]
+    existing_job = dataset_jobs.get(job_id)
+    if existing_job and existing_job.get("kind") == "package":
+        return {
+            "job_id": job_id,
+            "finetune_job_id": job_id,
+            "status": existing_job["status"],
+            "kind": existing_job["kind"],
+            "total": existing_job.get("total", len(req.dataset_items)),
+        }
+
+    existing_package = None
+    if not req.overwrite:
+        existing_package = await load_existing_package_result(
+            storage,
+            book_id=req.book_id,
+            character_id=req.character_id,
+            job_id=job_id,
+        )
+
+    dataset_jobs[job_id] = {
+        "job_id": job_id,
+        "kind": "package",
+        "status": "processing",
+        "phase": "packaging_dataset_zip",
+        "total": len(req.dataset_items),
+        "completed": 0,
+        "failed": 0,
+        "dataset_items": [],
+        "dataset_s3_key": None,
+        "dataset_s3_url": None,
+        "error": None,
+        "created_at": time.time(),
+    }
+
+    job = dataset_jobs[job_id]
+    if existing_package is not None:
+        job["completed"] = job["total"]
+        job["status"] = "completed"
+        job["phase"] = "packaged"
+        job["dataset_s3_key"] = existing_package["dataset_s3_key"]
+        job["dataset_s3_url"] = existing_package["dataset_s3_url"]
+    else:
+        asyncio.create_task(_run_dataset_package_job(job_id, req))
+
+    return {
+        "job_id": job_id,
+        "finetune_job_id": job_id,
+        "status": job["status"],
+        "kind": job["kind"],
+        "total": job["total"],
+    }
+
+
+@app.get(
+    "/dataset/status/{job_id}",
+    summary="Get status of a dataset prepare/package job",
+    response_model=DatasetJobStatusResponse,
+)
+async def get_dataset_status(job_id: str):
+    job = dataset_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Dataset job {job_id} not found")
+    return _dataset_status_payload(job)
+
 
 @app.post(
     "/voice-design",
@@ -1090,6 +2875,7 @@ async def voice_clone_batch(req: VoiceCloneBatchRequest):
             "description": "WAV audio or JSON with S3 URL",
         }
     },
+    response_model=VoiceDesignResponse,
 )
 async def voice_design(req: VoiceDesignRequest):
     """Generate speech from a text description of the desired voice.
@@ -1102,6 +2888,7 @@ async def voice_design(req: VoiceDesignRequest):
     - "A young female voice, energetic and cheerful"
     - "A deep, gravelly old man's voice, speaking slowly"
     """
+    logger.info(f"Voice design request: character='{req.character_name}' text='{req.text[:50]}...' instruct='{req.instruct[:50]}...'")
     parts = []
     if req.character_name:
         safe_name = "".join(c for c in req.character_name if c.isalnum() or c in ("-", "_", " ")).strip().replace(" ", "_")
@@ -1128,7 +2915,7 @@ async def voice_design(req: VoiceDesignRequest):
                 raise HTTPException(status_code=503, detail="Storage not configured.")
             
             s3_key = f"audio/voice_design/{req.s3_filename}"
-            if not req.overwrite and storage.object_exists(s3_key):
+            if not req.overwrite and await _storage_object_exists_async(s3_key):
                 presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
                 return {
                     "s3_url": storage._object_url(s3_key),
@@ -1137,6 +2924,8 @@ async def voice_design(req: VoiceDesignRequest):
                     "sample_rate": 24000,
                     "text": req.text,
                     "instruct": req.instruct,
+                    "job_id": "voice_design",
+                    "status": "success",
                 }
 
         try:
@@ -1146,13 +2935,25 @@ async def voice_design(req: VoiceDesignRequest):
                 languages=req.language,
             )
         except Exception as e:
+            logger.exception(
+                "Voice design request failed during batcher submit. text_length=%s instruct_length=%s upload_to_s3=%s runtime_stats=%s",
+                len(req.text),
+                len(req.instruct),
+                req.upload_to_s3,
+                pipeline.inference.stats,
+            )
             raise HTTPException(status_code=500, detail=f"Voice design failed: {str(e)}")
 
     if req.upload_to_s3:
         if not storage.is_configured:
             raise HTTPException(status_code=503, detail="Storage not configured.")
         with ops_log.operation("s3_upload", extra={"type": "voice_design"}):
-            s3_url = storage.upload_wav(wav_bytes, "voice_design", filename=req.s3_filename, model_id="voice_design_qwen")
+            s3_url = await _upload_wav_async(
+                wav_bytes,
+                "voice_design",
+                filename=req.s3_filename,
+                model_id="voice_design_qwen",
+            )
         s3_key = f"audio/voice_design/{req.s3_filename}" if req.s3_filename else s3_url.split(f"{storage.bucket}/")[-1]
         
         presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
@@ -1164,6 +2965,8 @@ async def voice_design(req: VoiceDesignRequest):
             "sample_rate": sr,
             "text": req.text,
             "instruct": req.instruct,
+            "job_id": "voice_design",
+            "status": "success",
         }
 
     return Response(
@@ -1199,6 +3002,7 @@ async def voice_design_batch(req: VoiceDesignBatchRequest):
     }
     ```
     """
+    logger.info(f"Voice design BATCH request: {len(req.items)} items")
     if not req.items:
         raise HTTPException(status_code=400, detail="No items provided.")
 
@@ -1211,119 +3015,128 @@ async def voice_design_batch(req: VoiceDesignBatchRequest):
     if req.upload_to_s3 and not storage.is_configured:
         raise HTTPException(status_code=503, detail="Storage not configured.")
 
-    from functools import partial
-
-    concurrency_limit = asyncio.Semaphore(MAX_CONCURRENT_VOICE_DESIGNS)
-
-    async def process_item(item: VoiceDesignBatchItem, index: int):
-        async with concurrency_limit:
-            # Build S3 filename with character prefix (same logic as single endpoint)
-            s3_filename = item.s3_filename
-            parts = []
-            if item.character_name:
-                safe_name = "".join(
-                    c for c in item.character_name if c.isalnum() or c in ("-", "_", " ")
-                ).strip().replace(" ", "_")
-                if safe_name:
-                    parts.append(safe_name)
-            if item.character_uuid:
-                parts.append(item.character_uuid)
-
-            if parts:
-                prefix = "_".join(parts)
-                if s3_filename:
-                    if not s3_filename.startswith(prefix):
-                        s3_filename = f"{prefix}_{s3_filename}"
-                else:
-                    s3_filename = f"{prefix}.wav"
-            elif not s3_filename:
-                import uuid as _uuid
-                s3_filename = f"voice_design_{_uuid.uuid4().hex[:8]}.wav"
-
-            # S3 fast-path: skip if file already exists
-            if req.upload_to_s3 and not req.overwrite and storage.is_configured:
-                s3_key = f"audio/voice_design/{s3_filename}"
-                loop = asyncio.get_running_loop()
-                exists = await loop.run_in_executor(None, storage.object_exists, s3_key)
-                if exists:
-                    presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
-                    return {
-                        "index": index,
-                        "status": "skipped",
-                        "s3_url": storage._object_url(s3_key),
-                        "presigned_url": presigned_url,
-                        "s3_key": s3_key,
-                        "sample_rate": 24000,
-                        "text": item.text,
-                        "instruct": item.instruct,
-                        "character_name": item.character_name,
-                    }
-
-            # Generate via the existing batcher
-            try:
-                wav_bytes, sr = await voice_design_batcher.submit(
-                    texts=item.text,
-                    instructs=item.instruct,
-                    languages=item.language,
-                )
-            except Exception as e:
-                logger.error(f"Voice design batch item {index} failed: {e}")
-                return {
-                    "index": index,
-                    "status": "failed",
-                    "error": str(e),
-                    "text": item.text,
-                    "instruct": item.instruct,
-                    "character_name": item.character_name,
-                }
-
-            # Upload to S3
-            if req.upload_to_s3:
-                loop = asyncio.get_running_loop()
-                with ops_log.operation("s3_upload", extra={"type": "voice_design_batch"}):
-                    s3_url = await loop.run_in_executor(
-                        None,
-                        partial(storage.upload_wav, wav_bytes, "voice_design", filename=s3_filename, model_id="voice_design_qwen"),
-                    )
-                s3_key = f"audio/voice_design/{s3_filename}"
-                presigned_url = storage.get_presigned_url(s3_key, expires_in=86400)
-                return {
-                    "index": index,
-                    "status": "success",
-                    "s3_url": s3_url,
-                    "presigned_url": presigned_url,
-                    "s3_key": s3_key,
-                    "sample_rate": sr,
-                    "text": item.text,
-                    "instruct": item.instruct,
-                    "character_name": item.character_name,
-                }
-
-            # No S3 upload — encode WAV bytes as base64 for JSON response
-            import base64
-            return {
-                "index": index,
-                "status": "success",
-                "audio_base64": base64.b64encode(wav_bytes).decode(),
-                "sample_rate": sr,
-                "text": item.text,
-                "instruct": item.instruct,
-                "character_name": item.character_name,
-            }
+    items_meta = []
+    for index, item in enumerate(req.items):
+        s3_filename = _build_voice_design_filename(item)
+        items_meta.append({
+            "index": index,
+            "item": item,
+            "filename": s3_filename,
+            "s3_key": f"audio/voice_design/{s3_filename}",
+        })
 
     with ops_log.operation("voice_design_batch_api", extra={
         "item_count": len(req.items),
         "upload_to_s3": req.upload_to_s3,
     }):
-        tasks = [process_item(item, i) for i, item in enumerate(req.items)]
-        results = await asyncio.gather(*tasks)
+        results: list[Optional[dict[str, Any]]] = [None] * len(req.items)
+        pending_meta = list(items_meta)
+
+        if req.upload_to_s3 and not req.overwrite:
+            exists_limit = asyncio.Semaphore(BATCH_STORAGE_CONCURRENCY)
+
+            async def check_existing(meta: dict[str, Any]) -> bool:
+                async with exists_limit:
+                    return await _storage_object_exists_async(meta["s3_key"])
+
+            existing_flags = await asyncio.gather(*(check_existing(meta) for meta in items_meta))
+            pending_meta = []
+            for meta, exists in zip(items_meta, existing_flags):
+                item = meta["item"]
+                if exists:
+                    presigned_url = storage.get_presigned_url(meta["s3_key"], expires_in=86400)
+                    results[meta["index"]] = {
+                        "index": meta["index"],
+                        "status": "skipped",
+                        "s3_url": storage._object_url(meta["s3_key"]),
+                        "presigned_url": presigned_url,
+                        "s3_key": meta["s3_key"],
+                        "sample_rate": 24000,
+                        "text": item.text,
+                        "instruct": item.instruct,
+                        "character_name": item.character_name,
+                    }
+                else:
+                    pending_meta.append(meta)
+
+        for chunk in _chunked(pending_meta, GPU_BATCH_SIZE):
+            try:
+                loop = asyncio.get_running_loop()
+                wavs_chunk, sr = await loop.run_in_executor(
+                    None,
+                    partial(
+                        pipeline.inference.generate_voice_design_batch,
+                        texts=[meta["item"].text for meta in chunk],
+                        instructs=[meta["item"].instruct for meta in chunk],
+                        languages=[meta["item"].language for meta in chunk],
+                    ),
+                )
+            except Exception as e:
+                logger.error("Voice design batch chunk failed: %s", e)
+                for meta in chunk:
+                    item = meta["item"]
+                    results[meta["index"]] = {
+                        "index": meta["index"],
+                        "status": "failed",
+                        "error": str(e),
+                        "text": item.text,
+                        "instruct": item.instruct,
+                        "character_name": item.character_name,
+                    }
+                continue
+
+            if req.upload_to_s3:
+                upload_limit = asyncio.Semaphore(BATCH_STORAGE_CONCURRENCY)
+
+                async def upload_result(meta: dict[str, Any], wav_bytes: bytes) -> dict[str, Any]:
+                    async with upload_limit:
+                        with ops_log.operation("s3_upload", extra={"type": "voice_design_batch"}):
+                            s3_url = await _upload_wav_async(
+                                wav_bytes,
+                                "voice_design",
+                                filename=meta["filename"],
+                                model_id="voice_design_qwen",
+                            )
+                        item = meta["item"]
+                        presigned_url = storage.get_presigned_url(meta["s3_key"], expires_in=86400)
+                        return {
+                            "index": meta["index"],
+                            "status": "success",
+                            "s3_url": s3_url,
+                            "presigned_url": presigned_url,
+                            "s3_key": meta["s3_key"],
+                            "sample_rate": sr,
+                            "text": item.text,
+                            "instruct": item.instruct,
+                            "character_name": item.character_name,
+                        }
+
+                uploaded_results = await asyncio.gather(
+                    *(upload_result(meta, wav_bytes) for meta, wav_bytes in zip(chunk, wavs_chunk))
+                )
+                for uploaded in uploaded_results:
+                    results[uploaded["index"]] = uploaded
+            else:
+                for meta, wav_bytes in zip(chunk, wavs_chunk):
+                    item = meta["item"]
+                    results[meta["index"]] = {
+                        "index": meta["index"],
+                        "status": "success",
+                        "audio_base64": base64.b64encode(wav_bytes).decode(),
+                        "sample_rate": sr,
+                        "text": item.text,
+                        "instruct": item.instruct,
+                        "character_name": item.character_name,
+                    }
+
+    final_results = [result for result in results if result is not None]
 
     return {
-        "total": len(results),
-        "succeeded": sum(1 for r in results if r.get("status") == "success"),
-        "skipped": sum(1 for r in results if r.get("status") == "skipped"),
-        "failed": sum(1 for r in results if r.get("status") == "failed"),
-        "results": results,
+        "total": len(final_results),
+        "succeeded": sum(1 for r in final_results if r.get("status") == "success"),
+        "skipped": sum(1 for r in final_results if r.get("status") == "skipped"),
+        "failed": sum(1 for r in final_results if r.get("status") == "failed"),
+        "results": final_results,
     }
 
 
@@ -1333,23 +3146,56 @@ async def voice_design_batch(req: VoiceDesignBatchRequest):
 
 @app.get("/gpu/status", summary="GPU and model status")
 async def gpu_status():
-    """Get GPU memory usage, model load state, and idle timer info."""
-    return pipeline.inference.stats
+    """Get GPU memory usage, model load state, and scheduler-facing idle/cooldown info."""
+    status = _gpu_scheduler_status()
+    status["startup_preload"] = {
+        "in_progress": bool(getattr(app.state, "startup_preload_in_progress", False)),
+        "last_error": getattr(app.state, "startup_preload_last_error", ""),
+        "completed_at": getattr(app.state, "startup_preload_completed_at", None),
+    }
+    return status
 
 
 @app.post("/gpu/unload", summary="Manually unload model from GPU")
 async def gpu_unload():
     """Immediately unload the model from GPU to free VRAM."""
     was_loaded = pipeline.inference.is_loaded
-    pipeline.inference.unload()
+    snapshot = pipeline.inference.unload()
     return {
         "detail": "Model unloaded" if was_loaded else "No model was loaded",
-        "gpu_memory_allocated_gb": 0.0,
+        "gpu_memory_allocated_gb": round(snapshot.get("allocated_gb", 0.0), 2),
+        "gpu_memory_reserved_gb": round(snapshot.get("reserved_gb", 0.0), 2),
+        "gpu_memory_free_gb": round(snapshot.get("free_gb", 0.0), 2),
     }
 
 
 class GpuConfigRequest(BaseModel):
     idle_timeout_seconds: int = 300
+
+
+class GPUConcurrencyConfigRequest(BaseModel):
+    gpu_max_models: int = Field(..., ge=1)
+    voice_design_replicas: int = Field(..., ge=1)
+    voice_clone_replicas: int = Field(..., ge=1)
+    shared_model_min_headroom_gb: float = Field(..., ge=0)
+
+
+class GPUConcurrencyConfigResponse(BaseModel):
+    gpu_max_models: int
+    voice_design_replicas: int
+    voice_clone_replicas: int
+    shared_model_min_headroom_gb: float
+
+
+def _gpu_concurrency_config_response() -> GPUConcurrencyConfigResponse:
+    stats = pipeline.inference.stats
+    shared_model_replicas = stats.get("shared_model_replicas", {})
+    return GPUConcurrencyConfigResponse(
+        gpu_max_models=stats["max_models"],
+        voice_design_replicas=shared_model_replicas.get("voice_design", 1),
+        voice_clone_replicas=shared_model_replicas.get("voice_clone", 1),
+        shared_model_min_headroom_gb=stats["shared_model_min_headroom_gb"],
+    )
 
 
 @app.put("/gpu/config", summary="Update GPU idle timeout")
@@ -1360,6 +3206,38 @@ async def gpu_config(req: GpuConfigRequest):
         "idle_timeout_seconds": req.idle_timeout_seconds,
         "auto_unload_enabled": req.idle_timeout_seconds > 0,
     }
+
+
+@app.get(
+    "/gpu/concurrency",
+    response_model=GPUConcurrencyConfigResponse,
+    summary="Get live GPU concurrency settings",
+)
+async def get_gpu_concurrency():
+    """Return the effective runtime GPU concurrency configuration."""
+    return _gpu_concurrency_config_response()
+
+
+@app.post(
+    "/gpu/concurrency",
+    response_model=GPUConcurrencyConfigResponse,
+    summary="Update live GPU concurrency settings",
+)
+async def update_gpu_concurrency(req: GPUConcurrencyConfigRequest):
+    """Apply GPU concurrency settings in memory without restarting the server."""
+    try:
+        pipeline.inference.update_runtime_config(
+            max_models=req.gpu_max_models,
+            shared_model_replicas={
+                "voice_design": req.voice_design_replicas,
+                "voice_clone": req.voice_clone_replicas,
+            },
+            shared_model_min_headroom_gb=req.shared_model_min_headroom_gb,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return _gpu_concurrency_config_response()
 
 
 @app.post("/gpu/terminate", summary="Request instance termination")
@@ -1493,6 +3371,16 @@ async def session_prepare(req: SessionPrepareRequest):
             "workers_started": len(session.workers),
             "vram": pipeline.inference.get_vram_budget(),
         }
+    except DuplicateActiveSessionError as e:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(e),
+                "active_session_id": e.active_session_id,
+            },
+        )
+    except TrainingConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -1587,6 +3475,22 @@ async def gpu_vram():
     return pipeline.inference.get_vram_budget()
 
 
+@app.get("/gpu/metrics", summary="Current resource utilization (CPU, GPU, RAM, VRAM)")
+async def gpu_metrics():
+    """Get real-time snapshot of system resources."""
+    return metrics_collector.get_latest()
+
+
+@app.get("/gpu/metrics/history", summary="Historical resource utilization")
+async def gpu_metrics_history(
+    limit: Optional[int] = Query(60, description="Max records to return"),
+    start_ts: Optional[str] = Query(None, description="Start ISO timestamp filter"),
+    end_ts: Optional[str] = Query(None, description="End ISO timestamp filter"),
+):
+    """Get historical resource utilization records with optional time filtering."""
+    return metrics_collector.get_history(limit=limit, start_ts=start_ts, end_ts=end_ts)
+
+
 # ---------------------------------------------------------------------------
 # Operations Logging
 # ---------------------------------------------------------------------------
@@ -1614,6 +3518,28 @@ async def ops_history(
 async def ops_running():
     """Get operations currently in progress."""
     return ops_log.get_running()
+
+
+@app.get("/logs/stream", summary="Stream server logs in real-time")
+async def stream_logs(request: Request):
+    """Stream server logs using Server-Sent Events (SSE).
+    
+    This endpoint provides a real-time feed of all server logs, including 
+    structured operations from ops_logger and stdout redirects.
+    """
+    async def log_generator():
+        # 1. Send recent history first
+        for msg in list(log_history):
+            yield {"data": msg}
+            
+        # 2. Subscribe to real-time updates
+        async with broadcast.subscribe(channel="logs") as subscriber:
+            async for event in subscriber:
+                if await request.is_disconnected():
+                    break
+                yield {"data": event.message}
+
+    return EventSourceResponse(log_generator())
 
 
 # ---------------------------------------------------------------------------

@@ -31,11 +31,23 @@ AudioLike = Union[
 MaybeList = Union[Any, List[Any]]
 
 class TTSDataset(Dataset):
-    def __init__(self, data_list, processor, config:Qwen3TTSConfig, lag_num = -1):
+    def __init__(
+        self,
+        data_list,
+        processor,
+        config: Qwen3TTSConfig,
+        lag_num=-1,
+        max_text_tokens: int = 0,
+        max_codec_tokens: int = 0,
+        max_total_tokens: int = 0,
+    ):
         self.data_list = data_list
         self.processor = processor
         self.lag_num = lag_num
         self.config = config
+        self.max_text_tokens = max(0, int(max_text_tokens or 0))
+        self.max_codec_tokens = max(0, int(max_codec_tokens or 0))
+        self.max_total_tokens = max(0, int(max_total_tokens or 0))
 
     def __len__(self):
         return len(self.data_list)
@@ -132,8 +144,16 @@ class TTSDataset(Dataset):
 
         text = self._build_assistant_text(text)
         text_ids = self._tokenize_texts(text)
+        if self.max_text_tokens > 0:
+            text_ids = text_ids[:, : self.max_text_tokens]
 
         audio_codes = torch.tensor(audio_codes, dtype=torch.long)
+        max_codec_tokens = self.max_codec_tokens
+        if self.max_total_tokens > 0:
+            total_budget = max(1, self.max_total_tokens - text_ids.shape[1] - 8)
+            max_codec_tokens = min(max_codec_tokens, total_budget) if max_codec_tokens > 0 else total_budget
+        if max_codec_tokens > 0:
+            audio_codes = audio_codes[:max_codec_tokens]
 
         ref_audio_list = self._ensure_list(ref_audio_path)
         normalized = self._normalize_audio_inputs(ref_audio_list)
