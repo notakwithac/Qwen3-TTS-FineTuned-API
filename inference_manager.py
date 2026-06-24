@@ -197,6 +197,7 @@ class InferenceManager:
         self._estimated_model_vram_gb = 5.5
         self._voice_clone_prompt_cache: collections.OrderedDict[tuple[str, str, bool], Any] = collections.OrderedDict()
         self._voice_clone_prompt_cache_max_entries = 128
+        self._external_gpu_eviction_callback = None
 
         # Session pinning: models pinned by active sessions won't be LRU evicted
         # Dict[cache_key, set[session_id]]
@@ -440,6 +441,10 @@ class InferenceManager:
                 "shared_model_min_headroom_gb": self._shared_model_min_headroom_gb,
             }
 
+    def set_external_gpu_eviction_callback(self, callback):
+        """Register a callback that frees non-Qwen GPU runtimes before Qwen model load."""
+        self._external_gpu_eviction_callback = callback
+
     @contextlib.contextmanager
     def _track_active(self):
         with self._lock:
@@ -457,6 +462,32 @@ class InferenceManager:
                     self._active_requests = 0
                     self._idle_started_at = self._last_request_finished_at
                 self._touch()
+
+    def run_external_gpu_call(self, label: str, fn):
+        """Run non-Qwen GPU work with exclusive ownership of the GPU limiter."""
+        acquired = 0
+        capacity = max(1, int(self._inference_limiter.snapshot().get("capacity", 1)))
+        with ops_log.operation("gpu_resource_wait", extra={"model": label}):
+            if self._gpu_controller:
+                self._gpu_controller.begin_inference(label)
+            for _ in range(capacity):
+                self._inference_limiter.acquire(label)
+                acquired += 1
+        try:
+            with self._track_active():
+                op = ops_log.start(label)
+                try:
+                    result = fn()
+                    ops_log.end(op)
+                    return result
+                except Exception as e:
+                    ops_log.fail(op, str(e))
+                    raise
+        finally:
+            for _ in range(acquired):
+                self._inference_limiter.release(label)
+            if self._gpu_controller:
+                self._gpu_controller.end_inference()
 
     # -- Speaker name normalisation -------------------------------------------
 
@@ -497,6 +528,9 @@ class InferenceManager:
             if session_id:
                 self._session_pins.setdefault(cache_key, set()).add(session_id)
             return self._models[cache_key][0]
+
+        if self._external_gpu_eviction_callback is not None:
+            self._external_gpu_eviction_callback()
 
         self._enforce_cache_size(reserve=1)
 

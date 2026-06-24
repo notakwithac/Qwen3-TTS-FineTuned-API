@@ -54,6 +54,21 @@ if [ -n "${TORCH_LIB_DIR}" ] && [ -d "${TORCH_LIB_DIR}" ]; then
     echo "[INFO] Added Torch native lib path to LD_LIBRARY_PATH: ${TORCH_LIB_DIR}" | tee -a "${LOG_DIR}/startup.log"
 fi
 
+# Pre-download model weights into the Hugging Face cache. This does not load
+# models into GPU; it only avoids first-request network downloads.
+export PREFETCH_MODELS_ON_START="${PREFETCH_MODELS_ON_START:-1}"
+export PREFETCH_MODEL_SET="${PREFETCH_MODEL_SET:-base voice_design tokenizer gemma sarvam_translate}"
+if [ "${PREFETCH_MODELS_ON_START}" = "1" ]; then
+    echo "[INFO] Pre-fetching model files: ${PREFETCH_MODEL_SET}" | tee -a "${LOG_DIR}/startup.log"
+    if python download_models.py --models ${PREFETCH_MODEL_SET} >> "${LOG_DIR}/model_prefetch.log" 2>&1; then
+        echo "[INFO] Model prefetch complete." | tee -a "${LOG_DIR}/startup.log"
+    else
+        echo "[WARN] Model prefetch failed; continuing API startup. See ${LOG_DIR}/model_prefetch.log" | tee -a "${LOG_DIR}/startup.log"
+    fi
+else
+    echo "[INFO] Model prefetch skipped (PREFETCH_MODELS_ON_START=${PREFETCH_MODELS_ON_START})." | tee -a "${LOG_DIR}/startup.log"
+fi
+
 # --- 4. EXECUTION ---
 echo "[INFO] Starting GPU Idle Watchdog..." | tee -a "${LOG_DIR}/startup.log"
 nohup python gpu_idle_watchdog.py >> "${LOG_DIR}/watchdog.log" 2>&1 &

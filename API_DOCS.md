@@ -11,6 +11,7 @@
   - [Quick Start](#quick-start)
   - [Disk Management (LRU)](#disk-management-lru)
   - [Authentication](#authentication)
+  - [Lazy vLLM Proxies](#lazy-vllm-proxies)
 - [Job Lifecycle (Finetuning)](#job-lifecycle-finetuning)
   - [POST /finetune](#post-finetune)
   - [GET /jobs/{job_id}](#get-jobsjob_id)
@@ -71,6 +72,60 @@ The API is optimized for instances with limited storage (e.g., 50GB SSD).
 ### Authentication
 
 No authentication is required by default. For production, add API key auth at the reverse proxy level (nginx/caddy) or add FastAPI middleware.
+
+### Lazy vLLM Proxies
+
+Qwen3-TTS can front Gemma 12B and Sarvam Translate through lazy vLLM
+subprocesses. Plain `docker compose up --build` starts the API. Startup can
+pre-download model files into the Hugging Face cache, but Gemma/Sarvam load into
+GPU only when requested.
+
+GPU residency rule:
+
+- Starting Gemma stops Sarvam and unloads resident Qwen models.
+- Starting Sarvam stops Gemma and unloads resident Qwen models.
+- Loading any Qwen TTS model stops Gemma/Sarvam first.
+
+Startup cache knobs:
+
+- `PREFETCH_MODELS_ON_START=1`
+- `PREFETCH_MODEL_SET=base voice_design tokenizer gemma sarvam_translate`
+
+Gemma OpenAI-compatible routes:
+
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+- `POST /v1/completions`
+- `GET /gemma/status`
+- `GET /vllm/status`
+
+Generation calls hold the same GPU limiter used by TTS inference. This lets
+Pathnam use one backend without bypassing Qwen3-TTS admission control.
+
+```bash
+curl -X POST "$BASE_URL/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemma12b",
+    "messages": [
+      {"role": "user", "content": "Return one short narration note."}
+    ],
+    "max_tokens": 128
+  }'
+```
+
+Sarvam translation route:
+
+```bash
+curl -X POST "$BASE_URL/translate" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Every voice carries a place with it.",
+    "source_language": "English",
+    "target_language": "Hindi",
+    "max_new_tokens": 256
+  }'
+```
 
 ---
 

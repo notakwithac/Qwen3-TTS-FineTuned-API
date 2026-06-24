@@ -14,6 +14,7 @@ import asyncio
 import base64
 import threading
 import torch
+import requests
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -34,6 +35,7 @@ from session_manager import (
 )
 from metrics_collector import metrics_collector
 from gpu_resource_controller import GPUResourceController
+from vllm_runtime_manager import ManagedVllmService, VllmRuntimeManager
 from dataset_jobs import (
     load_existing_package_result,
     load_existing_prepare_result,
@@ -368,6 +370,8 @@ async def _lifespan(app):
     if preload_task is not None:
         await preload_task
     logger.info("Server shutting down — waiting for pending S3 uploads...")
+    if MANAGED_VLLM_ENABLED:
+        vllm_runtime.stop_all()
     await asyncio.get_event_loop().run_in_executor(None, pipeline.shutdown)
     logger.info("Shutdown complete.")
 
@@ -484,6 +488,207 @@ async def log_requests(request: Request, call_next):
         })
         raise
 
+
+def _vllm_proxy_headers(api_key: str) -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
+def _gemma_proxy_headers() -> dict[str, str]:
+    return _vllm_proxy_headers(GEMMA_VLLM_API_KEY)
+
+
+def _normalize_gemma_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(payload)
+    requested_model = str(normalized.get("model") or "").strip()
+    if GEMMA_VLLM_FORCE_MODEL or not requested_model:
+        normalized["model"] = GEMMA_VLLM_MODEL
+    elif requested_model.startswith("openai/"):
+        normalized["model"] = requested_model.removeprefix("openai/")
+    return normalized
+
+
+def _gemma_upstream_url(path: str) -> str:
+    base_url = vllm_runtime.base_url("gemma") if MANAGED_VLLM_ENABLED else GEMMA_VLLM_BASE_URL
+    return f"{base_url}/{path.lstrip('/')}"
+
+
+def _sarvam_upstream_url(path: str) -> str:
+    base_url = vllm_runtime.base_url("sarvam") if MANAGED_VLLM_ENABLED else SARVAM_VLLM_BASE_URL
+    return f"{base_url}/{path.lstrip('/')}"
+
+
+def _prepare_managed_vllm(service_name: str) -> None:
+    if not MANAGED_VLLM_ENABLED:
+        return
+    pipeline.inference.unload()
+    vllm_runtime.ensure_running(service_name)
+
+
+async def _forward_gemma_vllm(path: str, payload: dict[str, Any]) -> Response:
+    if not GEMMA_VLLM_BASE_URL:
+        raise HTTPException(status_code=503, detail="Gemma vLLM backend is not configured")
+
+    outbound_payload = _normalize_gemma_payload(payload)
+
+    def _call_upstream():
+        _prepare_managed_vllm("gemma")
+        response = requests.post(
+            _gemma_upstream_url(path),
+            json=outbound_payload,
+            headers=_gemma_proxy_headers(),
+            timeout=GEMMA_VLLM_TIMEOUT_SECONDS,
+        )
+        if MANAGED_VLLM_ENABLED:
+            vllm_runtime.mark_used("gemma")
+        return response.status_code, response.headers.get("content-type", "application/json"), response.content
+
+    try:
+        loop = asyncio.get_running_loop()
+        status_code, media_type, content = await loop.run_in_executor(
+            None,
+            lambda: pipeline.inference.run_external_gpu_call("inference_gemma_vllm", _call_upstream),
+        )
+    except requests.RequestException as exc:
+        logger.warning("Gemma vLLM request failed: %s", exc)
+        raise HTTPException(status_code=503, detail=f"Gemma vLLM backend unavailable: {exc}") from exc
+
+    return Response(content=content, status_code=status_code, media_type=media_type)
+
+
+@app.get("/gemma/status", summary="Gemma vLLM proxy status")
+async def gemma_status():
+    """Check configured Gemma vLLM backend and shared GPU limiter state."""
+    reachable = False
+    detail = ""
+    if GEMMA_VLLM_BASE_URL:
+        try:
+            if MANAGED_VLLM_ENABLED:
+                vllm_runtime.stop_idle()
+            response = requests.get(
+                _gemma_upstream_url("models"),
+                headers=_gemma_proxy_headers(),
+                timeout=min(GEMMA_VLLM_TIMEOUT_SECONDS, 10),
+            )
+            reachable = response.ok
+            detail = response.text[:500]
+        except requests.RequestException as exc:
+            detail = str(exc)
+    else:
+        detail = "Gemma vLLM backend is not configured"
+
+    return {
+        "configured": bool(GEMMA_VLLM_BASE_URL),
+        "reachable": reachable,
+        "base_url": GEMMA_VLLM_BASE_URL,
+        "model": GEMMA_VLLM_MODEL,
+        "force_model": GEMMA_VLLM_FORCE_MODEL,
+        "managed_vllm": MANAGED_VLLM_ENABLED,
+        "managed_services": vllm_runtime.status() if MANAGED_VLLM_ENABLED else {},
+        "inference_limiter": pipeline.inference.stats.get("inference_limiter", {}),
+        "detail": detail,
+    }
+
+
+@app.get("/v1/models", summary="OpenAI-compatible model list")
+async def openai_models():
+    """Expose configured Gemma model id for OpenAI-compatible clients."""
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": GEMMA_VLLM_MODEL,
+                "object": "model",
+                "created": 0,
+                "owned_by": "vllm",
+            }
+        ],
+    }
+
+
+@app.post("/v1/chat/completions", summary="OpenAI-compatible Gemma chat completions")
+async def openai_chat_completions(request: Request):
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="JSON object body required")
+    return await _forward_gemma_vllm("chat/completions", payload)
+
+
+@app.post("/v1/completions", summary="OpenAI-compatible Gemma completions")
+async def openai_completions(request: Request):
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="JSON object body required")
+    return await _forward_gemma_vllm("completions", payload)
+
+
+class TranslateRequest(BaseModel):
+    text: str = Field(..., min_length=1)
+    source_language: str = "English"
+    target_language: str
+    max_new_tokens: int = Field(512, ge=1, le=4096)
+
+
+@app.post("/translate", summary="Translate text with managed Sarvam vLLM")
+async def translate(req: TranslateRequest):
+    """Translate text through Sarvam vLLM under the exclusive GPU runtime manager."""
+    prompt = (
+        f"Translate from {req.source_language} to {req.target_language}. "
+        "Return only the translated text.\n\n"
+        f"{req.text}"
+    )
+    payload = {
+        "model": SARVAM_VLLM_MODEL,
+        "messages": [
+            {"role": "user", "content": prompt},
+        ],
+        "max_tokens": req.max_new_tokens,
+        "temperature": 0,
+    }
+
+    def _call_upstream():
+        _prepare_managed_vllm("sarvam")
+        response = requests.post(
+            _sarvam_upstream_url("chat/completions"),
+            json=payload,
+            headers=_vllm_proxy_headers(SARVAM_VLLM_API_KEY),
+            timeout=SARVAM_VLLM_TIMEOUT_SECONDS,
+        )
+        if MANAGED_VLLM_ENABLED:
+            vllm_runtime.mark_used("sarvam")
+        response.raise_for_status()
+        data = response.json()
+        choices = data.get("choices") or []
+        message = choices[0].get("message", {}) if choices else {}
+        translated = (message.get("content") or choices[0].get("text", "")) if choices else ""
+        return {
+            "text": translated.strip(),
+            "source_language": req.source_language,
+            "target_language": req.target_language,
+            "model_id": SARVAM_VLLM_MODEL,
+        }
+
+    try:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: pipeline.inference.run_external_gpu_call("inference_sarvam_vllm", _call_upstream),
+        )
+    except requests.RequestException as exc:
+        logger.warning("Sarvam vLLM request failed: %s", exc)
+        raise HTTPException(status_code=503, detail=f"Sarvam vLLM backend unavailable: {exc}") from exc
+
+
+@app.get("/vllm/status", summary="Managed vLLM runtime status")
+async def managed_vllm_status():
+    return {
+        "managed": MANAGED_VLLM_ENABLED,
+        "services": vllm_runtime.status() if MANAGED_VLLM_ENABLED else {},
+        "inference_limiter": pipeline.inference.stats.get("inference_limiter", {}),
+    }
+
 # GPU configuration
 def _default_gpu_max_models() -> int:
     if not torch.cuda.is_available():
@@ -574,6 +779,25 @@ DATASET_JOB_VRAM_WAIT_TIMEOUT_SEC = float(os.environ.get("DATASET_JOB_VRAM_WAIT_
 VOICE_DESIGN_REPLICAS = int(os.environ.get("VOICE_DESIGN_REPLICAS", "1"))
 VOICE_CLONE_REPLICAS = int(os.environ.get("VOICE_CLONE_REPLICAS", "1"))
 SHARED_MODEL_MIN_HEADROOM_GB = float(os.environ.get("SHARED_MODEL_MIN_HEADROOM_GB", "4"))
+MANAGED_VLLM_ENABLED = os.environ.get("MANAGED_VLLM_ENABLED", "1") == "1"
+MANAGED_VLLM_IDLE_TIMEOUT_SECONDS = float(os.environ.get("MANAGED_VLLM_IDLE_TIMEOUT_SECONDS", "120"))
+GEMMA_VLLM_BASE_URL = os.environ.get("GEMMA_VLLM_BASE_URL", "http://127.0.0.1:8101/v1").rstrip("/")
+GEMMA_VLLM_HF_MODEL = os.environ.get("GEMMA_VLLM_HF_MODEL", "google/gemma-3-12b-it")
+GEMMA_VLLM_MODEL = os.environ.get("GEMMA_VLLM_MODEL", "gemma12b")
+GEMMA_VLLM_PORT = int(os.environ.get("GEMMA_VLLM_PORT", "8101"))
+GEMMA_VLLM_API_KEY = os.environ.get("GEMMA_VLLM_API_KEY", "EMPTY")
+GEMMA_VLLM_TIMEOUT_SECONDS = float(os.environ.get("GEMMA_VLLM_TIMEOUT_SECONDS", "300"))
+GEMMA_VLLM_FORCE_MODEL = os.environ.get("GEMMA_VLLM_FORCE_MODEL", "1") == "1"
+GEMMA_VLLM_GPU_MEMORY_UTILIZATION = os.environ.get("GEMMA_VLLM_GPU_MEMORY_UTILIZATION", "0.45")
+GEMMA_VLLM_MAX_MODEL_LEN = os.environ.get("GEMMA_VLLM_MAX_MODEL_LEN", "8192")
+SARVAM_VLLM_BASE_URL = os.environ.get("SARVAM_VLLM_BASE_URL", "http://127.0.0.1:8102/v1").rstrip("/")
+SARVAM_VLLM_HF_MODEL = os.environ.get("SARVAM_VLLM_HF_MODEL", "sarvamai/sarvam-translate")
+SARVAM_VLLM_MODEL = os.environ.get("SARVAM_VLLM_MODEL", "sarvam-translate")
+SARVAM_VLLM_PORT = int(os.environ.get("SARVAM_VLLM_PORT", "8102"))
+SARVAM_VLLM_API_KEY = os.environ.get("SARVAM_VLLM_API_KEY", "EMPTY")
+SARVAM_VLLM_TIMEOUT_SECONDS = float(os.environ.get("SARVAM_VLLM_TIMEOUT_SECONDS", "300"))
+SARVAM_VLLM_GPU_MEMORY_UTILIZATION = os.environ.get("SARVAM_VLLM_GPU_MEMORY_UTILIZATION", "0.45")
+SARVAM_VLLM_MAX_MODEL_LEN = os.environ.get("SARVAM_VLLM_MAX_MODEL_LEN", "4096")
 
 logger.info(f"Loaded Configuration:")
 logger.info(f"  - DEVICE: {DEVICE}")
@@ -622,6 +846,13 @@ logger.info(f"  - DATASET_JOB_VRAM_WAIT_TIMEOUT_SEC: {DATASET_JOB_VRAM_WAIT_TIME
 logger.info(f"  - VOICE_DESIGN_REPLICAS: {VOICE_DESIGN_REPLICAS}")
 logger.info(f"  - VOICE_CLONE_REPLICAS: {VOICE_CLONE_REPLICAS}")
 logger.info(f"  - SHARED_MODEL_MIN_HEADROOM_GB: {SHARED_MODEL_MIN_HEADROOM_GB}")
+logger.info(f"  - MANAGED_VLLM_ENABLED: {MANAGED_VLLM_ENABLED}")
+logger.info(f"  - MANAGED_VLLM_IDLE_TIMEOUT_SECONDS: {MANAGED_VLLM_IDLE_TIMEOUT_SECONDS}")
+logger.info(f"  - GEMMA_VLLM_BASE_URL: {GEMMA_VLLM_BASE_URL}")
+logger.info(f"  - GEMMA_VLLM_MODEL: {GEMMA_VLLM_MODEL}")
+logger.info(f"  - GEMMA_VLLM_FORCE_MODEL: {GEMMA_VLLM_FORCE_MODEL}")
+logger.info(f"  - SARVAM_VLLM_BASE_URL: {SARVAM_VLLM_BASE_URL}")
+logger.info(f"  - SARVAM_VLLM_MODEL: {SARVAM_VLLM_MODEL}")
 logger.info(f"  - MAX_REPLICAS_PER_MODEL: {MAX_REPLICAS_PER_MODEL}")
 logger.info(f"  - SESSION_TIMEOUT: {SESSION_TIMEOUT}s")
 
@@ -641,6 +872,34 @@ pipeline = Pipeline(
     },
     shared_model_min_headroom_gb=SHARED_MODEL_MIN_HEADROOM_GB,
 )
+
+vllm_runtime = VllmRuntimeManager(
+    services={
+        "gemma": ManagedVllmService(
+            name="gemma",
+            model=GEMMA_VLLM_HF_MODEL,
+            served_model_name=GEMMA_VLLM_MODEL,
+            port=GEMMA_VLLM_PORT,
+            gpu_memory_utilization=GEMMA_VLLM_GPU_MEMORY_UTILIZATION,
+            max_model_len=GEMMA_VLLM_MAX_MODEL_LEN,
+            api_key=GEMMA_VLLM_API_KEY,
+            startup_timeout_seconds=GEMMA_VLLM_TIMEOUT_SECONDS,
+        ),
+        "sarvam": ManagedVllmService(
+            name="sarvam",
+            model=SARVAM_VLLM_HF_MODEL,
+            served_model_name=SARVAM_VLLM_MODEL,
+            port=SARVAM_VLLM_PORT,
+            gpu_memory_utilization=SARVAM_VLLM_GPU_MEMORY_UTILIZATION,
+            max_model_len=SARVAM_VLLM_MAX_MODEL_LEN,
+            api_key=SARVAM_VLLM_API_KEY,
+            startup_timeout_seconds=SARVAM_VLLM_TIMEOUT_SECONDS,
+        ),
+    },
+    idle_timeout_seconds=MANAGED_VLLM_IDLE_TIMEOUT_SECONDS,
+)
+if MANAGED_VLLM_ENABLED:
+    pipeline.inference.set_external_gpu_eviction_callback(vllm_runtime.stop_all)
 
 # Session-based inference manager
 session_mgr = SessionManager(

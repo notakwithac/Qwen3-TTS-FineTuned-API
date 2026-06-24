@@ -115,13 +115,35 @@ Open:
 - MinIO console: <http://localhost:9001>
 - MinIO S3 endpoint: <http://localhost:9000>
 
-To include the optional Sarvam translation service:
+Gemma 12B and Sarvam Translate run as lazy vLLM subprocesses inside the API
+container. Plain compose starts the API and storage; the first Gemma/Sarvam
+request loads its model into GPU, and the idle timeout stops it again:
 
 ```bash
-docker compose --profile translate up --build
+docker compose up --build
 ```
 
-The OpenAI-compatible translation backend is exposed on port `8001`; requests should normally go through this API's `/translate` endpoint on port `8000`.
+By default startup pre-downloads model files into the shared Hugging Face cache
+volume without loading them into GPU:
+
+```env
+PREFETCH_MODELS_ON_START=1
+PREFETCH_MODEL_SET=base voice_design tokenizer gemma sarvam_translate
+```
+
+Set `PREFETCH_MODELS_ON_START=0` for faster API boot with first-request
+downloads. Gemma may require `HF_TOKEN` accepted for the selected Hugging Face
+repo.
+
+Qwen3-TTS exposes OpenAI-compatible Gemma routes on its own API port:
+
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+- `POST /v1/completions`
+- `GET /gemma/status`
+- `GET /vllm/status`
+
+Point Pathnam at Qwen3-TTS with `LLM_PROVIDER=vllm`, `LLM_MODEL=gemma12b`, and `LLM_BASE_URL=http://<qwen-api-host>:8000/v1`. The proxy unloads resident Qwen models before starting Gemma, stops any active Sarvam vLLM process first, and holds the same GPU limiter used by voice design, voice clone, and custom voice inference.
 
 ## TIR or direct Linux setup
 
@@ -240,6 +262,12 @@ Important defaults live in [.env.example](.env.example):
 | `VOICE_CLONE_REPLICAS` | Startup target for shared Base/clone replicas |
 | `SHARED_MODEL_MIN_HEADROOM_GB` | Free VRAM required before admitting another shared replica |
 | `GPU_BATCH_SIZE` | Upper bound for supported inference batching paths |
+| `MANAGED_VLLM_ENABLED` | Starts Gemma/Sarvam vLLM lazily and keeps them mutually exclusive with Qwen |
+| `MANAGED_VLLM_IDLE_TIMEOUT_SECONDS` | Stops idle Gemma/Sarvam vLLM processes after inactivity |
+| `PREFETCH_MODELS_ON_START` | Downloads model files at startup without loading GPU |
+| `PREFETCH_MODEL_SET` | Space-separated model keys to pre-cache |
+| `GEMMA_VLLM_MODEL` | Model id exposed through Qwen3-TTS `/v1` proxy |
+| `SARVAM_VLLM_MODEL` | Model id used by the `/translate` proxy |
 
 Runtime controls let you tune a live process without redeploying:
 
@@ -327,7 +355,7 @@ curl -X POST "$BASE_URL/translate" \
   }'
 ```
 
-In Docker, translation is isolated in its own vLLM service. If the `translate` profile is not running, the API returns a controlled `503` instead of loading the 4B translation model into the Qwen API process.
+In Docker, translation uses the same lazy vLLM manager as Gemma. Sarvam, Gemma, and Qwen TTS models are not intentionally kept resident together: starting one external vLLM model stops the other, and Qwen model loading stops external vLLM first.
 
 ## Repository guide
 
