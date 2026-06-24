@@ -783,7 +783,7 @@ MANAGED_VLLM_ENABLED = os.environ.get("MANAGED_VLLM_ENABLED", "1") == "1"
 MANAGED_VLLM_IDLE_TIMEOUT_SECONDS = float(os.environ.get("MANAGED_VLLM_IDLE_TIMEOUT_SECONDS", "120"))
 GEMMA_VLLM_BASE_URL = os.environ.get("GEMMA_VLLM_BASE_URL", "http://127.0.0.1:8101/v1").rstrip("/")
 GEMMA_VLLM_HF_MODEL = os.environ.get("GEMMA_VLLM_HF_MODEL", "google/gemma-3-12b-it")
-GEMMA_VLLM_MODEL = os.environ.get("GEMMA_VLLM_MODEL", "gemma12b")
+GEMMA_VLLM_MODEL = os.environ.get("GEMMA_VLLM_MODEL", "e4b")
 GEMMA_VLLM_PORT = int(os.environ.get("GEMMA_VLLM_PORT", "8101"))
 GEMMA_VLLM_API_KEY = os.environ.get("GEMMA_VLLM_API_KEY", "EMPTY")
 GEMMA_VLLM_TIMEOUT_SECONDS = float(os.environ.get("GEMMA_VLLM_TIMEOUT_SECONDS", "300"))
@@ -1600,8 +1600,14 @@ class JobSummary(APIModel):
     available_checkpoint_epochs: list[int] = Field(default_factory=list)
     inference_url: Optional[str] = None
     message: Optional[str] = None
+    s3_model_key: Optional[str] = None
+    hf_model_repo: Optional[str] = None
+    hf_model_url: Optional[str] = None
     s3_checkpoint_present: bool = False
+    hf_checkpoint_present: bool = False
+    has_local_checkpoint: bool = False
     has_durable_checkpoint: bool = False
+    model_storage_provider: Optional[str] = None
 
 
 class StorageStatus(APIModel):
@@ -2038,10 +2044,19 @@ async def get_job(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
     payload = job.to_dict()
-    s3_present = await loop.run_in_executor(None, pipeline._has_verified_checkpoint_backup, job)
+    s3_present = await loop.run_in_executor(None, pipeline._has_verified_s3_checkpoint_backup, job)
+    hf_present = await loop.run_in_executor(None, pipeline._has_verified_hf_checkpoint_backup, job)
     has_local = await loop.run_in_executor(None, pipeline._has_local_checkpoint, job)
     payload["s3_checkpoint_present"] = s3_present
-    payload["has_durable_checkpoint"] = bool(s3_present or has_local)
+    payload["hf_checkpoint_present"] = hf_present
+    payload["has_local_checkpoint"] = has_local
+    payload["has_durable_checkpoint"] = bool(s3_present or hf_present or has_local)
+    if hf_present:
+        payload["model_storage_provider"] = "huggingface"
+    elif s3_present:
+        payload["model_storage_provider"] = "s3"
+    elif has_local:
+        payload["model_storage_provider"] = "local"
     return payload
 
 
@@ -2144,7 +2159,9 @@ async def infer(job_id: str, req: InferRequest):
         # transparently recover instead of returning an error
         _cp_check = str(Path(job.checkpoint_path).resolve()) if job.checkpoint_path else None
         can_recover = job.status == JobStatus.FAILED and (
-            job.s3_model_key or (_cp_check and os.path.exists(_cp_check))
+            job.hf_model_repo
+            or job.s3_model_key
+            or (_cp_check and os.path.exists(_cp_check))
         )
         if not can_recover:
             raise HTTPException(
@@ -2302,7 +2319,9 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
     if job.status not in (JobStatus.READY, JobStatus.RESTORING):
         _cp_check = str(Path(job.checkpoint_path).resolve()) if job.checkpoint_path else None
         can_recover = job.status == JobStatus.FAILED and (
-            job.s3_model_key or (_cp_check and os.path.exists(_cp_check))
+            job.hf_model_repo
+            or job.s3_model_key
+            or (_cp_check and os.path.exists(_cp_check))
         )
         if not can_recover:
             raise HTTPException(

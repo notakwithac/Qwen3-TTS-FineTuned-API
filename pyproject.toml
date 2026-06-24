@@ -39,6 +39,7 @@ dependencies = [
   "nvidia-ml-py",
   "pydub",
   "whisperx",
+  "huggingface_hub",
 ]
 
 [project.urls]

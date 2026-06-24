@@ -20,6 +20,12 @@ import torch
 
 from cuda_cleanup import safe_cuda_cleanup
 from inference_manager import InferenceManager
+from model_storage import (
+    get_hf_model_storage_config,
+    hf_checkpoint_repo_exists,
+    restore_checkpoint_from_hf as hf_restore_checkpoint,
+    upload_checkpoint_to_hf,
+)
 from ops_logger import ops_log
 from enum import StrEnum
 
@@ -149,6 +155,9 @@ class Job:
         self.checkpoint_path: Optional[str] = None
         self.available_checkpoint_epochs: list[int] = []
         self.checkpoint_s3_keys: Dict[str, str] = {}
+        self.hf_model_repo: Optional[str] = None
+        self.hf_model_url: Optional[str] = None
+        self.checkpoint_hf_repos: Dict[str, str] = {}
         self.error: Optional[str] = None
         self.created_at = datetime.now(timezone.utc).isoformat()
         self.finished_at: Optional[str] = None
@@ -165,6 +174,9 @@ class Job:
             "checkpoint_path": self.checkpoint_path,
             "available_checkpoint_epochs": self.available_checkpoint_epochs,
             "checkpoint_s3_keys": self.checkpoint_s3_keys,
+            "hf_model_repo": self.hf_model_repo,
+            "hf_model_url": self.hf_model_url,
+            "checkpoint_hf_repos": self.checkpoint_hf_repos,
             "error": self.error,
             "created_at": self.created_at,
             "finished_at": self.finished_at,
@@ -236,6 +248,14 @@ class Job:
             str(epoch): str(s3_key)
             for epoch, s3_key in raw_checkpoint_s3_keys.items()
             if s3_key
+        }
+        job.hf_model_repo = data.get("hf_model_repo")
+        job.hf_model_url = data.get("hf_model_url")
+        raw_checkpoint_hf_repos = data.get("checkpoint_hf_repos", {})
+        job.checkpoint_hf_repos = {
+            str(epoch): str(repo_id)
+            for epoch, repo_id in raw_checkpoint_hf_repos.items()
+            if repo_id
         }
         job.error = data.get("error")
         job.created_at = data.get("created_at", job.created_at)
@@ -402,6 +422,39 @@ class Pipeline:
         job.s3_model_key = s3_key
         return checkpoint_s3_keys
 
+    def _upload_latest_checkpoint_to_hf(self, job: Job) -> dict[str, str]:
+        latest_epoch = self._latest_checkpoint_epoch(job)
+        if latest_epoch is None:
+            return {}
+
+        checkpoint_dir = _checkpoint_path_for_epoch(job.output_dir, latest_epoch)
+        if not checkpoint_dir.is_dir():
+            return {}
+
+        repo_id, model_url = upload_checkpoint_to_hf(
+            job,
+            checkpoint_dir,
+            latest_epoch,
+            checkpoint_dir_name=_checkpoint_dir_name(latest_epoch),
+        )
+        checkpoint_hf_repos = {str(latest_epoch): repo_id}
+        job.checkpoint_hf_repos = checkpoint_hf_repos
+        job.hf_model_repo = repo_id
+        job.hf_model_url = model_url
+        return checkpoint_hf_repos
+
+    def _checkpoint_hf_repo_exists(
+        self,
+        job: Job,
+        checkpoint_epoch: Optional[int] = None,
+    ) -> bool:
+        repo_id = None
+        if checkpoint_epoch is not None:
+            repo_id = job.checkpoint_hf_repos.get(str(checkpoint_epoch))
+        if not repo_id:
+            repo_id = job.hf_model_repo
+        return hf_checkpoint_repo_exists(repo_id)
+
     def _checkpoint_s3_object_exists(
         self,
         job: Job,
@@ -422,11 +475,33 @@ class Pipeline:
             return False
         return storage.object_exists(s3_ref)
 
-    def _has_verified_checkpoint_backup(self, job: Job) -> bool:
+    def _has_verified_hf_checkpoint_backup(self, job: Job) -> bool:
+        latest_epoch = self._latest_checkpoint_epoch(job)
+        if latest_epoch is not None and self._checkpoint_hf_repo_exists(job, checkpoint_epoch=latest_epoch):
+            return True
+        return self._checkpoint_hf_repo_exists(job)
+
+    def _has_verified_s3_checkpoint_backup(self, job: Job) -> bool:
         latest_epoch = self._latest_checkpoint_epoch(job)
         if latest_epoch is not None and self._checkpoint_s3_object_exists(job, checkpoint_epoch=latest_epoch):
             return True
         return self._checkpoint_s3_object_exists(job)
+
+    def _has_verified_checkpoint_backup(self, job: Job) -> bool:
+        if self._has_verified_hf_checkpoint_backup(job):
+            return True
+        latest_epoch = self._latest_checkpoint_epoch(job)
+        if latest_epoch is not None and self._checkpoint_s3_object_exists(job, checkpoint_epoch=latest_epoch):
+            return True
+        return self._checkpoint_s3_object_exists(job)
+
+    def _has_remote_checkpoint_backup(self, job: Job) -> bool:
+        return bool(
+            job.hf_model_repo
+            or job.checkpoint_hf_repos
+            or job.s3_model_key
+            or job.checkpoint_s3_keys
+        )
 
     def _has_local_checkpoint(self, job: Job) -> bool:
         checkpoint_path = job.checkpoint_path
@@ -443,6 +518,10 @@ class Pipeline:
             return True
         if not self._has_local_checkpoint(job):
             return False
+        if get_hf_model_storage_config() is not None:
+            checkpoint_hf_repos = self._upload_latest_checkpoint_to_hf(job)
+            job.save()
+            return bool(checkpoint_hf_repos) and self._has_verified_hf_checkpoint_backup(job)
         checkpoint_s3_keys = self._upload_latest_checkpoint_to_s3(job)
         self._upload_job_json_to_s3(job)
         job.save()
@@ -484,8 +563,13 @@ class Pipeline:
             and latest_epoch is not None
             and requested_epoch != latest_epoch
             and str(requested_epoch) not in job.checkpoint_s3_keys
+            and str(requested_epoch) not in job.checkpoint_hf_repos
         ):
             raise ValueError(f"checkpoint epoch {requested_epoch} is not available for job {job.job_id}")
+
+        if job.checkpoint_hf_repos or job.hf_model_repo:
+            restored_path = self._restore_checkpoint_from_hf(job, checkpoint_epoch=requested_epoch)
+            return str(Path(restored_path).resolve()), requested_epoch
 
         if job.checkpoint_s3_keys or job.s3_model_key:
             restored_path = self._restore_checkpoint_from_s3(job, checkpoint_epoch=requested_epoch)
@@ -494,11 +578,12 @@ class Pipeline:
         raise ValueError(f"Job {job.job_id} has no checkpoint available")
 
     def _s3_sync_worker(self, interval_seconds: float = 900.0):
-        """Background thread: every 15 min, upload any READY job that is missing from S3."""
+        """Background thread: every 15 min, upload any READY job missing remote backup."""
         from storage import storage
-        logger.info("S3 sync monitor started (interval: 15 min).")
+        hf_enabled = get_hf_model_storage_config() is not None
+        logger.info("Checkpoint sync monitor started (interval: 15 min).")
         while not self._stop_sync_event.wait(timeout=interval_seconds):
-            if not storage.is_configured:
+            if not hf_enabled and not storage.is_configured:
                 continue
             try:
                 with self._lock:
@@ -507,31 +592,37 @@ class Pipeline:
                 for job in jobs_snapshot:
                     if self._stop_sync_event.is_set():
                         break
-                    # Only target READY jobs with a local checkpoint but no S3 backup
                     if job.status != JobStatus.READY:
                         continue
-                    if job.s3_model_key:
-                        continue  # Already uploaded
+                    if job.hf_model_repo or job.s3_model_key:
+                        continue
                     if not job.checkpoint_path or not os.path.exists(str(job.checkpoint_path)):
-                        continue  # No local checkpoint to upload
+                        continue
                     
-                    logger.warning(f"S3 sync: Job {job.job_id} ({job.speaker_name}) has no S3 backup — uploading now.")
-                    with ops_log.operation("s3_sync_upload", job_id=job.job_id):
+                    logger.warning(
+                        "Checkpoint sync: Job %s (%s) has no remote backup — uploading now.",
+                        job.job_id,
+                        job.speaker_name,
+                    )
+                    with ops_log.operation("checkpoint_sync_upload", job_id=job.job_id):
                         try:
-                            checkpoint_s3_keys = self._upload_latest_checkpoint_to_s3(job)
-                            self._upload_job_json_to_s3(job)
+                            if hf_enabled:
+                                checkpoint_refs = self._upload_latest_checkpoint_to_hf(job)
+                            else:
+                                checkpoint_refs = self._upload_latest_checkpoint_to_s3(job)
+                                self._upload_job_json_to_s3(job)
                             job.save()
                             logger.info(
-                                "S3 sync: Job %s uploaded %d checkpoint(s) successfully",
+                                "Checkpoint sync: Job %s uploaded %d checkpoint(s) successfully",
                                 job.job_id,
-                                len(checkpoint_s3_keys),
+                                len(checkpoint_refs),
                             )
                         except Exception as e:
-                            logger.error(f"S3 sync: Failed to upload job {job.job_id}: {e}")
-                            raise # Let ops_log.operation catch it
+                            logger.error(f"Checkpoint sync: Failed to upload job {job.job_id}: {e}")
+                            raise
             except Exception as e:
-                logger.error(f"S3 sync worker error: {e}")
-        logger.info("S3 sync monitor stopped.")
+                logger.error(f"Checkpoint sync worker error: {e}")
+        logger.info("Checkpoint sync monitor stopped.")
 
     # -- Job management -----------------------------------------------------
 
@@ -677,6 +768,12 @@ class Pipeline:
             chosen.s3_model_key = other.s3_model_key
         if not chosen.checkpoint_s3_keys and other.checkpoint_s3_keys:
             chosen.checkpoint_s3_keys = dict(other.checkpoint_s3_keys)
+        if not chosen.hf_model_repo and other.hf_model_repo:
+            chosen.hf_model_repo = other.hf_model_repo
+        if not chosen.hf_model_url and other.hf_model_url:
+            chosen.hf_model_url = other.hf_model_url
+        if not chosen.checkpoint_hf_repos and other.checkpoint_hf_repos:
+            chosen.checkpoint_hf_repos = dict(other.checkpoint_hf_repos)
         if not chosen.available_checkpoint_epochs and other.available_checkpoint_epochs:
             chosen.available_checkpoint_epochs = list(other.available_checkpoint_epochs)
         if (
@@ -689,13 +786,18 @@ class Pipeline:
 
     def _reconcile_checkpoint_readiness(self, job: Job) -> Job:
         has_local = self._has_local_checkpoint(job)
-        has_s3 = self._has_verified_checkpoint_backup(job)
-        if has_local or has_s3:
+        has_remote = self._has_verified_checkpoint_backup(job)
+        if has_local or has_remote:
             if job.status != JobStatus.READY:
                 job.status = JobStatus.READY
                 job.error = None
                 job.finished_at = job.finished_at or datetime.now(timezone.utc).isoformat()
-                source = "local disk" if has_local else "S3"
+                if has_local:
+                    source = "local disk"
+                elif self._has_verified_hf_checkpoint_backup(job):
+                    source = "Hugging Face"
+                else:
+                    source = "S3"
                 job.progress = {
                     "stage": "ready",
                     "detail": f"Model checkpoint found on {source} and ready for inference",
@@ -753,6 +855,7 @@ class Pipeline:
         candidates.sort(key=lambda x: x.last_accessed_at)
 
         from storage import storage as _storage
+        hf_enabled = get_hf_model_storage_config() is not None
 
         for job in candidates:
             if current_size <= threshold_bytes:
@@ -762,9 +865,9 @@ class Pipeline:
             if not job_dir.exists():
                 continue
 
-            if job.s3_model_key:
-                # S3-backed: only delete the heavy output/ and dataset/ dirs,
-                # keep job.json so get_job() still works without S3 round-trip
+            if job.hf_model_repo or job.s3_model_key:
+                # Remote-backed: only delete the heavy output/ and dataset/ dirs,
+                # keep job.json so get_job() still works without a remote round-trip
                 for subdir in ["output", "dataset"]:
                     subdir_path = job_dir / subdir
                     if subdir_path.exists():
@@ -772,13 +875,13 @@ class Pipeline:
                         try:
                             shutil.rmtree(subdir_path)
                             current_size -= size
-                            logger.info(f"LRU: Deleted {subdir}/ for S3-backed job {job.job_id} (freed {size / 1024**2:.1f}MB)")
+                            logger.info(f"LRU: Deleted {subdir}/ for remote-backed job {job.job_id} (freed {size / 1024**2:.1f}MB)")
                         except Exception as e:
                             logger.error(f"LRU: Failed to delete {subdir}/ for {job.job_id}: {e}")
-            elif _storage.is_configured:
-                # S3 is configured but this job hasn't been uploaded yet — skip it.
-                # It may still be uploading in the background, or the upload failed.
-                logger.warning(f"LRU: Skipping job {job.job_id} — not yet uploaded to S3. Cannot safely prune.")
+            elif hf_enabled or _storage.is_configured:
+                logger.warning(
+                    f"LRU: Skipping job {job.job_id} — not yet uploaded to remote storage. Cannot safely prune."
+                )
             else:
                 # No S3 configured: delete the entire folder (last resort)
                 size = self._get_dir_size(job_dir)
@@ -1086,27 +1189,39 @@ class Pipeline:
             ops_log.end(train_op, extra={"checkpoint_path": str(checkpoint_path)})
             job.available_checkpoint_epochs = self._refresh_available_checkpoints(job)
              
-            # --- MODEL OFFLOAD: Zip and upload to S3 (Background Thread) ---
+            # --- MODEL OFFLOAD: upload checkpoint to HF or S3 (Background Thread) ---
             from storage import storage
-            if storage.is_configured:
-                def run_s3_upload(j: Job):
-                    j.progress = {"stage": "offloading", "detail": "Zipping and uploading model to S3 in background..."}
+            hf_enabled = get_hf_model_storage_config() is not None
+            if hf_enabled or storage.is_configured:
+                def run_checkpoint_upload(j: Job):
+                    if hf_enabled:
+                        j.progress = {
+                            "stage": "offloading",
+                            "detail": "Uploading model checkpoint to Hugging Face in background...",
+                        }
+                    else:
+                        j.progress = {
+                            "stage": "offloading",
+                            "detail": "Zipping and uploading model to S3 in background...",
+                        }
                     j.save()
                     offload_op = ops_log.start("model_offload", job_id=j.job_id)
                     try:
-                        checkpoint_s3_keys = self._upload_latest_checkpoint_to_s3(j)
-                        # Upload job.json to S3 for easy access / restoration
-                        self._upload_job_json_to_s3(j)
-                        j.save()  # Persist s3_model_key locally
-                        ops_log.end(offload_op, extra={"checkpoint_count": len(checkpoint_s3_keys)})
+                        if hf_enabled:
+                            checkpoint_refs = self._upload_latest_checkpoint_to_hf(j)
+                        else:
+                            checkpoint_refs = self._upload_latest_checkpoint_to_s3(j)
+                            self._upload_job_json_to_s3(j)
+                        j.save()
+                        ops_log.end(offload_op, extra={"checkpoint_count": len(checkpoint_refs)})
                     except Exception as err:
                         ops_log.fail(offload_op, f"Model upload failed: {err}")
                  
                 upload_thread = threading.Thread(
-                    target=run_s3_upload, 
+                    target=run_checkpoint_upload, 
                     args=(job,),
-                    daemon=False,  # Non-daemon: survives Ctrl+C so upload completes
-                    name=f"s3-upload-{job.job_id[:8]}"
+                    daemon=False,
+                    name=f"checkpoint-upload-{job.job_id[:8]}"
                 )
                 with self._lock:
                     self._upload_threads.append(upload_thread)
@@ -1323,6 +1438,112 @@ class Pipeline:
         except Exception as e:
             logger.warning(f"Job metadata not found or unreadable on S3 at {s3_key}: {e}")
         return None
+
+    def _restore_checkpoint_from_hf(
+        self,
+        job: Job,
+        checkpoint_epoch: Optional[int] = None,
+    ) -> str:
+        """Download a checkpoint snapshot from Hugging Face.
+
+        Returns the local checkpoint path.
+        Raises ValueError if restoration fails.
+        """
+        latest_epoch = self._latest_checkpoint_epoch(job)
+        target_epoch = checkpoint_epoch if checkpoint_epoch is not None else latest_epoch
+        repo_id = None
+        if target_epoch is not None:
+            repo_id = job.checkpoint_hf_repos.get(str(target_epoch))
+        if not repo_id:
+            repo_id = job.hf_model_repo
+
+        if not repo_id:
+            raise ValueError(f"Job {job.job_id} has no HF model repo")
+
+        job_dir = self.jobs_dir / job.job_id
+        output_dir = job_dir / "output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        if target_epoch is not None:
+            checkpoint_dir = _checkpoint_path_for_epoch(job.output_dir, target_epoch)
+        else:
+            checkpoint_dir = output_dir / f"checkpoint_{job.speaker_name}"
+        checkpoint_path = str(checkpoint_dir.resolve())
+
+        if checkpoint_dir.exists() and any(checkpoint_dir.iterdir()):
+            logger.info(f"Checkpoint for job {job.job_id} already exists, skipping HF restore.")
+            job.checkpoint_path = checkpoint_path
+            return checkpoint_path
+
+        with self._lock:
+            if job.job_id not in self._restore_locks:
+                self._restore_locks[job.job_id] = threading.Lock()
+            lock = self._restore_locks[job.job_id]
+
+        with lock:
+            if checkpoint_dir.exists() and any(checkpoint_dir.iterdir()):
+                if checkpoint_epoch is None or (latest_epoch is not None and target_epoch == latest_epoch):
+                    job.checkpoint_path = checkpoint_path
+                return checkpoint_path
+
+            prev_status = job.status
+            prev_progress = dict(job.progress)
+            update_default_checkpoint = checkpoint_epoch is None or (
+                latest_epoch is not None and target_epoch == latest_epoch
+            )
+            if update_default_checkpoint:
+                job.status = JobStatus.RESTORING
+                job.progress = {"stage": "restoring", "detail": "Downloading model from Hugging Face..."}
+                job.save()
+
+            restore_op = ops_log.start("checkpoint_restore", job_id=job.job_id, extra={
+                "hf_repo": repo_id,
+                "checkpoint_epoch": target_epoch,
+            })
+            try:
+                dir_name = (
+                    _checkpoint_dir_name(target_epoch)
+                    if target_epoch is not None
+                    else checkpoint_dir.name
+                )
+                restored_path = hf_restore_checkpoint(
+                    job,
+                    checkpoint_dir,
+                    checkpoint_dir_name=dir_name,
+                    repo_id=repo_id,
+                )
+
+                if target_epoch is not None:
+                    job.available_checkpoint_epochs = sorted(
+                        set(job.available_checkpoint_epochs + [target_epoch])
+                    )
+                if update_default_checkpoint:
+                    job.checkpoint_path = restored_path
+                    job.status = JobStatus.READY
+                    job.progress = {
+                        "stage": "ready",
+                        "detail": "Model restored from Hugging Face and ready for inference",
+                        "inference_url": f"/infer/{job.job_id}",
+                    }
+                    job.save()
+                else:
+                    job.status = prev_status
+                    job.progress = prev_progress
+                ops_log.end(restore_op, extra={"checkpoint_path": restored_path})
+                logger.info(
+                    "Restored checkpoint for job %s from HF repo %s to %s",
+                    job.job_id,
+                    repo_id,
+                    restored_path,
+                )
+                return restored_path
+            except Exception as e:
+                job.status = prev_status
+                job.progress = prev_progress
+                if update_default_checkpoint:
+                    job.save()
+                ops_log.fail(restore_op, str(e))
+                raise ValueError(f"Failed to restore checkpoint from Hugging Face: {e}")
 
     def _restore_checkpoint_from_s3(
         self,

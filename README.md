@@ -115,7 +115,7 @@ Open:
 - MinIO console: <http://localhost:9001>
 - MinIO S3 endpoint: <http://localhost:9000>
 
-Gemma 12B and Sarvam Translate run as lazy vLLM subprocesses inside the API
+Gemma e4b and Sarvam Translate run as lazy vLLM subprocesses inside the API
 container. Plain compose starts the API and storage; the first Gemma/Sarvam
 request loads its model into GPU, and the idle timeout stops it again:
 
@@ -143,7 +143,7 @@ Qwen3-TTS exposes OpenAI-compatible Gemma routes on its own API port:
 - `GET /gemma/status`
 - `GET /vllm/status`
 
-Point Pathnam at Qwen3-TTS with `LLM_PROVIDER=vllm`, `LLM_MODEL=gemma12b`, and `LLM_BASE_URL=http://<qwen-api-host>:8000/v1`. The proxy unloads resident Qwen models before starting Gemma, stops any active Sarvam vLLM process first, and holds the same GPU limiter used by voice design, voice clone, and custom voice inference.
+Point Pathnam at Qwen3-TTS with `LLM_PROVIDER=vllm`, `LLM_MODEL=e4b`, and `LLM_BASE_URL=http://<qwen-api-host>:8000/v1`. The proxy unloads resident Qwen models before starting Gemma, stops any active Sarvam vLLM process first, and holds the same GPU limiter used by voice design, voice clone, and custom voice inference.
 
 ## TIR or direct Linux setup
 
@@ -292,10 +292,18 @@ The service supports AWS S3, E2E Object Storage, MinIO, and other S3-compatible 
 
 - Generated audio is organized and uploaded to object storage.
 - Private objects can be returned through time-limited presigned URLs.
-- Fine-tuned models are backed up before eligible local outputs are pruned.
+- Fine-tuned model checkpoints are uploaded to public Hugging Face repos when `HF_TOKEN` is set; older jobs with only S3 metadata remain restorable from object storage.
 - Raw datasets and heavy intermediate training artifacts are cleaned up after use.
 - The local `jobs/` model cache is pruned by least-recently-used access when it exceeds its configured threshold.
 - An optional fallback S3 backend can restore custom models that are not present in the primary store.
+
+Model checkpoint env vars:
+
+| Variable | Purpose |
+|---|---|
+| `HF_TOKEN` | Authenticates Hugging Face upload/download for fine-tuned checkpoints and dataset diarization |
+| `HF_MODEL_NAMESPACE` | Hugging Face org/user namespace for checkpoint repos (default: `vaaniqo-finetuned-models`) |
+| `HF_MODEL_REPO_PREFIX` | Repo name prefix, e.g. `Qwen3-Book-Speaker-jobid` (default: `Qwen3`) |
 
 Check the active backend with `GET /storage/status` and trigger disk cleanup with `GET /gpu/cleanup?threshold_gb=20`.
 

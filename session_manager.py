@@ -841,12 +841,7 @@ class SessionManager:
 
                     checkpoint_path = str(job.checkpoint_path) if job.checkpoint_path else None
                     if not checkpoint_path or not os.path.exists(checkpoint_path):
-                        if job.s3_model_key:
-                            checkpoint_path = self.pipeline._restore_checkpoint_from_s3(job)
-                        else:
-                            raise ValueError(
-                                f"Job {job_id} has no checkpoint and no S3 backup"
-                            )
+                        checkpoint_path, _ = self.pipeline.resolve_checkpoint_path(job)
 
                     self.pipeline.touch_job(job_id)
                     return job_id, checkpoint_path, job.character_id, job.speaker_name

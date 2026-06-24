@@ -122,7 +122,7 @@ def test_chat_completions_proxy_uses_gemma_model_and_gpu_limiter(monkeypatch):
     runtime = _StubVllmRuntime()
     monkeypatch.setattr(api_server, "vllm_runtime", runtime)
     monkeypatch.setattr(api_server, "MANAGED_VLLM_ENABLED", True)
-    monkeypatch.setattr(api_server, "GEMMA_VLLM_MODEL", "gemma12b")
+    monkeypatch.setattr(api_server, "GEMMA_VLLM_MODEL", "e4b")
     monkeypatch.setattr(api_server, "GEMMA_VLLM_FORCE_MODEL", True)
     monkeypatch.setattr(api_server.requests, "post", fake_post)
 
@@ -141,7 +141,7 @@ def test_chat_completions_proxy_uses_gemma_model_and_gpu_limiter(monkeypatch):
     assert runtime.ensure_calls == ["gemma"]
     assert runtime.mark_calls == ["gemma"]
     assert captured["url"] == "http://127.0.0.1:8101/v1/chat/completions"
-    assert captured["json"]["model"] == "gemma12b"
+    assert captured["json"]["model"] == "e4b"
     assert captured["json"]["messages"] == [{"role": "user", "content": "hi"}]
 
 
@@ -181,10 +181,10 @@ def test_translate_proxy_uses_sarvam_and_same_gpu_limiter(monkeypatch):
 
 
 def test_models_lists_configured_gemma_model(monkeypatch):
-    monkeypatch.setattr(api_server, "GEMMA_VLLM_MODEL", "gemma12b")
+    monkeypatch.setattr(api_server, "GEMMA_VLLM_MODEL", "e4b")
 
     client = TestClient(api_server.app)
     response = client.get("/v1/models")
 
     assert response.status_code == 200
-    assert response.json()["data"][0]["id"] == "gemma12b"
+    assert response.json()["data"][0]["id"] == "e4b"

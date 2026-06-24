@@ -215,3 +215,70 @@ def test_get_job_promotes_local_failed_job_when_checkpoint_exists_on_s3(tmp_path
     assert resolved.status == pipeline.JobStatus.READY
     assert resolved.error is None
     assert resolved.progress["stage"] == "ready"
+
+
+def test_upload_latest_checkpoint_to_hf_only_uploads_last_epoch(tmp_path, monkeypatch):
+    job = _make_job(tmp_path, num_epochs=10)
+    for epoch in (6, 7, 9):
+        checkpoint_dir = Path(job.output_dir) / f"checkpoint-epoch-{epoch}"
+        checkpoint_dir.mkdir()
+        (checkpoint_dir / "model.safetensors").write_text(f"ckpt{epoch}", encoding="utf-8")
+
+    pipe = pipeline.Pipeline.__new__(pipeline.Pipeline)
+    uploaded_epochs = []
+
+    def fake_upload_checkpoint_to_hf(_job, checkpoint_dir, checkpoint_epoch, *, checkpoint_dir_name):
+        uploaded_epochs.append((Path(checkpoint_dir).name, checkpoint_epoch, checkpoint_dir_name))
+        return f"namespace/repo-{checkpoint_epoch}", f"https://huggingface.co/namespace/repo-{checkpoint_epoch}"
+
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+    monkeypatch.setattr("pipeline.upload_checkpoint_to_hf", fake_upload_checkpoint_to_hf)
+
+    checkpoint_hf_repos = pipeline.Pipeline._upload_latest_checkpoint_to_hf(pipe, job)
+
+    assert uploaded_epochs == [("checkpoint-epoch-9", 9, "checkpoint-epoch-9")]
+    assert checkpoint_hf_repos == {"9": "namespace/repo-9"}
+    assert job.hf_model_repo == "namespace/repo-9"
+    assert job.hf_model_url == "https://huggingface.co/namespace/repo-9"
+    assert job.checkpoint_hf_repos == {"9": "namespace/repo-9"}
+
+
+def test_has_verified_hf_checkpoint_backup_checks_repo_existence(tmp_path, monkeypatch):
+    job = _make_job(tmp_path, num_epochs=10)
+    job.hf_model_repo = "namespace/repo-9"
+    job.checkpoint_hf_repos = {"9": "namespace/repo-9"}
+
+    pipe = pipeline.Pipeline.__new__(pipeline.Pipeline)
+
+    monkeypatch.setattr("pipeline.hf_checkpoint_repo_exists", lambda repo_id: repo_id == "namespace/repo-9")
+
+    assert pipeline.Pipeline._has_verified_hf_checkpoint_backup(pipe, job) is True
+
+
+def test_resolve_checkpoint_path_restores_from_hf_when_local_missing(tmp_path, monkeypatch):
+    job = _make_job(tmp_path, num_epochs=10)
+    job.hf_model_repo = "namespace/repo-9"
+    job.checkpoint_hf_repos = {"9": "namespace/repo-9"}
+    job.available_checkpoint_epochs = [9]
+
+    pipe = pipeline.Pipeline.__new__(pipeline.Pipeline)
+    restored = []
+
+    def fake_restore_checkpoint_from_hf(_job, checkpoint_epoch=None):
+        checkpoint_dir = Path(job.output_dir) / "checkpoint-epoch-9"
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        (checkpoint_dir / "model.safetensors").write_text("restored", encoding="utf-8")
+        restored.append(checkpoint_epoch)
+        return str(checkpoint_dir.resolve())
+
+    monkeypatch.setattr(
+        pipeline.Pipeline,
+        "_restore_checkpoint_from_hf",
+        lambda self, _job, checkpoint_epoch=None: fake_restore_checkpoint_from_hf(_job, checkpoint_epoch),
+    )
+
+    resolved_path, resolved_epoch = pipeline.Pipeline.resolve_checkpoint_path(pipe, job)
+
+    assert restored == [9]
+    assert resolved_epoch == 9
+    assert Path(resolved_path).name == "checkpoint-epoch-9"

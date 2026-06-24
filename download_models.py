@@ -15,7 +15,7 @@ Models downloaded:
     2. Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice   (~3.5 GB) — for custom voice inference
     3. Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign   (~3.5 GB) — for voice design inference
     4. Qwen/Qwen3-TTS-Tokenizer-12Hz          (~400 MB) — for audio tokenization
-    5. Gemma 12B                              — for LLM extraction via vLLM
+    5. Gemma e4b                              — for LLM extraction via vLLM
     6. sarvamai/sarvam-translate              — for /translate via vLLM
 """
 
@@ -55,7 +55,7 @@ MODELS = {
     },
     "gemma": {
         "repo": os.environ.get("GEMMA_VLLM_HF_MODEL", "google/gemma-3-12b-it"),
-        "desc": "Gemma 12B model (lazy vLLM LLM proxy)",
+        "desc": "Gemma e4b model (lazy vLLM LLM proxy)",
         "size": "large",
     },
     "sarvam_translate": {

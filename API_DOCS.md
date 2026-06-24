@@ -75,7 +75,7 @@ No authentication is required by default. For production, add API key auth at th
 
 ### Lazy vLLM Proxies
 
-Qwen3-TTS can front Gemma 12B and Sarvam Translate through lazy vLLM
+Qwen3-TTS can front Gemma e4b and Sarvam Translate through lazy vLLM
 subprocesses. Plain `docker compose up --build` starts the API. Startup can
 pre-download model files into the Hugging Face cache, but Gemma/Sarvam load into
 GPU only when requested.
@@ -106,7 +106,7 @@ Pathnam use one backend without bypassing Qwen3-TTS admission control.
 curl -X POST "$BASE_URL/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gemma12b",
+    "model": "e4b",
     "messages": [
       {"role": "user", "content": "Return one short narration note."}
     ],
