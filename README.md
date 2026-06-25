@@ -15,6 +15,13 @@ A production-oriented service for fine-tuning, cloning, designing, and serving v
 
 This is not the upstream Qwen3-TTS repository. It is an independent production harness built around the upstream models and training code.
 
+## Latest integrations
+
+- **Gemma 4 / e4b LLM proxy is done.** The service now exposes OpenAI-compatible `/v1` routes backed by a lazy vLLM Gemma process, so Pathnam can run chapter extraction and dialogue attribution through the same local GPU stack that serves TTS.
+- **Hugging Face checkpoint storage is integrated.** When `HF_TOKEN` is configured, fine-tuned checkpoints are uploaded to Hugging Face repos, job metadata records the repo URL, and inference can restore checkpoints from Hugging Face when local disk or S3 copies are not present.
+- **Model prefetching uses the shared Hugging Face cache.** Qwen base models, VoiceDesign, tokenizer assets, Gemma, and Sarvam Translate can be pre-downloaded at startup without keeping every model resident in VRAM.
+- **Pathnam integration is first-class.** Point Pathnam at this API with `FINETUNE_API_URL` for voice work and `LLM_PROVIDER=vllm`, `LLM_MODEL=e4b`, `LLM_BASE_URL=http://<qwen-api-host>:8000/v1` for local LLM extraction.
+
 ## Why this repository exists
 
 Running a speech model once is different from operating it as a service. This project handles the machinery around the model:
