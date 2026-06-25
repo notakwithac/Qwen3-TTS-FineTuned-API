@@ -16,6 +16,9 @@ services:
       qwen-local:
         aliases:
           - qwen-tts-api
+      pathnam-qwen:
+        aliases:
+          - qwen-tts-api
     volumes:
       - ./jobs:/app/jobs
       - ./logs:/app/logs
@@ -70,4 +73,7 @@ volumes:
 networks:
   qwen-local:
     name: qwen-local
+    driver: bridge
+  pathnam-qwen:
+    name: pathnam-qwen
     driver: bridge

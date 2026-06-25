@@ -38,4 +38,4 @@ flash_attn*.whl
 *tts_dataset
 Qwen3-TTS-*
 uv.lock
-resource_metrics.jsonl
+metrics/resource_metrics.jsonl

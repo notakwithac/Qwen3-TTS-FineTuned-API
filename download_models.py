@@ -23,6 +23,7 @@ import argparse
 import logging
 import os
 import time
+from typing import Any
 
 from huggingface_hub import snapshot_download
 
@@ -54,9 +55,10 @@ MODELS = {
         "size": "~400 MB",
     },
     "gemma": {
-        "repo": os.environ.get("GEMMA_VLLM_HF_MODEL", "google/gemma-3-12b-it"),
+        "repo": os.environ.get("GEMMA_VLLM_HF_MODEL", "google/gemma-4-E4B"),
         "desc": "Gemma e4b model (lazy vLLM LLM proxy)",
         "size": "large",
+        "skip_if_unauthenticated": True,
     },
     "sarvam_translate": {
         "repo": os.environ.get("SARVAM_VLLM_HF_MODEL", "sarvamai/sarvam-translate"),
@@ -66,9 +68,25 @@ MODELS = {
 }
 
 
-def download_model(name: str, info: dict, cache_dir: str = None):
+def _is_access_denied_error(exc: Exception) -> bool:
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if status_code in (401, 403):
+        return True
+
+    message = str(exc).lower()
+    return (
+        "gated repo" in message
+        or "access to model" in message
+        or "restricted" in message
+    )
+
+
+def download_model(
+    name: str, info: dict[str, Any], cache_dir: str = None
+) -> dict[str, Any]:
     """Download a single model."""
-    log.info(f"{'='*60}")
+    log.info(f"{'=' * 60}")
     log.info(f"Downloading: {info['repo']}")
     log.info(f"  Description: {info['desc']}")
     log.info(f"  Size: {info['size']}")
@@ -82,15 +100,26 @@ def download_model(name: str, info: dict, cache_dir: str = None):
         elapsed = time.time() - t0
         log.info(f"  ✅  Downloaded to: {path}")
         log.info(f"  ⏱  Time: {elapsed:.1f}s")
-        return path
+        return {"path": path, "status": "downloaded", "reason": None}
     except Exception as e:
         elapsed = time.time() - t0
+        if info.get("skip_if_unauthenticated") and _is_access_denied_error(e):
+            log.warning(
+                f"  ⚠  Skipping optional gated repo after {elapsed:.1f}s: {e}"
+            )
+            return {
+                "path": None,
+                "status": "skipped",
+                "reason": "optional gated repo unavailable",
+            }
         log.error(f"  ❌  Failed after {elapsed:.1f}s: {e}")
-        return None
+        return {"path": None, "status": "failed", "reason": str(e)}
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Download Qwen3-TTS models from HuggingFace")
+    parser = argparse.ArgumentParser(
+        description="Download Qwen3-TTS models from HuggingFace"
+    )
     parser.add_argument(
         "--models",
         nargs="*",
@@ -123,23 +152,24 @@ def main():
     results = {}
     for name in models_to_download:
         info = MODELS[name]
-        path = download_model(name, info, cache_dir=args.cache_dir)
-        results[name] = {"path": path, "success": path is not None}
+        results[name] = download_model(name, info, cache_dir=args.cache_dir)
 
     total_elapsed = time.time() - total_t0
-    log.info(f"{'='*60}")
+    log.info(f"{'=' * 60}")
     log.info(f"Download complete in {total_elapsed:.1f}s")
     log.info("")
 
     for name, result in results.items():
-        status = "✅" if result["success"] else "❌"
+        status = {"downloaded": "✅", "skipped": "⏭️", "failed": "❌"}[result["status"]]
         log.info(f"  {status}  {MODELS[name]['repo']}")
         if result["path"]:
             log.info(f"       → {result['path']}")
 
-    failed = [n for n, r in results.items() if not r["success"]]
+    failed = [n for n, r in results.items() if r["status"] == "failed"]
     if failed:
-        log.warning(f"\n⚠  {len(failed)} model(s) failed to download: {', '.join(failed)}")
+        log.warning(
+            f"\n⚠  {len(failed)} model(s) failed to download: {', '.join(failed)}"
+        )
         return 1
     return 0
 
