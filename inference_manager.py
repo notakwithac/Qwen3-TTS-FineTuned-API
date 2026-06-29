@@ -123,6 +123,18 @@ class RuntimeAdjustableLimiter:
                     },
                 )
 
+    def acquire_all(self, label: str) -> int:
+        acquired = 0
+        capacity = max(1, int(self.snapshot()["capacity"]))
+        try:
+            for _ in range(capacity):
+                self.acquire(label)
+                acquired += 1
+            return acquired
+        except BaseException:
+            self.release_many(label, acquired)
+            raise
+
     def release(self, label: str = "unknown"):
         with self._condition:
             if self._active > 0:
@@ -133,6 +145,10 @@ class RuntimeAdjustableLimiter:
             else:
                 self._holders[label] = count - 1
             self._condition.notify_all()
+
+    def release_many(self, label: str, count: int) -> None:
+        for _ in range(max(0, int(count))):
+            self.release(label)
 
     def update_capacity(self, capacity: int):
         with self._condition:
@@ -466,13 +482,10 @@ class InferenceManager:
     def run_external_gpu_call(self, label: str, fn):
         """Run non-Qwen GPU work with exclusive ownership of the GPU limiter."""
         acquired = 0
-        capacity = max(1, int(self._inference_limiter.snapshot().get("capacity", 1)))
         with ops_log.operation("gpu_resource_wait", extra={"model": label}):
             if self._gpu_controller:
                 self._gpu_controller.begin_inference(label)
-            for _ in range(capacity):
-                self._inference_limiter.acquire(label)
-                acquired += 1
+            acquired = self._inference_limiter.acquire_all(label)
         try:
             with self._track_active():
                 op = ops_log.start(label)
@@ -484,8 +497,7 @@ class InferenceManager:
                     ops_log.fail(op, str(e))
                     raise
         finally:
-            for _ in range(acquired):
-                self._inference_limiter.release(label)
+            self._inference_limiter.release_many(label, acquired)
             if self._gpu_controller:
                 self._gpu_controller.end_inference()
 
