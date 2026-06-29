@@ -7,6 +7,7 @@ load_dotenv(override=True)
 import logging
 import os
 import re
+import secrets
 import tempfile
 import time
 import uuid
@@ -20,7 +21,17 @@ from pathlib import Path
 from typing import Any, Optional
 from functools import partial
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, Request
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -35,6 +46,12 @@ from session_manager import (
 )
 from metrics_collector import metrics_collector
 from gpu_resource_controller import GPUResourceController
+from gpu_lease_manager import (
+    GpuLeaseManager,
+    InvalidLeaseTokenError,
+    LeaseConflictError,
+    LeaseGrant,
+)
 from vllm_runtime_manager import ManagedVllmService, VllmRuntimeManager
 from dataset_jobs import (
     load_existing_package_result,
@@ -168,7 +185,13 @@ logging.getLogger("transformers.generation.utils").setLevel(logging.ERROR)
 # App setup
 # ---------------------------------------------------------------------------
 
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
+
+
+async def _gpu_lease_reaper_loop() -> None:
+    while True:
+        await asyncio.sleep(5)
+        await asyncio.to_thread(gpu_lease_manager.reap_expired)
 
 
 def _startup_preload_snapshot() -> dict[str, Any]:
@@ -346,6 +369,7 @@ async def _lifespan(app):
     session_mgr.start_cleanup_loop()
     metrics_collector.start()
     _log_flash_attn_runtime_diagnostics()
+    app.state.gpu_lease_reaper_task = asyncio.create_task(_gpu_lease_reaper_loop())
     if STARTUP_PRELOAD_SHARED_MODELS:
         app.state.startup_preload_task = asyncio.create_task(_background_startup_preload_shared_models())
     else:
@@ -367,6 +391,11 @@ async def _lifespan(app):
     # Shutdown: stop metrics collector and wait for any in-progress S3 uploads
     metrics_collector.stop()
     preload_task = getattr(app.state, "startup_preload_task", None)
+    lease_reaper_task = app.state.gpu_lease_reaper_task
+    lease_reaper_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await lease_reaper_task
+    await asyncio.to_thread(gpu_lease_manager.close)
     if preload_task is not None:
         await preload_task
     logger.info("Server shutting down — waiting for pending S3 uploads...")
@@ -782,6 +811,10 @@ SHARED_MODEL_MIN_HEADROOM_GB = float(os.environ.get("SHARED_MODEL_MIN_HEADROOM_G
 MANAGED_VLLM_ENABLED = os.environ.get("MANAGED_VLLM_ENABLED", "1") == "1"
 MANAGED_VLLM_IDLE_TIMEOUT_SECONDS = float(os.environ.get("MANAGED_VLLM_IDLE_TIMEOUT_SECONDS", "120"))
 GEMMA_VLLM_BASE_URL = os.environ.get("GEMMA_VLLM_BASE_URL", "http://127.0.0.1:8101/v1").rstrip("/")
+GPU_LEASE_DEFAULT_TTL_SECONDS = max(
+    30,
+    min(900, int(os.environ.get("GPU_LEASE_DEFAULT_TTL_SECONDS", "120"))),
+)
 GEMMA_VLLM_HF_MODEL = os.environ.get("GEMMA_VLLM_HF_MODEL", "google/gemma-3-12b-it")
 GEMMA_VLLM_MODEL = os.environ.get("GEMMA_VLLM_MODEL", "e4b")
 GEMMA_VLLM_PORT = int(os.environ.get("GEMMA_VLLM_PORT", "8101"))
@@ -900,6 +933,19 @@ vllm_runtime = VllmRuntimeManager(
 )
 if MANAGED_VLLM_ENABLED:
     pipeline.inference.set_external_gpu_eviction_callback(vllm_runtime.stop_all)
+
+
+
+def _prepare_gpu_for_external_lease() -> None:
+    vllm_runtime.stop_all()
+    pipeline.inference.unload()
+
+
+gpu_lease_manager = GpuLeaseManager(
+    acquire_permits=pipeline.inference._inference_limiter.acquire_all,
+    release_permits=pipeline.inference._inference_limiter.release_many,
+    prepare_gpu=_prepare_gpu_for_external_lease,
+)
 
 # Session-based inference manager
 session_mgr = SessionManager(
@@ -3421,6 +3467,90 @@ async def voice_design_batch(req: VoiceDesignBatchRequest):
 # ---------------------------------------------------------------------------
 # GPU Management
 # ---------------------------------------------------------------------------
+
+def require_gpu_lease_key(
+    x_gpu_lease_key: str | None = Header(default=None),
+) -> None:
+    expected = os.environ.get("GPU_LEASE_API_KEY", "").strip()
+    if not expected:
+        raise HTTPException(503, "External GPU leasing is disabled")
+    if not x_gpu_lease_key or not secrets.compare_digest(x_gpu_lease_key, expected):
+        raise HTTPException(401, "Invalid GPU lease key")
+
+
+class GpuLeaseAcquireRequest(BaseModel):
+    owner: str = Field(..., min_length=1, max_length=128)
+    ttl_seconds: int = Field(GPU_LEASE_DEFAULT_TTL_SECONDS, ge=30, le=900)
+
+    @field_validator("owner")
+    @classmethod
+    def validate_owner(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("owner must not be blank")
+        return value
+
+
+class GpuLeaseHeartbeatRequest(BaseModel):
+    ttl_seconds: int | None = Field(default=None, ge=30, le=900)
+
+
+def _lease_grant_response(grant: LeaseGrant) -> dict[str, object]:
+    return {
+        "owner": grant.owner,
+        "label": grant.label,
+        "permit_count": grant.permit_count,
+        "acquired_at": grant.acquired_at,
+        "expires_at": grant.expires_at,
+        "last_heartbeat_at": grant.last_heartbeat_at,
+        "token": grant.token,
+    }
+
+
+@app.get("/gpu/leases/status", dependencies=[Depends(require_gpu_lease_key)])
+async def gpu_lease_status():
+    return await asyncio.to_thread(gpu_lease_manager.status)
+
+
+@app.post("/gpu/leases", dependencies=[Depends(require_gpu_lease_key)])
+async def acquire_gpu_lease(req: GpuLeaseAcquireRequest):
+    try:
+        grant = await asyncio.to_thread(
+            gpu_lease_manager.acquire,
+            owner=req.owner,
+            ttl_seconds=req.ttl_seconds,
+        )
+    except LeaseConflictError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return _lease_grant_response(grant)
+
+
+@app.post(
+    "/gpu/leases/{token}/heartbeat",
+    dependencies=[Depends(require_gpu_lease_key)],
+)
+async def heartbeat_gpu_lease(token: str, req: GpuLeaseHeartbeatRequest):
+    try:
+        grant = await asyncio.to_thread(
+            gpu_lease_manager.heartbeat,
+            token,
+            req.ttl_seconds,
+        )
+    except InvalidLeaseTokenError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return _lease_grant_response(grant)
+
+
+@app.delete(
+    "/gpu/leases/{token}", dependencies=[Depends(require_gpu_lease_key)]
+)
+async def release_gpu_lease(token: str):
+    try:
+        released = await asyncio.to_thread(gpu_lease_manager.release, token)
+    except InvalidLeaseTokenError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return {"released": released}
+
 
 @app.get("/gpu/status", summary="GPU and model status")
 async def gpu_status():

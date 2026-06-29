@@ -12,6 +12,7 @@
   - [Disk Management (LRU)](#disk-management-lru)
   - [Authentication](#authentication)
   - [Lazy vLLM Proxies](#lazy-vllm-proxies)
+  - [External GPU Leases](#external-gpu-leases)
 - [Job Lifecycle (Finetuning)](#job-lifecycle-finetuning)
   - [POST /finetune](#post-finetune)
   - [GET /jobs/{job_id}](#get-jobsjob_id)
@@ -126,6 +127,25 @@ curl -X POST "$BASE_URL/translate" \
     "max_new_tokens": 256
   }'
 ```
+
+### External GPU Leases
+
+An authenticated lease temporarily reserves every inference permit for one
+external GPU worker. Acquiring a lease stops managed vLLM processes and unloads
+resident Qwen models before returning the opaque lease token. Requests must send
+the service key in `X-GPU-Lease-Key`; keys are never accepted in query strings.
+
+```http
+POST   /gpu/leases
+POST   /gpu/leases/{token}/heartbeat
+DELETE /gpu/leases/{token}
+GET    /gpu/leases/status
+```
+
+Acquire with `{"owner":"dataset-lab","ttl_seconds":120}`. Heartbeats may send
+`{"ttl_seconds":120}` to extend expiry. TTL values must be between 30 and 900
+seconds. Status responses expose ownership and expiry metadata but never the
+lease token. Release is idempotent after a lease is no longer active.
 
 ---
 
@@ -340,6 +360,8 @@ Notes:
 | `VOICE_CLONE_REPLICAS` | `1` | Throughput-mode startup target for shared VoiceClone replicas. Prefer batching before increasing this target |
 | `SHARED_MODEL_MIN_HEADROOM_GB` | `4` | Minimum free VRAM headroom required before loading another shared replica |
 | `GPU_IDLE_TIMEOUT` | `0` | Throughput-mode recommendation for keeping the hot shared models resident. Use a larger value if you still want eventual idle unload |
+| `GPU_LEASE_API_KEY` | unset | Service key enabling exclusive external GPU lease endpoints |
+| `GPU_LEASE_DEFAULT_TTL_SECONDS` | `120` | Default lease TTL; requests are restricted to 30..900 seconds |
 | `E2E_BUCKET` | `qwen3-tts` | Default S3 bucket |
 
 **Throughput-mode guidance:**
