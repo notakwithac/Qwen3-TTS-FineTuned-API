@@ -1,32 +1,36 @@
 # coding=utf-8
-import threading
 import logging
 import os
+import threading
+
 import torch
 
 logger = logging.getLogger(__name__)
 
+
 class GPUResourceController:
     """Manages GPU resource synchronization between training and inference.
-    
+
     Implements a Readers-Writers lock:
     - Many Inferences (Readers) can run concurrently.
     - Training (Writer) is exclusive both to other trainings and to all inferences.
     """
-    
+
     def __init__(self, allow_concurrent: bool = None):
         # If not explicitly provided, determine default based on VRAM
         if allow_concurrent is None:
             self.allow_concurrent = self._get_smart_default()
         else:
             self.allow_concurrent = allow_concurrent
-            
+
         self._lock = threading.Condition(threading.Lock())
         self._training_active = False
         self._training_requested = False
         self._inference_count = 0
-        
-        logger.info(f"GPUResourceController initialized. allow_concurrent={self.allow_concurrent}")
+
+        logger.info(
+            f"GPUResourceController initialized. allow_concurrent={self.allow_concurrent}"
+        )
 
     def _get_smart_default(self) -> bool:
         """Default to True (allow concurrent) only on 40GB+ GPUs (A100, H100, A6000)."""

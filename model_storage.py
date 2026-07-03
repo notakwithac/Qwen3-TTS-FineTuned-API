@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import tempfile
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
@@ -204,6 +205,7 @@ def restore_checkpoint_from_hf(
     *,
     checkpoint_dir_name: str,
     repo_id: Optional[str] = None,
+    filename: Optional[str] = None,
 ) -> str:
     """Download a checkpoint snapshot from HF into target_dir."""
     resolved_repo = repo_id or job.hf_model_repo
@@ -214,6 +216,59 @@ def restore_checkpoint_from_hf(
     token = config.token if config is not None else (os.environ.get("HF_TOKEN") or None)
 
     from huggingface_hub import snapshot_download
+
+    if filename:
+        if Path(filename).name != filename or filename in {".", ".."}:
+            raise ValueError("Hugging Face filename must be a relative basename")
+        if not filename.lower().endswith(".zip"):
+            raise ValueError("Legacy Hugging Face checkpoint files must be ZIP archives")
+
+        from huggingface_hub import hf_hub_download
+
+        logger.info("Downloading HF checkpoint archive %s/%s", resolved_repo, filename)
+        archive_path = Path(
+            hf_hub_download(
+                repo_id=resolved_repo,
+                repo_type=REPO_TYPE,
+                filename=filename,
+                token=token,
+            )
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            extracted_dir = Path(temp_dir) / "checkpoint"
+            extracted_dir.mkdir()
+            root = extracted_dir.resolve()
+            with zipfile.ZipFile(archive_path) as archive:
+                for member in archive.infolist():
+                    destination = (extracted_dir / member.filename).resolve()
+                    if destination != root and root not in destination.parents:
+                        raise ValueError(f"Unsafe path in Hugging Face checkpoint ZIP: {member.filename}")
+                archive.extractall(extracted_dir)
+            if not any(extracted_dir.iterdir()):
+                raise ValueError(f"HF repo {resolved_repo} contains an empty checkpoint ZIP")
+            target_dir.mkdir(parents=True, exist_ok=True)
+            for item in extracted_dir.iterdir():
+                dest = target_dir / item.name
+                if item.is_dir():
+                    if dest.exists():
+                        shutil.rmtree(dest)
+                    shutil.copytree(item, dest)
+                else:
+                    shutil.copy2(item, dest)
+
+        if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
+            try:
+                fd = os.open(archive_path, os.O_RDONLY)
+                try:
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                finally:
+                    os.close(fd)
+            except OSError as exc:
+                logger.debug("Could not evict HF archive from page cache: %s", exc)
+
+        checkpoint_path = str(target_dir.resolve())
+        logger.info("Restored checkpoint for job %s from HF repo %s to %s", job.job_id, resolved_repo, checkpoint_path)
+        return checkpoint_path
 
     path_in_repo = checkpoint_path_in_repo(checkpoint_dir_name)
     cache_dir = snapshot_download(

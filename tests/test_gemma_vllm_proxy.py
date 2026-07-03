@@ -83,6 +83,7 @@ class _StubVllmRuntime:
         self.ensure_calls = []
         self.mark_calls = []
         self.stop_all_calls = []
+        self.log_path = "/tmp/pathnam-vllm-sarvam.log"
 
     def base_url(self, name):
         return {
@@ -101,6 +102,12 @@ class _StubVllmRuntime:
 
     def status(self):
         return {}
+
+    def get(self, name):
+        return types.SimpleNamespace(log_path=self.log_path)
+
+    def tail_log(self, name, *, max_chars=2000):
+        return "sarvam log tail"
 
 
 def test_chat_completions_proxy_uses_gemma_model_and_gpu_limiter(monkeypatch):
@@ -178,6 +185,100 @@ def test_translate_proxy_uses_sarvam_and_same_gpu_limiter(monkeypatch):
     assert runtime.mark_calls == ["sarvam"]
     assert captured["url"] == "http://127.0.0.1:8102/v1/chat/completions"
     assert captured["json"]["model"] == "sarvam-translate"
+
+
+def test_translate_proxy_returns_503_when_managed_sarvam_fails(monkeypatch):
+    pipeline = _StubPipeline()
+    runtime = _StubVllmRuntime()
+
+    def fail_ensure_running(name):
+        raise TimeoutError("vLLM service sarvam did not become ready: boot log")
+
+    runtime.ensure_running = fail_ensure_running
+    monkeypatch.setattr(api_server, "pipeline", pipeline)
+    monkeypatch.setattr(api_server, "vllm_runtime", runtime)
+    monkeypatch.setattr(api_server, "MANAGED_VLLM_ENABLED", True)
+
+    client = TestClient(api_server.app)
+    response = client.post(
+        "/translate",
+        json={
+            "text": "hello",
+            "source_language": "English",
+            "target_language": "Hindi",
+        },
+    )
+
+    assert response.status_code == 503
+    detail = response.json()["detail"]
+    assert detail["code"] == "sarvam_unavailable"
+    assert "Sarvam vLLM backend unavailable" in detail["message"]
+    assert "boot log" in detail["message"]
+    assert detail["log_path"] == "/tmp/pathnam-vllm-sarvam.log"
+    assert detail["log_tail"] == "sarvam log tail"
+    assert pipeline.inference.calls == ["inference_sarvam_vllm"]
+
+
+def test_translate_proxy_returns_structured_503_when_sarvam_read_times_out(monkeypatch):
+    pipeline = _StubPipeline()
+    runtime = _StubVllmRuntime()
+
+    def fake_post(url, json, headers, timeout):
+        raise api_server.requests.ReadTimeout("read timeout")
+
+    monkeypatch.setattr(api_server, "pipeline", pipeline)
+    monkeypatch.setattr(api_server, "vllm_runtime", runtime)
+    monkeypatch.setattr(api_server, "MANAGED_VLLM_ENABLED", True)
+    monkeypatch.setattr(api_server, "SARVAM_VLLM_TIMEOUT_SECONDS", 600.0)
+    monkeypatch.setattr(api_server.requests, "post", fake_post)
+
+    client = TestClient(api_server.app)
+    response = client.post(
+        "/translate",
+        json={
+            "text": "hello",
+            "source_language": "English",
+            "target_language": "Hindi",
+        },
+    )
+
+    assert response.status_code == 503
+    detail = response.json()["detail"]
+    assert detail["code"] == "sarvam_timeout"
+    assert detail["timeout_seconds"] == 600.0
+    assert detail["log_path"] == "/tmp/pathnam-vllm-sarvam.log"
+    assert detail["log_tail"] == "sarvam log tail"
+    assert pipeline.inference.calls == ["inference_sarvam_vllm"]
+    assert runtime.ensure_calls == ["sarvam"]
+    assert runtime.mark_calls == []
+
+
+def test_sarvam_vllm_uses_eager_mode_by_default():
+    assert "--enforce-eager" in api_server.vllm_runtime.get("sarvam").extra_args
+
+
+def test_sarvam_vllm_disables_image_prompt_profiling_by_default():
+    extra_args = api_server.vllm_runtime.get("sarvam").extra_args
+
+    limit_index = extra_args.index("--limit-mm-per-prompt")
+    assert extra_args[limit_index + 1] == '{"image":0}'
+
+
+def test_sarvam_vllm_limits_batch_profile_by_default():
+    extra_args = api_server.vllm_runtime.get("sarvam").extra_args
+
+    batch_index = extra_args.index("--max-num-batched-tokens")
+    assert extra_args[batch_index + 1] == "1024"
+
+
+def test_sarvam_vllm_uses_bitsandbytes_by_default():
+    extra_args = api_server.vllm_runtime.get("sarvam").extra_args
+
+    load_index = extra_args.index("--load-format")
+    quantization_index = extra_args.index("--quantization")
+    assert extra_args[load_index + 1] == "bitsandbytes"
+    assert extra_args[quantization_index + 1] == "bitsandbytes"
+    assert "--cpu-offload-gb" not in extra_args
 
 
 def test_models_lists_configured_gemma_model(monkeypatch):

@@ -23,6 +23,8 @@ wheels/
 venv/
 env/
 /models/
+/dots.tts/
+/dots.tts-mf/
 runs/
 jobs/
 .env

@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_REPLICA_THRESHOLD = 500   # Lines before adding a replica
 DEFAULT_MAX_REPLICAS = 4          # Max replicas of one model
 DEFAULT_SESSION_TIMEOUT = 3600    # Auto-cleanup after 1h idle
+DEFAULT_MODEL_RESTORE_CONCURRENCY = max(1, int(os.environ.get("MODEL_RESTORE_CONCURRENCY", "1")))
 MODEL_VRAM_GB = 5.5               # Measured per-model VRAM (bf16 weights + compiled overhead)
 DEFAULT_BATCH_TEXT_BUDGET = int(os.environ.get("SESSION_BATCH_MAX_CHARS", "4000"))
 DEFAULT_BATCH_PADDED_TEXT_BUDGET = int(os.environ.get("SESSION_BATCH_MAX_PADDED_CHARS", "0"))
@@ -591,6 +592,7 @@ class SessionManager:
         custom_min_new_tokens: int = DEFAULT_CUSTOM_SESSION_MIN_NEW_TOKENS,
         custom_max_new_tokens: int = DEFAULT_CUSTOM_SESSION_MAX_NEW_TOKENS,
         custom_max_new_tokens_per_char: int = DEFAULT_CUSTOM_SESSION_MAX_NEW_TOKENS_PER_CHAR,
+        model_restore_concurrency: int = DEFAULT_MODEL_RESTORE_CONCURRENCY,
     ):
         self.inference = inference_manager
         self.pipeline = pipeline
@@ -605,6 +607,7 @@ class SessionManager:
         self.custom_min_new_tokens = max(0, int(custom_min_new_tokens or 0))
         self.custom_max_new_tokens = max(0, int(custom_max_new_tokens or 0))
         self.custom_max_new_tokens_per_char = max(0, int(custom_max_new_tokens_per_char or 0))
+        self.model_restore_concurrency = max(1, int(model_restore_concurrency or 1))
         self.sessions: Dict[str, Session] = {}
 
         # Limit active workers to max_models to prevent cache thrashing
@@ -814,6 +817,7 @@ class SessionManager:
             requested_job_ids=list(requested_job_ids),
         )
         self.sessions[session_id] = session
+        preexisting_cache_keys = set(getattr(self.inference, "loaded_paths", []) or [])
 
         op = ops_log.start("session_prepare", extra={
             "session_id": session_id,
@@ -831,6 +835,8 @@ class SessionManager:
                 if jid not in unique_jobs:
                     unique_jobs[jid] = c
 
+            restore_semaphore = asyncio.Semaphore(self.model_restore_concurrency)
+
             async def _resolve_job(char_dict):
                 job_id = char_dict["job_id"]
                 def _resolve_job_sync():
@@ -839,6 +845,10 @@ class SessionManager:
                     if not job:
                         raise ValueError(f"Job {job_id} not found")
 
+                    model_source = char_dict.get("model_source")
+                    if model_source:
+                        self.pipeline.apply_model_source(job, model_source)
+
                     checkpoint_path = str(job.checkpoint_path) if job.checkpoint_path else None
                     if not checkpoint_path or not os.path.exists(checkpoint_path):
                         checkpoint_path, _ = self.pipeline.resolve_checkpoint_path(job)
@@ -846,7 +856,8 @@ class SessionManager:
                     self.pipeline.touch_job(job_id)
                     return job_id, checkpoint_path, job.character_id, job.speaker_name
 
-                return await loop.run_in_executor(None, _resolve_job_sync)
+                async with restore_semaphore:
+                    return await loop.run_in_executor(None, _resolve_job_sync)
 
             # Resolve all unique jobs
             results = await asyncio.gather(*[_resolve_job(c) for c in unique_jobs.values()])
@@ -902,21 +913,52 @@ class SessionManager:
                     "GPU training is active; session preparation must wait for training to finish."
                 )
 
-            preload_tasks = []
+            planned_preloads = []
             for plan in session.character_plans.values():
                 for cache_key in plan.replica_keys:
-                    preload_tasks.append(
+                    planned_preloads.append((plan, cache_key))
+
+            oversubscribed = len(planned_preloads) > max_models
+            selected_preloads = (
+                planned_preloads[:max_models]
+                if oversubscribed
+                else planned_preloads
+            )
+            preload_session_id = "" if oversubscribed else session_id
+            if oversubscribed:
+                ops_log.log_event(
+                    "session_preload_deferred",
+                    extra={
+                        "session_id": session_id,
+                        "planned_model_count": len(planned_preloads),
+                        "preloaded_model_count": len(selected_preloads),
+                        "max_models": max_models,
+                        "deferred_cache_keys": [
+                            cache_key for _plan, cache_key in planned_preloads[max_models:]
+                        ],
+                    },
+                )
+
+            preload_tasks = []
+            for plan, cache_key in selected_preloads:
+                preload_tasks.append(
                         loop.run_in_executor(
                             None,
                             self.inference.load_for_session,
                             cache_key,
                             plan.checkpoint_path,
                             plan.character_name,
-                            session_id,
+                            preload_session_id,
                         )
                     )
             if preload_tasks:
-                await asyncio.gather(*preload_tasks)
+                preload_results = await asyncio.gather(*preload_tasks, return_exceptions=True)
+                preload_error = next(
+                    (result for result in preload_results if isinstance(result, BaseException)),
+                    None,
+                )
+                if preload_error is not None:
+                    raise preload_error
 
             # 5. Start workers (one per replica)
             for job_id, plan in session.character_plans.items():
@@ -964,6 +1006,23 @@ class SessionManager:
             return session
 
         except Exception as e:
+            rollback_keys = [
+                cache_key
+                for plan in session.character_plans.values()
+                for cache_key in plan.replica_keys
+            ]
+            for cache_key in rollback_keys:
+                try:
+                    self.inference.unpin_session(cache_key, session_id)
+                    if cache_key not in preexisting_cache_keys:
+                        self.inference.unload_specific(cache_key)
+                except Exception as rollback_error:
+                    logger.warning(
+                        "Session %s rollback could not release model %s: %s",
+                        session_id,
+                        cache_key,
+                        rollback_error,
+                    )
             session.status = SessionStatus.FAILED
             session.error = str(e)
             ops_log.fail(op, str(e))
