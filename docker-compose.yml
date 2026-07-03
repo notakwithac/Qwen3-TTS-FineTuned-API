@@ -6,6 +6,7 @@ services:
       args:
         INSTALL_FLASH_ATTN: "0"
     image: qwen3-tts-api:local
+    restart: unless-stopped
     env_file:
       - .env
     ports:
@@ -29,9 +30,20 @@ services:
     depends_on:
       createbuckets:
         condition: service_completed_successfully
+    develop:
+      watch:
+        - action: sync+restart
+          path: ./app # adjust to wherever your source lives
+          target: /app
+          ignore:
+            - jobs/
+            - logs/
+            - metrics/
+            - runs/
 
   minio:
     image: minio/minio:latest
+    restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${E2E_ACCESS_KEY}
@@ -40,7 +52,10 @@ services:
       - "9000:9000"
       - "9001:9001"
     networks:
-      - qwen-local
+      qwen-local:
+      pathnam-qwen:
+        aliases:
+          - minio
     volumes:
       - minio-data:/data
     healthcheck:
@@ -51,6 +66,7 @@ services:
 
   createbuckets:
     image: minio/mc:latest
+    restart: "no"
     networks:
       - qwen-local
     depends_on:

@@ -7,7 +7,7 @@ import types
 
 import pytest
 import torch
-from inference_manager import InferenceManager, VOICE_CLONE_MODEL, VOICE_DESIGN_MODEL
+from inference_manager import GpuCapacityError, InferenceManager, VOICE_CLONE_MODEL, VOICE_DESIGN_MODEL
 
 
 def test_shared_replica_keys_are_distinct():
@@ -373,6 +373,101 @@ def test_load_for_session_uses_gpu_controller_and_releases_on_failure(monkeypatc
         ("begin", "session_prepare_model_load"),
         ("end", None),
     ]
+
+
+def test_session_load_refuses_to_exceed_capacity_when_existing_model_is_pinned(monkeypatch):
+    load_calls = []
+
+    class _StubQwen3TTSModel:
+        @staticmethod
+        def from_pretrained(path, **_kwargs):
+            load_calls.append(path)
+            return types.SimpleNamespace(model=object())
+
+    stub_module = types.ModuleType("qwen_tts")
+    stub_module.Qwen3TTSModel = _StubQwen3TTSModel
+    monkeypatch.setitem(sys.modules, "qwen_tts", stub_module)
+    monkeypatch.setattr(inference_manager.ops_log, "log_event", lambda *args, **kwargs: None)
+
+    manager = InferenceManager(device="cpu", max_models=1)
+    manager.load_for_session("checkpoint-a", "checkpoint-a", "a", "session-x")
+
+    with pytest.raises(GpuCapacityError, match="No evictable GPU model slot") as excinfo:
+        manager.load_for_session("checkpoint-b", "checkpoint-b", "b", "session-x")
+
+    assert load_calls == ["checkpoint-a"]
+    assert manager.loaded_paths == ["checkpoint-a"]
+    assert manager.loaded_count == manager.max_models == 1
+    assert excinfo.value.diagnostics["session_pins"] == {"checkpoint-a": ["session-x"]}
+
+
+def test_model_load_refuses_insufficient_driver_free_memory(monkeypatch):
+    load_calls = []
+
+    class _StubQwen3TTSModel:
+        @staticmethod
+        def from_pretrained(path, **_kwargs):
+            load_calls.append(path)
+            return types.SimpleNamespace(model=object())
+
+    stub_module = types.ModuleType("qwen_tts")
+    stub_module.Qwen3TTSModel = _StubQwen3TTSModel
+    monkeypatch.setitem(sys.modules, "qwen_tts", stub_module)
+    monkeypatch.setattr(inference_manager.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(inference_manager.torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(inference_manager.ops_log, "log_event", lambda *args, **kwargs: None)
+
+    manager = InferenceManager(
+        device="cuda:0",
+        max_models=1,
+        shared_model_min_headroom_gb=4.0,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_get_gpu_memory_snapshot",
+        lambda: {"total_gb": 13.0, "allocated_gb": 11.0, "reserved_gb": 11.0, "free_gb": 2.0},
+    )
+
+    with pytest.raises(GpuCapacityError, match="Insufficient free GPU memory"):
+        manager.load_for_session("checkpoint-a", "checkpoint-a", "a", "session-x")
+
+    assert load_calls == []
+    assert manager.loaded_count == 0
+
+
+def test_unload_clears_model_ownership_bookkeeping(monkeypatch):
+    manager = InferenceManager(device="cpu", max_models=1)
+    manager._models["checkpoint-a"] = (object(), "custom_voice", "a")
+    manager._models_in_use["checkpoint-a"] = 1
+    manager._session_pins["checkpoint-a"] = {"session-x"}
+    manager._execution_locks["checkpoint-a"] = threading.Lock()
+    manager._shared_replica_loads["checkpoint-a"] = 1
+    monkeypatch.setattr(
+        manager,
+        "_purge_cuda_allocator_cache",
+        lambda: {"total_gb": 0.0, "allocated_gb": 0.0, "reserved_gb": 0.0, "free_gb": 0.0},
+    )
+
+    manager.unload()
+
+    assert manager.loaded_paths == []
+    assert manager._models_in_use == {}
+    assert manager._session_pins == {}
+    assert manager._execution_locks == {}
+    assert manager._shared_replica_loads == {}
+
+
+def test_unload_specific_refuses_models_owned_by_another_session(monkeypatch):
+    manager = InferenceManager(device="cpu", max_models=1)
+    model = object()
+    manager._models["checkpoint-a"] = (model, "custom_voice", "a")
+    manager._session_pins["checkpoint-a"] = {"session-other"}
+    monkeypatch.setattr(manager, "_purge_cuda_allocator_cache", lambda: manager._get_gpu_memory_snapshot())
+
+    unloaded = manager.unload_specific("checkpoint-a")
+
+    assert unloaded is False
+    assert manager._models["checkpoint-a"][0] is model
 
 
 def test_runtime_adjustable_limiter_logs_wait_lifecycle(monkeypatch):

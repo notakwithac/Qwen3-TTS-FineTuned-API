@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -26,8 +28,11 @@ class ManagedVllmService:
     extra_args: list[str] = field(default_factory=list)
     api_key: str = "EMPTY"
     startup_timeout_seconds: float = 900.0
+    log_path: str = ""
+    use_hf_token: bool = True
 
     process: subprocess.Popen | None = None
+    log_handle: Any = None
     last_used_at: float = 0.0
 
     @property
@@ -93,10 +98,31 @@ class VllmRuntimeManager:
                 *service.extra_args,
             ]
             env = os.environ.copy()
+            if not service.use_hf_token:
+                for token_key in ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HF_HUB_TOKEN"):
+                    env.pop(token_key, None)
+                env["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
+            elif not env.get("HF_TOKEN") and not env.get("HUGGINGFACE_HUB_TOKEN") and not env.get("HF_HUB_TOKEN"):
+                # Avoid failing public model startup because of an expired token
+                # persisted in the shared Hugging Face cache volume.
+                env["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
             if service.api_key:
                 env["VLLM_API_KEY"] = service.api_key
             logger.info("Starting managed vLLM service %s: %s", name, " ".join(command))
-            service.process = subprocess.Popen(command, env=env)
+            self._close_log_handle(service)
+            log_path = service.log_path or f"/tmp/pathnam-vllm-{service.name}.log"
+            Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+            service.log_path = log_path
+            service.log_handle = open(log_path, "a", buffering=1)
+            service.log_handle.write(f"\n--- starting {name} at {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+            service.process = subprocess.Popen(
+                command,
+                env=env,
+                stdout=service.log_handle,
+                stderr=subprocess.STDOUT,
+                text=True,
+                start_new_session=True,
+            )
             self._wait_until_ready(service)
             service.last_used_at = time.time()
             return service
@@ -120,14 +146,20 @@ class VllmRuntimeManager:
                 for name, service in self._services.items()
             }
 
+    def tail_log(self, name: str, *, max_chars: int = 2000) -> str:
+        with self._lock:
+            return self._tail_log(self._services[name], max_chars=max_chars)
+
     def _wait_until_ready(self, service: ManagedVllmService) -> None:
         deadline = time.time() + service.startup_timeout_seconds
         headers = {"Authorization": f"Bearer {service.api_key}"} if service.api_key else {}
         last_error = ""
         while time.time() < deadline:
             if service.process is not None and service.process.poll() is not None:
+                log_tail = self._tail_log(service)
                 raise RuntimeError(
-                    f"vLLM service {service.name} exited during startup with code {service.process.returncode}"
+                    f"vLLM service {service.name} exited during startup with code "
+                    f"{service.process.returncode}. Recent log: {log_tail}"
                 )
             try:
                 response = requests.get(f"{service.base_url}/models", headers=headers, timeout=5)
@@ -138,7 +170,10 @@ class VllmRuntimeManager:
                 last_error = str(exc)
             time.sleep(2)
         self._stop_locked(service)
-        raise TimeoutError(f"vLLM service {service.name} did not become ready: {last_error}")
+        raise TimeoutError(
+            f"vLLM service {service.name} did not become ready: {last_error}. "
+            f"Recent log: {self._tail_log(service)}"
+        )
 
     def _stop_locked(self, service: ManagedVllmService) -> None:
         process = service.process
@@ -146,11 +181,48 @@ class VllmRuntimeManager:
             return
         if process.poll() is None:
             logger.info("Stopping managed vLLM service %s pid=%s", service.name, process.pid)
-            process.terminate()
+            self._terminate_process_group(process)
             try:
                 process.wait(timeout=30)
             except subprocess.TimeoutExpired:
                 logger.warning("Killing managed vLLM service %s pid=%s", service.name, process.pid)
-                process.kill()
+                self._kill_process_group(process)
                 process.wait(timeout=30)
         service.process = None
+        self._close_log_handle(service)
+
+    def _terminate_process_group(self, process: subprocess.Popen) -> None:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except (AttributeError, OSError):
+            process.terminate()
+
+    def _kill_process_group(self, process: subprocess.Popen) -> None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (AttributeError, OSError):
+            process.kill()
+
+    def _close_log_handle(self, service: ManagedVllmService) -> None:
+        handle = service.log_handle
+        if handle is None:
+            return
+        try:
+            handle.close()
+        finally:
+            service.log_handle = None
+
+    def _tail_log(self, service: ManagedVllmService, *, max_chars: int = 2000) -> str:
+        if service.log_handle is not None:
+            service.log_handle.flush()
+        log_path = service.log_path
+        if not log_path:
+            return ""
+        try:
+            with open(log_path, "rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                handle.seek(max(0, size - max_chars))
+                return handle.read().decode("utf-8", errors="replace").strip()
+        except OSError as exc:
+            return f"could not read {log_path}: {exc}"

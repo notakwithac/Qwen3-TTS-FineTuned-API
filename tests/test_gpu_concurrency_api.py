@@ -46,6 +46,7 @@ broadcast_module.Broadcast = _DummyBroadcast
 sys.modules["broadcaster"] = broadcast_module
 
 import api_server
+from inference_manager import GpuCapacityError
 from session_manager import DuplicateActiveSessionError, TrainingConflictError
 
 
@@ -197,7 +198,9 @@ def test_gpu_status_hides_idle_window_when_backlog_exists(monkeypatch):
             },
         },
     )
-    monkeypatch.setattr(api_server.ops_log, "get_running", lambda: [{"op_name": "session_worker_batch"}])
+    monkeypatch.setattr(
+        api_server.ops_log, "get_running", lambda: [{"op_name": "session_worker_batch"}]
+    )
 
     with TestClient(api_server.app) as client:
         response = client.get("/gpu/status")
@@ -308,7 +311,9 @@ def test_session_prepare_returns_conflict_when_training_is_active(monkeypatch):
             "GPU training is active; session preparation must wait for training to finish."
         )
 
-    monkeypatch.setattr(api_server.session_mgr, "prepare_session", _raise_training_conflict)
+    monkeypatch.setattr(
+        api_server.session_mgr, "prepare_session", _raise_training_conflict
+    )
 
     with TestClient(api_server.app) as client:
         response = client.post(
@@ -330,6 +335,41 @@ def test_session_prepare_returns_conflict_when_training_is_active(monkeypatch):
     assert response.status_code == 409
     assert response.json() == {
         "detail": "GPU training is active; session preparation must wait for training to finish."
+    }
+
+
+def test_session_prepare_returns_retryable_gpu_capacity_error(monkeypatch):
+    inference = StubInference()
+    monkeypatch.setattr(api_server, "pipeline", StubPipeline(inference))
+    _patch_startup_dependencies(monkeypatch)
+
+    async def _raise_capacity(**_kwargs):
+        raise GpuCapacityError(
+            "No evictable GPU model slot is available.",
+            diagnostics={"loaded_count": 1, "max_models": 1},
+        )
+
+    monkeypatch.setattr(api_server.session_mgr, "prepare_session", _raise_capacity)
+
+    with TestClient(api_server.app) as client:
+        response = client.post(
+            "/session/prepare",
+            json={
+                "session_id": "session-capacity",
+                "characters": [
+                    {"job_id": "job-1", "character_name": "Narrator", "line_count": 1}
+                ],
+            },
+        )
+
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "5"
+    assert response.json() == {
+        "detail": {
+            "code": "gpu_capacity_timeout",
+            "message": "No evictable GPU model slot is available.",
+            "diagnostics": {"loaded_count": 1, "max_models": 1},
+        }
     }
 
 

@@ -5,21 +5,22 @@ Supports both CustomVoice (fine-tuned) and VoiceDesign (generate from descriptio
 Auto-unloads from VRAM after configurable idle timeout.
 """
 
+import asyncio
 import collections
+import contextlib
 import gc
 import io
 import logging
 import re
-import traceback
 import threading
 import time
-import asyncio
-import contextlib
+import traceback
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Optional, Dict
+from typing import Any, Dict, Optional
 
 import soundfile as sf
 import torch
+
 from ops_logger import ops_log
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,15 @@ _CUDA_BUSY_ERROR_PATTERNS = (
     "device busy",
     "cuda-capable device",
 )
+
+
+class GpuCapacityError(RuntimeError):
+    """Raised before model allocation when no safe GPU cache slot is available."""
+
+    def __init__(self, message: str, *, diagnostics: Optional[dict[str, Any]] = None):
+        super().__init__(message)
+        self.diagnostics = diagnostics or {}
+        self.retry_after_seconds = 5
 
 
 def _iter_exception_chain(exc: BaseException):
@@ -181,7 +191,7 @@ class InferenceManager:
         compile: bool = False,
         gpu_controller: Any = None,
         shared_model_replicas: Optional[Dict[str, int]] = None,
-        shared_model_min_headroom_gb: float = 4.0,
+        shared_model_min_headroom_gb: float = 2.0,
     ):
         self._device = device
         self._attn_impl = "flash_attention_2" if use_flash_attn else "eager"
@@ -211,7 +221,9 @@ class InferenceManager:
                 self._shared_model_replicas[model_type] = max(1, int(count))
         self._shared_model_min_headroom_gb = float(shared_model_min_headroom_gb)
         self._estimated_model_vram_gb = 5.5
-        self._voice_clone_prompt_cache: collections.OrderedDict[tuple[str, str, bool], Any] = collections.OrderedDict()
+        self._voice_clone_prompt_cache: collections.OrderedDict[
+            tuple[str, str, bool], Any
+        ] = collections.OrderedDict()
         self._voice_clone_prompt_cache_max_entries = 128
         self._external_gpu_eviction_callback = None
 
@@ -305,8 +317,12 @@ class InferenceManager:
             "auto_unload_enabled": self._auto_unload_enabled,
             "idle_timeout_seconds": self._idle_timeout,
             "active_requests": self._active_requests,
-            "last_request_started_at": self._format_timestamp(self._last_request_started_at),
-            "last_request_finished_at": self._format_timestamp(self._last_request_finished_at),
+            "last_request_started_at": self._format_timestamp(
+                self._last_request_started_at
+            ),
+            "last_request_finished_at": self._format_timestamp(
+                self._last_request_finished_at
+            ),
             "idle_started_at": self._format_timestamp(self._idle_started_at),
             "idle_seconds": idle_seconds,
             "total_requests": self._total_requests,
@@ -325,7 +341,9 @@ class InferenceManager:
     def _reset_idle_timer(self):
         self._cancel_idle_timer()
         if self._auto_unload_enabled and self._idle_timeout > 0:
-            self._idle_timer = threading.Timer(self._idle_timeout, self._on_idle_timeout)
+            self._idle_timer = threading.Timer(
+                self._idle_timeout, self._on_idle_timeout
+            )
             self._idle_timer.daemon = True
             self._idle_timer.start()
 
@@ -342,7 +360,13 @@ class InferenceManager:
                         f"GPU idle for {elapsed:.0f}s (timeout={self._idle_timeout}s). "
                         f"Unloading all {self.loaded_count} models."
                     )
-                    ops_log.log_event("gpu_idle_timeout", extra={"elapsed": round(elapsed, 1), "loaded_count": self.loaded_count})
+                    ops_log.log_event(
+                        "gpu_idle_timeout",
+                        extra={
+                            "elapsed": round(elapsed, 1),
+                            "loaded_count": self.loaded_count,
+                        },
+                    )
                     self._unload_all_unsafe()
 
     def _touch(self):
@@ -408,6 +432,11 @@ class InferenceManager:
             "max_models": self._max_models,
             "loaded_checkpoints": self.loaded_paths[:8],
             "models_in_use": dict(self._models_in_use),
+            "session_pins": {
+                cache_key: sorted(session_ids)
+                for cache_key, session_ids in self._session_pins.items()
+                if session_ids
+            },
             "shared_model_replicas": dict(self._shared_model_replicas),
             "shared_model_min_headroom_gb": self._shared_model_min_headroom_gb,
             "inference_limiter": self._inference_limiter.snapshot(),
@@ -516,7 +545,9 @@ class InferenceManager:
 
     # -- Load / Unload --------------------------------------------------------
 
-    def _load_model(self, path: str, model_type: str, speaker_name: Optional[str] = None):
+    def _load_model(
+        self, path: str, model_type: str, speaker_name: Optional[str] = None
+    ):
         """Internal: load a model (caller must hold lock)."""
         return self._load_model_into_cache(
             cache_key=path,
@@ -544,22 +575,71 @@ class InferenceManager:
         if self._external_gpu_eviction_callback is not None:
             self._external_gpu_eviction_callback()
 
-        self._enforce_cache_size(reserve=1)
+        if not self._enforce_cache_size(reserve=1):
+            diagnostics = self._build_runtime_diagnostics_locked(
+                cache_key=cache_key,
+                path=source_path,
+                model_type=model_type,
+                speaker=speaker_name,
+                session_id=session_id or None,
+                stage="cache_admission",
+            )
+            ops_log.log_event(
+                "model_load_capacity_rejected",
+                extra=diagnostics,
+                level=logging.WARNING,
+            )
+            raise GpuCapacityError(
+                "No evictable GPU model slot is available; active or session-pinned models block admission.",
+                diagnostics=diagnostics,
+            )
+
+        if torch.cuda.is_available():
+            memory_snapshot = self._get_gpu_memory_snapshot()
+            required_free_gb = (
+                self._estimated_model_vram_gb + self._shared_model_min_headroom_gb
+            )
+            if memory_snapshot["free_gb"] < required_free_gb:
+                diagnostics = self._build_runtime_diagnostics_locked(
+                    cache_key=cache_key,
+                    path=source_path,
+                    model_type=model_type,
+                    speaker=speaker_name,
+                    session_id=session_id or None,
+                    required_free_gb=required_free_gb,
+                    stage="memory_admission",
+                )
+                ops_log.log_event(
+                    "model_load_memory_rejected",
+                    extra=diagnostics,
+                    level=logging.WARNING,
+                )
+                raise GpuCapacityError(
+                    "Insufficient free GPU memory for model load: "
+                    f"{memory_snapshot['free_gb']:.2f}GB available, "
+                    f"{required_free_gb:.2f}GB required including safety headroom.",
+                    diagnostics=diagnostics,
+                )
 
         op_name = "model_load_session" if session_id else "model_load"
-        op = ops_log.start(op_name, extra={
-            "cache_key": cache_key,
-            "path": source_path,
-            "model_type": model_type,
-            "speaker": speaker_name,
-        })
+        op = ops_log.start(
+            op_name,
+            extra={
+                "cache_key": cache_key,
+                "path": source_path,
+                "model_type": model_type,
+                "speaker": speaker_name,
+            },
+        )
         try:
             from qwen_tts import Qwen3TTSModel
 
             if cache_key == source_path:
                 logger.info(f"Loading {model_type} model from {source_path}...")
             else:
-                logger.info(f"Loading {model_type} model from {source_path} as {cache_key}...")
+                logger.info(
+                    f"Loading {model_type} model from {source_path} as {cache_key}..."
+                )
 
             max_retries = 5
             retry_delay = 1.0
@@ -589,9 +669,20 @@ class InferenceManager:
                         )
                         break
                     except Exception as e:
-                        if self._attn_impl == "flash_attention_2" and not any(x in str(e).lower() for x in ["busy", "unavailable"]):
+                        if self._attn_impl == "flash_attention_2" and not any(
+                            x in str(e).lower() for x in ["busy", "unavailable"]
+                        ):
                             err_str = str(e)
-                            if any(x in err_str for x in ["FlashAttention2", "flash-attn", "flash_attn", "package f", "DLL load failed"]):
+                            if any(
+                                x in err_str
+                                for x in [
+                                    "FlashAttention2",
+                                    "flash-attn",
+                                    "flash_attn",
+                                    "package f",
+                                    "DLL load failed",
+                                ]
+                            ):
                                 logger.warning(
                                     f"Flash Attention (v2) could not be loaded for {source_path}. "
                                     f"Error: {err_str}. Falling back to 'eager' implementation."
@@ -606,7 +697,10 @@ class InferenceManager:
                             raise e
                         raise e
                 except Exception as load_err:
-                    if _is_retryable_cuda_busy_error(load_err) and attempt < max_retries - 1:
+                    if (
+                        _is_retryable_cuda_busy_error(load_err)
+                        and attempt < max_retries - 1
+                    ):
                         retry_context = self._build_runtime_diagnostics_locked(
                             cache_key=cache_key,
                             path=source_path,
@@ -625,7 +719,7 @@ class InferenceManager:
                             level=logging.WARNING,
                         )
                         logger.warning(
-                            f"CUDA device busy (attempt {attempt+1}/{max_retries}). "
+                            f"CUDA device busy (attempt {attempt + 1}/{max_retries}). "
                             f"Retrying in {retry_delay}s..."
                         )
                         time.sleep(retry_delay)
@@ -634,8 +728,12 @@ class InferenceManager:
                         raise load_err
 
             if self._compile:
-                with ops_log.operation("model_compile", extra={"path": source_path, "cache_key": cache_key}):
-                    logger.info("Compiling model for faster inference (this may take a few minutes)...")
+                with ops_log.operation(
+                    "model_compile", extra={"path": source_path, "cache_key": cache_key}
+                ):
+                    logger.info(
+                        "Compiling model for faster inference (this may take a few minutes)..."
+                    )
                     model.model = torch.compile(model.model, mode="reduce-overhead")
 
             self._models[cache_key] = (model, model_type, speaker_name)
@@ -647,7 +745,9 @@ class InferenceManager:
                 self._session_pins.setdefault(cache_key, set()).add(session_id)
             self._touch()
 
-            mem = torch.cuda.memory_allocated(0) / 1e9 if torch.cuda.is_available() else 0
+            mem = (
+                torch.cuda.memory_allocated(0) / 1e9 if torch.cuda.is_available() else 0
+            )
             logger.info(
                 f"{model_type} model loaded into cache as {cache_key}. "
                 f"Counts: {self.loaded_count}/{self._max_models}. GPU: {mem:.2f} GB"
@@ -675,10 +775,15 @@ class InferenceManager:
             )
             raise
 
-    def _enforce_cache_size(self, reserve: int = 0):
+    def _enforce_cache_size(self, reserve: int = 0) -> bool:
         """Internal: remove LRU models if over capacity (caller must hold lock).
-        Respects session-pinned AND in-use models (won't evict them)."""
-        while len(self._models) > (self._max_models - reserve) and self._models:
+        Respects session-pinned AND in-use models (won't evict them).
+
+        Returns True only when the requested number of cache slots is available.
+        """
+        target_size = max(0, self._max_models - max(0, int(reserve)))
+        evicted_any = False
+        while len(self._models) > target_size and self._models:
             evicted = False
             for path in list(self._models.keys()):
                 # Skip models actively running inference
@@ -692,17 +797,44 @@ class InferenceManager:
                 logger.info(f"LRU Eviction: Unloading {mtype} model from {path}")
                 ops_log.log_event("model_eviction", extra={"path": path, "type": mtype})
                 del model
+                del model_tuple
                 self._execution_locks.pop(path, None)
                 self._shared_replica_loads.pop(path, None)
+                self._session_pins.pop(path, None)
+                self._models_in_use.pop(path, None)
                 self._total_unloads += 1
                 evicted = True
+                evicted_any = True
                 break
             if not evicted:
-                logger.warning("Cannot evict any models — all in-use or session-pinned")
+                blockers = {
+                    path: {
+                        "in_use": self._models_in_use.get(path, 0),
+                        "session_pins": sorted(self._session_pins.get(path, set())),
+                    }
+                    for path in self._models
+                }
+                logger.warning(
+                    "Cannot evict models for cache admission: target=%d blockers=%s",
+                    target_size,
+                    blockers,
+                )
+                ops_log.log_event(
+                    "model_eviction_blocked",
+                    extra={
+                        "target_size": target_size,
+                        "loaded_count": self.loaded_count,
+                        "blockers": blockers,
+                    },
+                    level=logging.WARNING,
+                )
                 break
-        
-        if torch.cuda.is_available():
+
+        if evicted_any:
+            self._purge_cuda_allocator_cache()
+        elif torch.cuda.is_available():
             torch.cuda.empty_cache()
+        return len(self._models) <= target_size
 
     def _mark_in_use(self, path: str):
         """Mark a model as actively running inference (caller holds lock)."""
@@ -727,7 +859,9 @@ class InferenceManager:
         return f"{source_path}::replica-{replica_index}"
 
     @staticmethod
-    def _clone_prompt_cache_key(ref_audio: Any, ref_text: Any, xvec_only: Any) -> Optional[tuple[str, str, bool]]:
+    def _clone_prompt_cache_key(
+        ref_audio: Any, ref_text: Any, xvec_only: Any
+    ) -> Optional[tuple[str, str, bool]]:
         if not isinstance(ref_audio, str):
             return None
         return (ref_audio, ref_text or "", bool(xvec_only))
@@ -745,7 +879,9 @@ class InferenceManager:
             ref_text=getattr(prompt_item, "ref_text", None),
         )
 
-    def _get_cached_clone_prompt_item(self, cache_key: Optional[tuple[str, str, bool]]) -> Any:
+    def _get_cached_clone_prompt_item(
+        self, cache_key: Optional[tuple[str, str, bool]]
+    ) -> Any:
         if cache_key is None:
             return None
         with self._lock:
@@ -755,14 +891,19 @@ class InferenceManager:
             self._voice_clone_prompt_cache.move_to_end(cache_key)
             return self._clone_prompt_item_to_cpu(prompt_item)
 
-    def _store_cached_clone_prompt_item(self, cache_key: Optional[tuple[str, str, bool]], prompt_item: Any) -> None:
+    def _store_cached_clone_prompt_item(
+        self, cache_key: Optional[tuple[str, str, bool]], prompt_item: Any
+    ) -> None:
         if cache_key is None:
             return
         cached_item = self._clone_prompt_item_to_cpu(prompt_item)
         with self._lock:
             self._voice_clone_prompt_cache[cache_key] = cached_item
             self._voice_clone_prompt_cache.move_to_end(cache_key)
-            while len(self._voice_clone_prompt_cache) > self._voice_clone_prompt_cache_max_entries:
+            while (
+                len(self._voice_clone_prompt_cache)
+                > self._voice_clone_prompt_cache_max_entries
+            ):
                 self._voice_clone_prompt_cache.popitem(last=False)
 
     def _move_cache_entry_locked(self, old_key: str, new_key: str) -> bool:
@@ -778,7 +919,9 @@ class InferenceManager:
         if old_key in self._execution_locks:
             self._execution_locks[new_key] = self._execution_locks.pop(old_key)
         if old_key in self._shared_replica_loads:
-            self._shared_replica_loads[new_key] = self._shared_replica_loads.pop(old_key)
+            self._shared_replica_loads[new_key] = self._shared_replica_loads.pop(
+                old_key
+            )
         if old_key in self._session_pins:
             self._session_pins[new_key] = self._session_pins.pop(old_key)
         if self._last_path == old_key:
@@ -788,7 +931,10 @@ class InferenceManager:
 
     def _shared_replica_keys(self, source_path: str, model_type: str) -> list[str]:
         replica_count = max(1, int(self._shared_model_replicas.get(model_type, 1)))
-        return [self._build_shared_replica_key(source_path, idx) for idx in range(replica_count)]
+        return [
+            self._build_shared_replica_key(source_path, idx)
+            for idx in range(replica_count)
+        ]
 
     def _has_shared_replica_headroom_locked(self) -> bool:
         if not torch.cuda.is_available():
@@ -825,7 +971,11 @@ class InferenceManager:
                     key,
                 ),
             )
-            selection_kind = "expand_or_load" if selected not in loaded_candidates else "reuse_loaded"
+            selection_kind = (
+                "expand_or_load"
+                if selected not in loaded_candidates
+                else "reuse_loaded"
+            )
             selection_context = self._build_runtime_diagnostics_locked(
                 model_type=model_type,
                 source_path=source_path,
@@ -838,7 +988,9 @@ class InferenceManager:
                 can_expand=can_expand,
             )
             ops_log.log_event("shared_replica_selection", extra=selection_context)
-            self._shared_replica_loads[selected] = self._shared_replica_loads.get(selected, 0) + 1
+            self._shared_replica_loads[selected] = (
+                self._shared_replica_loads.get(selected, 0) + 1
+            )
             return selected
 
     def _release_shared_replica(self, cache_key: str):
@@ -901,8 +1053,13 @@ class InferenceManager:
     def _unload_all_unsafe(self):
         count = len(self._models)
         self._models.clear()
+        self._models_in_use.clear()
+        self._session_pins.clear()
         self._execution_locks.clear()
         self._shared_replica_loads.clear()
+        self._last_path = None
+        self._last_type = None
+        self._last_speaker = None
         self._cancel_idle_timer()
         snapshot = self._purge_cuda_allocator_cache()
         if count > 0:
@@ -923,7 +1080,10 @@ class InferenceManager:
     # -- Session-aware loading ------------------------------------------------
 
     def load_for_session(
-        self, cache_key: str, checkpoint_path: str, speaker_name: str,
+        self,
+        cache_key: str,
+        checkpoint_path: str,
+        speaker_name: str,
         session_id: str = "",
     ):
         """Load a model for a session, optionally as a replica.
@@ -962,6 +1122,19 @@ class InferenceManager:
         """Unload a specific model by its cache key."""
         with self._lock:
             if cache_key in self._models:
+                in_use = self._models_in_use.get(cache_key, 0)
+                session_pins = self._session_pins.get(cache_key, set())
+                if in_use > 0 or session_pins:
+                    ops_log.log_event(
+                        "model_unload_blocked",
+                        extra={
+                            "cache_key": cache_key,
+                            "in_use": in_use,
+                            "session_pins": sorted(session_pins),
+                        },
+                        level=logging.WARNING,
+                    )
+                    return False
                 model, mtype, _ = self._models.pop(cache_key)
                 del model
                 self._total_unloads += 1
@@ -996,13 +1169,15 @@ class InferenceManager:
             "session_pinned": len(self._session_pins),
         }
 
-    def _get_model(self, path: str, model_type: str, speaker_name: Optional[str] = None):
+    def _get_model(
+        self, path: str, model_type: str, speaker_name: Optional[str] = None
+    ):
         """Get model from cache or load it (caller holds lock)."""
         if path in self._models:
             self._models.move_to_end(path)
             self._touch()
             return self._models[path][0], self._models[path][2]
-        
+
         # Load it
         model = self._load_model(path, model_type, speaker_name)
         return model, speaker_name
@@ -1061,11 +1236,15 @@ class InferenceManager:
             self._gpu_controller.begin_inference("inference_custom_voice_batch")
 
         # Acquire semaphore FIRST to limit concurrent model usage to max_models
-        with ops_log.operation("gpu_resource_wait", extra={"checkpoint": checkpoint_path}):
+        with ops_log.operation(
+            "gpu_resource_wait", extra={"checkpoint": checkpoint_path}
+        ):
             self._inference_limiter.acquire("inference_custom_voice_batch")
         try:
             with self._lock:
-                model, spk = self._get_model(checkpoint_path, "custom_voice", speaker_name)
+                model, spk = self._get_model(
+                    checkpoint_path, "custom_voice", speaker_name
+                )
                 self._mark_in_use(checkpoint_path)
                 self._total_requests += len(texts)
             model_lock = self._get_execution_lock(checkpoint_path)
@@ -1073,14 +1252,22 @@ class InferenceManager:
             try:
                 with self._track_active():
                     effective_generate_kwargs = dict(generation_kwargs)
-                    if max_new_tokens is not None and "max_new_tokens" not in effective_generate_kwargs:
+                    if (
+                        max_new_tokens is not None
+                        and "max_new_tokens" not in effective_generate_kwargs
+                    ):
                         effective_generate_kwargs["max_new_tokens"] = max_new_tokens
-                    op = ops_log.start("inference_custom_voice_batch", extra={
-                        "batch_size": len(texts),
-                        "speaker": spk,
-                        "max_new_tokens": effective_generate_kwargs.get("max_new_tokens"),
-                        "do_sample": effective_generate_kwargs.get("do_sample"),
-                    })
+                    op = ops_log.start(
+                        "inference_custom_voice_batch",
+                        extra={
+                            "batch_size": len(texts),
+                            "speaker": spk,
+                            "max_new_tokens": effective_generate_kwargs.get(
+                                "max_new_tokens"
+                            ),
+                            "do_sample": effective_generate_kwargs.get("do_sample"),
+                        },
+                    )
                     logger.info(
                         "Speaker '%s' started saying %s texts (max_new_tokens=%s, do_sample=%s).",
                         spk,
@@ -1089,7 +1276,9 @@ class InferenceManager:
                         effective_generate_kwargs.get("do_sample"),
                     )
                     try:
-                        speakers = [self._normalize_speaker_name(spk) if spk else spk] * len(texts)
+                        speakers = [
+                            self._normalize_speaker_name(spk) if spk else spk
+                        ] * len(texts)
 
                         with model_lock:
                             wavs_list, sr = model.generate_custom_voice(
@@ -1101,12 +1290,16 @@ class InferenceManager:
                             )
 
                         # Encode WAVs in parallel on CPU threads (frees GPU thread)
-                        results = list(self._wav_pool.map(
-                            lambda w: self._encode_wav(w, sr), wavs_list
-                        ))
+                        results = list(
+                            self._wav_pool.map(
+                                lambda w: self._encode_wav(w, sr), wavs_list
+                            )
+                        )
 
                         ops_log.end(op, extra={"sample_rate": sr})
-                        logger.info(f"Speaker '{spk}' finished saying {len(texts)} texts.")
+                        logger.info(
+                            f"Speaker '{spk}' finished saying {len(texts)} texts."
+                        )
                         return results, sr
                     except Exception as e:
                         ops_log.fail(op, str(e))
@@ -1129,13 +1322,17 @@ class InferenceManager:
         **generation_kwargs,
     ) -> tuple[bytes, int]:
         """Generate speech using CustomVoice model. Auto-loads if not in cache."""
-        with ops_log.operation("gpu_resource_wait", extra={"checkpoint": checkpoint_path}):
+        with ops_log.operation(
+            "gpu_resource_wait", extra={"checkpoint": checkpoint_path}
+        ):
             if self._gpu_controller:
                 self._gpu_controller.begin_inference("inference_custom_voice")
             self._inference_limiter.acquire("inference_custom_voice")
         try:
             with self._lock:
-                model, spk = self._get_model(checkpoint_path, "custom_voice", speaker_name)
+                model, spk = self._get_model(
+                    checkpoint_path, "custom_voice", speaker_name
+                )
                 self._mark_in_use(checkpoint_path)
                 self._total_requests += 1
             model_lock = self._get_execution_lock(checkpoint_path)
@@ -1143,15 +1340,23 @@ class InferenceManager:
             try:
                 with self._track_active():
                     effective_generate_kwargs = dict(generation_kwargs)
-                    if max_new_tokens is not None and "max_new_tokens" not in effective_generate_kwargs:
+                    if (
+                        max_new_tokens is not None
+                        and "max_new_tokens" not in effective_generate_kwargs
+                    ):
                         effective_generate_kwargs["max_new_tokens"] = max_new_tokens
-                    op = ops_log.start("inference_custom_voice", extra={
-                        "text_length": len(text),
-                        "language": language,
-                        "speaker": spk,
-                        "max_new_tokens": effective_generate_kwargs.get("max_new_tokens"),
-                        "do_sample": effective_generate_kwargs.get("do_sample"),
-                    })
+                    op = ops_log.start(
+                        "inference_custom_voice",
+                        extra={
+                            "text_length": len(text),
+                            "language": language,
+                            "speaker": spk,
+                            "max_new_tokens": effective_generate_kwargs.get(
+                                "max_new_tokens"
+                            ),
+                            "do_sample": effective_generate_kwargs.get("do_sample"),
+                        },
+                    )
                     logger.info(
                         "Speaker '%s' started saying text: '%s...' (max_new_tokens=%s, do_sample=%s)",
                         spk,
@@ -1164,13 +1369,17 @@ class InferenceManager:
                             wavs, sr = model.generate_custom_voice(
                                 text=text,
                                 language=language,
-                                speaker=self._normalize_speaker_name(spk) if spk else spk,
+                                speaker=self._normalize_speaker_name(spk)
+                                if spk
+                                else spk,
                                 instruct=instruct if instruct else None,
                                 **effective_generate_kwargs,
                             )
 
                         result = self._encode_wav(wavs[0], sr)
-                        ops_log.end(op, extra={"audio_bytes": len(result), "sample_rate": sr})
+                        ops_log.end(
+                            op, extra={"audio_bytes": len(result), "sample_rate": sr}
+                        )
                         return result, sr
                     except Exception as e:
                         ops_log.fail(op, str(e))
@@ -1202,7 +1411,9 @@ class InferenceManager:
         try:
             try:
                 with self._lock:
-                    model, _ = self._get_model_by_cache_key(cache_key, VOICE_DESIGN_MODEL, "voice_design")
+                    model, _ = self._get_model_by_cache_key(
+                        cache_key, VOICE_DESIGN_MODEL, "voice_design"
+                    )
                     self._mark_in_use(cache_key)
                     self._total_requests += len(texts)
             except Exception as e:
@@ -1225,11 +1436,16 @@ class InferenceManager:
 
             try:
                 with self._track_active():
-                    op = ops_log.start("inference_voice_design_batch", extra={
-                        "batch_size": len(texts),
-                        "cache_key": cache_key,
-                    })
-                    logger.info(f"VoiceDesign started for {len(texts)} texts on {cache_key}.")
+                    op = ops_log.start(
+                        "inference_voice_design_batch",
+                        extra={
+                            "batch_size": len(texts),
+                            "cache_key": cache_key,
+                        },
+                    )
+                    logger.info(
+                        f"VoiceDesign started for {len(texts)} texts on {cache_key}."
+                    )
                     try:
                         with model_lock:
                             wavs_list, sr = model.generate_voice_design(
@@ -1239,12 +1455,16 @@ class InferenceManager:
                             )
 
                         # Encode WAVs in parallel on CPU threads (frees GPU thread)
-                        results = list(self._wav_pool.map(
-                            lambda w: self._encode_wav(w, sr), wavs_list
-                        ))
+                        results = list(
+                            self._wav_pool.map(
+                                lambda w: self._encode_wav(w, sr), wavs_list
+                            )
+                        )
 
                         ops_log.end(op, extra={"sample_rate": sr})
-                        logger.info(f"VoiceDesign finished for {len(texts)} texts on {cache_key}.")
+                        logger.info(
+                            f"VoiceDesign finished for {len(texts)} texts on {cache_key}."
+                        )
                         return results, sr
                     except Exception as e:
                         ops_log.fail(op, str(e))
@@ -1272,7 +1492,9 @@ class InferenceManager:
         try:
             try:
                 with self._lock:
-                    model, _ = self._get_model_by_cache_key(cache_key, VOICE_DESIGN_MODEL, "voice_design")
+                    model, _ = self._get_model_by_cache_key(
+                        cache_key, VOICE_DESIGN_MODEL, "voice_design"
+                    )
                     self._mark_in_use(cache_key)
                     self._total_requests += 1
             except Exception as e:
@@ -1296,13 +1518,18 @@ class InferenceManager:
 
             try:
                 with self._track_active():
-                    op = ops_log.start("inference_voice_design", extra={
-                        "text_length": len(text),
-                        "instruct_length": len(instruct),
-                        "language": language,
-                        "cache_key": cache_key,
-                    })
-                    logger.info(f"VoiceDesign started for text on {cache_key}: '{text[:50]}...'")
+                    op = ops_log.start(
+                        "inference_voice_design",
+                        extra={
+                            "text_length": len(text),
+                            "instruct_length": len(instruct),
+                            "language": language,
+                            "cache_key": cache_key,
+                        },
+                    )
+                    logger.info(
+                        f"VoiceDesign started for text on {cache_key}: '{text[:50]}...'"
+                    )
                     try:
                         with model_lock:
                             wavs, sr = model.generate_voice_design(
@@ -1312,7 +1539,9 @@ class InferenceManager:
                             )
 
                         result = self._encode_wav(wavs[0], sr)
-                        ops_log.end(op, extra={"audio_bytes": len(result), "sample_rate": sr})
+                        ops_log.end(
+                            op, extra={"audio_bytes": len(result), "sample_rate": sr}
+                        )
                         return result, sr
                     except Exception as e:
                         ops_log.fail(op, str(e))
@@ -1373,48 +1602,85 @@ class InferenceManager:
 
         with ops_log.operation("gpu_resource_wait", extra={"model": "voice_clone"}):
             if self._gpu_controller:
-                self._gpu_controller.begin_inference("inference_voice_clone_flexible_batch")
+                self._gpu_controller.begin_inference(
+                    "inference_voice_clone_flexible_batch"
+                )
             self._inference_limiter.acquire("inference_voice_clone_flexible_batch")
         cache_key = self._acquire_shared_replica(VOICE_CLONE_MODEL, "voice_clone")
         try:
             with self._lock:
-                model, _ = self._get_model_by_cache_key(cache_key, VOICE_CLONE_MODEL, "voice_clone")
+                model, _ = self._get_model_by_cache_key(
+                    cache_key, VOICE_CLONE_MODEL, "voice_clone"
+                )
                 self._mark_in_use(cache_key)
                 self._total_requests += len(texts)
             model_lock = self._get_execution_lock(cache_key)
 
             try:
                 with self._track_active():
-                    op = ops_log.start("inference_voice_clone_flexible_batch", extra={
-                        "batch_size": len(texts),
-                        "cache_key": cache_key,
-                    })
+                    op = ops_log.start(
+                        "inference_voice_clone_flexible_batch",
+                        extra={
+                            "batch_size": len(texts),
+                            "cache_key": cache_key,
+                        },
+                    )
                     try:
                         prompt_scan_started_at = time.monotonic()
                         prompt_items: list[Any] = []
-                        pending_prompt_misses: list[tuple[int, Any, Any, Any, Optional[tuple[str, str, bool]]]] = []
-                        pending_prompt_miss_positions: Dict[tuple[str, str, bool], list[int]] = {}
+                        pending_prompt_misses: list[
+                            tuple[int, Any, Any, Any, Optional[tuple[str, str, bool]]]
+                        ] = []
+                        pending_prompt_miss_positions: Dict[
+                            tuple[str, str, bool], list[int]
+                        ] = {}
                         prompt_cache_hits = 0
 
-                        for index, (ref_audio, ref_text, xvec_only) in enumerate(zip(ref_audios, ref_texts, x_vector_only_modes)):
-                            prompt_cache_key = self._clone_prompt_cache_key(ref_audio, ref_text, xvec_only)
-                            prompt_item = self._get_cached_clone_prompt_item(prompt_cache_key)
+                        for index, (ref_audio, ref_text, xvec_only) in enumerate(
+                            zip(ref_audios, ref_texts, x_vector_only_modes)
+                        ):
+                            prompt_cache_key = self._clone_prompt_cache_key(
+                                ref_audio, ref_text, xvec_only
+                            )
+                            prompt_item = self._get_cached_clone_prompt_item(
+                                prompt_cache_key
+                            )
                             if prompt_item is not None:
                                 prompt_cache_hits += 1
                                 prompt_items.append(prompt_item)
                             else:
                                 prompt_items.append(None)
-                                if prompt_cache_key is not None and prompt_cache_key in pending_prompt_miss_positions:
-                                    pending_prompt_miss_positions[prompt_cache_key].append(index)
+                                if (
+                                    prompt_cache_key is not None
+                                    and prompt_cache_key
+                                    in pending_prompt_miss_positions
+                                ):
+                                    pending_prompt_miss_positions[
+                                        prompt_cache_key
+                                    ].append(index)
                                     continue
-                                pending_prompt_misses.append((index, ref_audio, ref_text, xvec_only, prompt_cache_key))
+                                pending_prompt_misses.append(
+                                    (
+                                        index,
+                                        ref_audio,
+                                        ref_text,
+                                        xvec_only,
+                                        prompt_cache_key,
+                                    )
+                                )
                                 if prompt_cache_key is not None:
-                                    pending_prompt_miss_positions[prompt_cache_key] = [index]
+                                    pending_prompt_miss_positions[prompt_cache_key] = [
+                                        index
+                                    ]
 
-                        unique_ref_count = len({
-                            self._clone_prompt_cache_key(a, t, x)
-                            for a, t, x in zip(ref_audios, ref_texts, x_vector_only_modes)
-                        })
+                        unique_ref_count = len(
+                            {
+                                self._clone_prompt_cache_key(a, t, x)
+                                for a, t, x in zip(
+                                    ref_audios, ref_texts, x_vector_only_modes
+                                )
+                            }
+                        )
                         lock_wait_started_at = time.monotonic()
                         logger.info(
                             "VoiceClone flexible awaiting execution lock on %s: texts=%d unique_refs=%d prompt_cache_hits=%d prompt_cache_misses=%d",
@@ -1428,7 +1694,13 @@ class InferenceManager:
                         lock_wait_seconds = time.monotonic() - lock_wait_started_at
                         try:
                             prompt_build_started_at = time.monotonic()
-                            for index, ref_audio, ref_text, xvec_only, prompt_cache_key in pending_prompt_misses:
+                            for (
+                                index,
+                                ref_audio,
+                                ref_text,
+                                xvec_only,
+                                prompt_cache_key,
+                            ) in pending_prompt_misses:
                                 built_items = model.create_voice_clone_prompt(
                                     ref_audio=ref_audio,
                                     ref_text=ref_text,
@@ -1436,20 +1708,26 @@ class InferenceManager:
                                 )
                                 prompt_item = built_items[0]
                                 target_indexes = (
-                                    pending_prompt_miss_positions.get(prompt_cache_key, [index])
+                                    pending_prompt_miss_positions.get(
+                                        prompt_cache_key, [index]
+                                    )
                                     if prompt_cache_key is not None
                                     else [index]
                                 )
                                 for target_index in target_indexes:
                                     prompt_items[target_index] = prompt_item
                                 if prompt_cache_key is not None:
-                                    self._store_cached_clone_prompt_item(prompt_cache_key, prompt_item)
+                                    self._store_cached_clone_prompt_item(
+                                        prompt_cache_key, prompt_item
+                                    )
 
                             assert all(p is not None for p in prompt_items), (
                                 f"prompt_items has None entries: {[i for i, p in enumerate(prompt_items) if p is None]}"
                             )
 
-                            prompt_build_seconds = time.monotonic() - prompt_build_started_at
+                            prompt_build_seconds = (
+                                time.monotonic() - prompt_build_started_at
+                            )
                             logger.info(
                                 "VoiceClone flexible lock acquired on %s after %.3fs: prompt_scan=%.3fs prompt_build=%.3fs unique_refs=%d cache_hits=%d cache_misses=%d",
                                 cache_key,
@@ -1484,9 +1762,11 @@ class InferenceManager:
 
                         # Encode WAVs in parallel on CPU threads (frees GPU thread)
                         t1 = time.monotonic()
-                        results = list(self._wav_pool.map(
-                            lambda w: self._encode_wav(w, sr), wavs_list
-                        ))
+                        results = list(
+                            self._wav_pool.map(
+                                lambda w: self._encode_wav(w, sr), wavs_list
+                            )
+                        )
                         logger.info(
                             "VoiceClone flexible WAV encoding finished in %.3fs: texts=%d bytes=%d",
                             time.monotonic() - t1,

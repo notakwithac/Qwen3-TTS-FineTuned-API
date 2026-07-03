@@ -2,7 +2,9 @@ import sys
 import types
 from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 
 class _DummyBroadcast:
@@ -46,6 +48,27 @@ sys.modules["broadcaster"] = broadcast_module
 
 import api_server
 from pipeline import Job, JobStatus
+
+
+def test_inference_requests_accept_huggingface_model_source():
+    source = {
+        "provider": "huggingface",
+        "repo_id": "notakwithac/Qwen3-Narrator-job-1",
+        "filename": "checkpoint-epoch-14.zip",
+        "checkpoint_epoch": 14,
+    }
+    assert api_server.InferRequest(text="Hello", model_source=source).model_source.repo_id == source["repo_id"]
+    assert api_server.SessionPrepareRequest(
+        characters=[{"job_id": "job-1", "character_name": "Narrator", "model_source": source}]
+    ).characters[0].model_source.filename == source["filename"]
+
+
+def test_huggingface_model_source_rejects_path_traversal():
+    with pytest.raises(ValidationError, match="relative basename"):
+        api_server.HuggingFaceModelSource(
+            repo_id="notakwithac/Qwen3-Narrator-job-1",
+            filename="../checkpoint-epoch-14.zip",
+        )
 
 
 def _patch_startup_dependencies(monkeypatch):

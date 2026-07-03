@@ -48,6 +48,7 @@ The result is a service that can train a voice, generate speech, recover from fa
 | Voice design | Creates speech from a natural-language voice description | `POST /voice-design` |
 | Zero-shot clone | Clones a voice from reference audio and its transcript | `POST /voice-clone` |
 | Dataset preparation | Transcribes and prepares candidate clips for human review and packaging | `POST /dataset/prepare` |
+| Local dataset synthesis | Expands an authorized reference voice into Qwen-ready dialogue clips with dots.tts-mf | [docs/dots-tts-dataset.md](docs/dots-tts-dataset.md) |
 | Event-driven narration | Preloads character models and processes queued lines in the background | `POST /session/prepare` |
 | Translation | Translates text across English and 22 Indian languages | `POST /translate` |
 

@@ -9,7 +9,7 @@ FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime
 
 # System dependencies required at runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg libsndfile1 sox \
+    ffmpeg libsndfile1 sox gcc g++ \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -30,6 +30,7 @@ RUN pip install --no-cache-dir -c /tmp/pytorch-constraints.txt \
     "transformers==4.57.3" \
     "accelerate==1.12.0" \
     vllm \
+    bitsandbytes \
     einops \
     requests \
     boto3 \

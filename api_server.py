@@ -46,6 +46,7 @@ from session_manager import (
 )
 from metrics_collector import metrics_collector
 from gpu_resource_controller import GPUResourceController
+from inference_manager import GpuCapacityError
 from gpu_lease_manager import (
     GpuLeaseManager,
     InvalidLeaseTokenError,
@@ -368,8 +369,8 @@ async def _lifespan(app):
     # Startup: start session cleanup loop and resource monitoring
     session_mgr.start_cleanup_loop()
     metrics_collector.start()
-    _log_flash_attn_runtime_diagnostics()
     app.state.gpu_lease_reaper_task = asyncio.create_task(_gpu_lease_reaper_loop())
+    _log_flash_attn_runtime_diagnostics()
     if STARTUP_PRELOAD_SHARED_MODELS:
         app.state.startup_preload_task = asyncio.create_task(_background_startup_preload_shared_models())
     else:
@@ -390,12 +391,12 @@ async def _lifespan(app):
     sys.stdout = sys.__stdout__
     # Shutdown: stop metrics collector and wait for any in-progress S3 uploads
     metrics_collector.stop()
-    preload_task = getattr(app.state, "startup_preload_task", None)
     lease_reaper_task = app.state.gpu_lease_reaper_task
     lease_reaper_task.cancel()
     with suppress(asyncio.CancelledError):
         await lease_reaper_task
     await asyncio.to_thread(gpu_lease_manager.close)
+    preload_task = getattr(app.state, "startup_preload_task", None)
     if preload_task is not None:
         await preload_task
     logger.info("Server shutting down — waiting for pending S3 uploads...")
@@ -549,6 +550,22 @@ def _sarvam_upstream_url(path: str) -> str:
     return f"{base_url}/{path.lstrip('/')}"
 
 
+def _sarvam_error_detail(exc: Exception) -> dict[str, Any]:
+    detail: dict[str, Any] = {
+        "code": "sarvam_timeout" if isinstance(exc, requests.ReadTimeout) else "sarvam_unavailable",
+        "message": f"Sarvam vLLM backend unavailable: {exc}",
+        "timeout_seconds": SARVAM_VLLM_TIMEOUT_SECONDS,
+    }
+    if MANAGED_VLLM_ENABLED:
+        try:
+            service = vllm_runtime.get("sarvam")
+            detail["log_path"] = service.log_path or None
+            detail["log_tail"] = vllm_runtime.tail_log("sarvam", max_chars=2000)
+        except Exception as log_exc:
+            detail["log_tail"] = f"Could not read Sarvam vLLM log tail: {log_exc}"
+    return detail
+
+
 def _prepare_managed_vllm(service_name: str) -> None:
     if not MANAGED_VLLM_ENABLED:
         return
@@ -580,7 +597,7 @@ async def _forward_gemma_vllm(path: str, payload: dict[str, Any]) -> Response:
             None,
             lambda: pipeline.inference.run_external_gpu_call("inference_gemma_vllm", _call_upstream),
         )
-    except requests.RequestException as exc:
+    except (requests.RequestException, RuntimeError, TimeoutError, OSError) as exc:
         logger.warning("Gemma vLLM request failed: %s", exc)
         raise HTTPException(status_code=503, detail=f"Gemma vLLM backend unavailable: {exc}") from exc
 
@@ -663,6 +680,16 @@ class TranslateRequest(BaseModel):
 @app.post("/translate", summary="Translate text with managed Sarvam vLLM")
 async def translate(req: TranslateRequest):
     """Translate text through Sarvam vLLM under the exclusive GPU runtime manager."""
+    logger.info(
+        "Sarvam translate request: source_language=%s target_language=%s text_chars=%s "
+        "max_new_tokens=%s managed_vllm=%s timeout_seconds=%s",
+        req.source_language,
+        req.target_language,
+        len(req.text),
+        req.max_new_tokens,
+        MANAGED_VLLM_ENABLED,
+        SARVAM_VLLM_TIMEOUT_SECONDS,
+    )
     prompt = (
         f"Translate from {req.source_language} to {req.target_language}. "
         "Return only the translated text.\n\n"
@@ -678,6 +705,7 @@ async def translate(req: TranslateRequest):
     }
 
     def _call_upstream():
+        started_at = time.perf_counter()
         _prepare_managed_vllm("sarvam")
         response = requests.post(
             _sarvam_upstream_url("chat/completions"),
@@ -692,6 +720,16 @@ async def translate(req: TranslateRequest):
         choices = data.get("choices") or []
         message = choices[0].get("message", {}) if choices else {}
         translated = (message.get("content") or choices[0].get("text", "")) if choices else ""
+        logger.info(
+            "Sarvam translate response: source_language=%s target_language=%s text_chars=%s "
+            "max_new_tokens=%s translated_chars=%s elapsed=%.3fs",
+            req.source_language,
+            req.target_language,
+            len(req.text),
+            req.max_new_tokens,
+            len(translated),
+            time.perf_counter() - started_at,
+        )
         return {
             "text": translated.strip(),
             "source_language": req.source_language,
@@ -705,9 +743,9 @@ async def translate(req: TranslateRequest):
             None,
             lambda: pipeline.inference.run_external_gpu_call("inference_sarvam_vllm", _call_upstream),
         )
-    except requests.RequestException as exc:
+    except (requests.RequestException, RuntimeError, TimeoutError, OSError) as exc:
         logger.warning("Sarvam vLLM request failed: %s", exc)
-        raise HTTPException(status_code=503, detail=f"Sarvam vLLM backend unavailable: {exc}") from exc
+        raise HTTPException(status_code=503, detail=_sarvam_error_detail(exc)) from exc
 
 
 @app.get("/vllm/status", summary="Managed vLLM runtime status")
@@ -810,11 +848,11 @@ VOICE_CLONE_REPLICAS = int(os.environ.get("VOICE_CLONE_REPLICAS", "1"))
 SHARED_MODEL_MIN_HEADROOM_GB = float(os.environ.get("SHARED_MODEL_MIN_HEADROOM_GB", "4"))
 MANAGED_VLLM_ENABLED = os.environ.get("MANAGED_VLLM_ENABLED", "1") == "1"
 MANAGED_VLLM_IDLE_TIMEOUT_SECONDS = float(os.environ.get("MANAGED_VLLM_IDLE_TIMEOUT_SECONDS", "120"))
-GEMMA_VLLM_BASE_URL = os.environ.get("GEMMA_VLLM_BASE_URL", "http://127.0.0.1:8101/v1").rstrip("/")
 GPU_LEASE_DEFAULT_TTL_SECONDS = max(
     30,
     min(900, int(os.environ.get("GPU_LEASE_DEFAULT_TTL_SECONDS", "120"))),
 )
+GEMMA_VLLM_BASE_URL = os.environ.get("GEMMA_VLLM_BASE_URL", "http://127.0.0.1:8101/v1").rstrip("/")
 GEMMA_VLLM_HF_MODEL = os.environ.get("GEMMA_VLLM_HF_MODEL", "google/gemma-3-12b-it")
 GEMMA_VLLM_MODEL = os.environ.get("GEMMA_VLLM_MODEL", "e4b")
 GEMMA_VLLM_PORT = int(os.environ.get("GEMMA_VLLM_PORT", "8101"))
@@ -828,9 +866,16 @@ SARVAM_VLLM_HF_MODEL = os.environ.get("SARVAM_VLLM_HF_MODEL", "sarvamai/sarvam-t
 SARVAM_VLLM_MODEL = os.environ.get("SARVAM_VLLM_MODEL", "sarvam-translate")
 SARVAM_VLLM_PORT = int(os.environ.get("SARVAM_VLLM_PORT", "8102"))
 SARVAM_VLLM_API_KEY = os.environ.get("SARVAM_VLLM_API_KEY", "EMPTY")
-SARVAM_VLLM_TIMEOUT_SECONDS = float(os.environ.get("SARVAM_VLLM_TIMEOUT_SECONDS", "300"))
-SARVAM_VLLM_GPU_MEMORY_UTILIZATION = os.environ.get("SARVAM_VLLM_GPU_MEMORY_UTILIZATION", "0.45")
-SARVAM_VLLM_MAX_MODEL_LEN = os.environ.get("SARVAM_VLLM_MAX_MODEL_LEN", "4096")
+SARVAM_VLLM_TIMEOUT_SECONDS = float(os.environ.get("SARVAM_VLLM_TIMEOUT_SECONDS", "600"))
+SARVAM_VLLM_GPU_MEMORY_UTILIZATION = os.environ.get("SARVAM_VLLM_GPU_MEMORY_UTILIZATION", "0.88")
+SARVAM_VLLM_MAX_MODEL_LEN = os.environ.get("SARVAM_VLLM_MAX_MODEL_LEN", "2048")
+SARVAM_VLLM_MAX_NUM_BATCHED_TOKENS = os.environ.get("SARVAM_VLLM_MAX_NUM_BATCHED_TOKENS", "1024")
+SARVAM_VLLM_USE_HF_TOKEN = os.environ.get("SARVAM_VLLM_USE_HF_TOKEN", "0") == "1"
+SARVAM_VLLM_ENFORCE_EAGER = os.environ.get("SARVAM_VLLM_ENFORCE_EAGER", "1") == "1"
+SARVAM_VLLM_LIMIT_MM_PER_PROMPT = os.environ.get("SARVAM_VLLM_LIMIT_MM_PER_PROMPT", '{"image":0}')
+SARVAM_VLLM_LOAD_FORMAT = os.environ.get("SARVAM_VLLM_LOAD_FORMAT", "bitsandbytes")
+SARVAM_VLLM_QUANTIZATION = os.environ.get("SARVAM_VLLM_QUANTIZATION", "bitsandbytes")
+SARVAM_VLLM_CPU_OFFLOAD_GB = os.environ.get("SARVAM_VLLM_CPU_OFFLOAD_GB", "")
 
 logger.info(f"Loaded Configuration:")
 logger.info(f"  - DEVICE: {DEVICE}")
@@ -906,6 +951,20 @@ pipeline = Pipeline(
     shared_model_min_headroom_gb=SHARED_MODEL_MIN_HEADROOM_GB,
 )
 
+sarvam_vllm_extra_args = []
+if SARVAM_VLLM_ENFORCE_EAGER:
+    sarvam_vllm_extra_args.append("--enforce-eager")
+if SARVAM_VLLM_LIMIT_MM_PER_PROMPT:
+    sarvam_vllm_extra_args.extend(["--limit-mm-per-prompt", SARVAM_VLLM_LIMIT_MM_PER_PROMPT])
+if SARVAM_VLLM_MAX_NUM_BATCHED_TOKENS:
+    sarvam_vllm_extra_args.extend(["--max-num-batched-tokens", SARVAM_VLLM_MAX_NUM_BATCHED_TOKENS])
+if SARVAM_VLLM_LOAD_FORMAT:
+    sarvam_vllm_extra_args.extend(["--load-format", SARVAM_VLLM_LOAD_FORMAT])
+if SARVAM_VLLM_QUANTIZATION:
+    sarvam_vllm_extra_args.extend(["--quantization", SARVAM_VLLM_QUANTIZATION])
+if SARVAM_VLLM_CPU_OFFLOAD_GB:
+    sarvam_vllm_extra_args.extend(["--cpu-offload-gb", SARVAM_VLLM_CPU_OFFLOAD_GB])
+
 vllm_runtime = VllmRuntimeManager(
     services={
         "gemma": ManagedVllmService(
@@ -925,15 +984,16 @@ vllm_runtime = VllmRuntimeManager(
             port=SARVAM_VLLM_PORT,
             gpu_memory_utilization=SARVAM_VLLM_GPU_MEMORY_UTILIZATION,
             max_model_len=SARVAM_VLLM_MAX_MODEL_LEN,
+            extra_args=sarvam_vllm_extra_args,
             api_key=SARVAM_VLLM_API_KEY,
             startup_timeout_seconds=SARVAM_VLLM_TIMEOUT_SECONDS,
+            use_hf_token=SARVAM_VLLM_USE_HF_TOKEN,
         ),
     },
     idle_timeout_seconds=MANAGED_VLLM_IDLE_TIMEOUT_SECONDS,
 )
 if MANAGED_VLLM_ENABLED:
     pipeline.inference.set_external_gpu_eviction_callback(vllm_runtime.stop_all)
-
 
 
 def _prepare_gpu_for_external_lease() -> None:
@@ -1469,6 +1529,45 @@ class VoiceDesignResponse(AudioS3Result):
     instruct: str
 
 
+class HuggingFaceModelSource(APIModel):
+    provider: str = "huggingface"
+    repo_id: str
+    filename: Optional[str] = None
+    checkpoint_epoch: Optional[int] = None
+
+    @field_validator("provider")
+    @classmethod
+    def validate_provider(cls, value: str) -> str:
+        if value != "huggingface":
+            raise ValueError("provider must be huggingface")
+        return value
+
+    @field_validator("repo_id")
+    @classmethod
+    def validate_repo_id(cls, value: str) -> str:
+        value = value.strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", value):
+            raise ValueError("repo_id must use owner/repo form")
+        return value
+
+    @field_validator("filename")
+    @classmethod
+    def validate_filename(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value or Path(value).name != value or value in {".", ".."}:
+            raise ValueError("filename must be a relative basename")
+        return value
+
+    @field_validator("checkpoint_epoch")
+    @classmethod
+    def validate_source_checkpoint_epoch(cls, value: Optional[int]) -> Optional[int]:
+        if value is not None and value < 0:
+            raise ValueError("checkpoint_epoch must be >= 0")
+        return value
+
+
 class InferRequest(APIModel):
     text: str
     language: str = "English"
@@ -1484,6 +1583,7 @@ class InferRequest(APIModel):
     chapter_id: Optional[str] = None
     character_id: Optional[str] = None
     overwrite: bool = False  # If false, skips generation if file already exists on S3
+    model_source: Optional[HuggingFaceModelSource] = None
 
     @field_validator("text")
     @classmethod
@@ -1589,6 +1689,7 @@ class BatchInferRequest(APIModel):
     chapter_id: Optional[str] = None
     character_id: Optional[str] = None
     overwrite: bool = False  # Default overwrite flag for all items
+    model_source: Optional[HuggingFaceModelSource] = None
 
     @field_validator("items")
     @classmethod
@@ -2199,6 +2300,13 @@ async def infer(job_id: str, req: InferRequest):
     job = await loop.run_in_executor(None, pipeline.get_job, job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    if req.model_source:
+        await loop.run_in_executor(
+            None,
+            pipeline.apply_model_source,
+            job,
+            req.model_source.model_dump(exclude_none=True),
+        )
 
     if job.status not in (JobStatus.READY, JobStatus.RESTORING):
         # Auto-recover: if job FAILED but training completed (has S3 backup or local checkpoint),
@@ -2362,6 +2470,13 @@ async def infer_batch(job_id: str, req: BatchInferRequest):
     job = await loop.run_in_executor(None, pipeline.get_job, job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    if req.model_source:
+        await loop.run_in_executor(
+            None,
+            pipeline.apply_model_source,
+            job,
+            req.model_source.model_dump(exclude_none=True),
+        )
     if job.status not in (JobStatus.READY, JobStatus.RESTORING):
         _cp_check = str(Path(job.checkpoint_path).resolve()) if job.checkpoint_path else None
         can_recover = job.status == JobStatus.FAILED and (
@@ -3468,6 +3583,7 @@ async def voice_design_batch(req: VoiceDesignBatchRequest):
 # GPU Management
 # ---------------------------------------------------------------------------
 
+
 def require_gpu_lease_key(
     x_gpu_lease_key: str | None = Header(default=None),
 ) -> None:
@@ -3550,7 +3666,6 @@ async def release_gpu_lease(token: str):
     except InvalidLeaseTokenError as exc:
         raise HTTPException(404, str(exc)) from exc
     return {"released": released}
-
 
 @app.get("/gpu/status", summary="GPU and model status")
 async def gpu_status():
@@ -3717,6 +3832,7 @@ class SessionCharacterInfo(BaseModel):
     character_name: str
     line_count: int = 0
     avg_word_count: int = 20
+    model_source: Optional[HuggingFaceModelSource] = None
 
 class SessionPrepareRequest(BaseModel):
     """Prepare a session: pre-load models, create per-character queues."""
@@ -3789,6 +3905,18 @@ async def session_prepare(req: SessionPrepareRequest):
         )
     except TrainingConflictError as e:
         raise HTTPException(status_code=409, detail=str(e))
+    except GpuCapacityError as e:
+        return JSONResponse(
+            status_code=503,
+            headers={"Retry-After": str(e.retry_after_seconds)},
+            content={
+                "detail": {
+                    "code": "gpu_capacity_timeout",
+                    "message": str(e),
+                    "diagnostics": e.diagnostics,
+                }
+            },
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

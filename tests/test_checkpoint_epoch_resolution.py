@@ -1,6 +1,7 @@
 from pathlib import Path
 import sys
 import json
+import zipfile
 
 import pytest
 
@@ -9,6 +10,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import pipeline
+import model_storage
 
 
 def _make_job(tmp_path, *, num_epochs=10):
@@ -282,3 +284,48 @@ def test_resolve_checkpoint_path_restores_from_hf_when_local_missing(tmp_path, m
     assert restored == [9]
     assert resolved_epoch == 9
     assert Path(resolved_path).name == "checkpoint-epoch-9"
+
+
+def test_apply_model_source_repairs_job_hf_metadata(tmp_path, monkeypatch):
+    job = _make_job(tmp_path, num_epochs=14)
+    job.job_dir = str(tmp_path / "jobs" / job.job_id)
+    pipe = pipeline.Pipeline.__new__(pipeline.Pipeline)
+    monkeypatch.setattr(pipe, "_upload_job_json_to_s3", lambda _job: None)
+
+    pipeline.Pipeline.apply_model_source(
+        pipe,
+        job,
+        {
+            "provider": "huggingface",
+            "repo_id": "notakwithac/Qwen3-Narrator-job-epoch-test",
+            "filename": "checkpoint-epoch-14.zip",
+            "checkpoint_epoch": 14,
+        },
+    )
+
+    assert job.hf_model_repo == "notakwithac/Qwen3-Narrator-job-epoch-test"
+    assert job.hf_model_filename == "checkpoint-epoch-14.zip"
+    assert job.checkpoint_hf_repos["14"] == job.hf_model_repo
+
+
+def test_restore_checkpoint_from_hf_extracts_migrated_root_zip(tmp_path, monkeypatch):
+    archive = tmp_path / "checkpoint-epoch-14.zip"
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.writestr("config.json", "{}")
+        handle.writestr("model/model.safetensors", "weights")
+
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda **_kwargs: str(archive))
+    job = _make_job(tmp_path, num_epochs=14)
+    target = tmp_path / "restored" / "checkpoint-epoch-14"
+
+    restored = model_storage.restore_checkpoint_from_hf(
+        job,
+        target,
+        checkpoint_dir_name="checkpoint-epoch-14",
+        repo_id="notakwithac/Qwen3-Narrator-job-epoch-test",
+        filename="checkpoint-epoch-14.zip",
+    )
+
+    assert Path(restored) == target.resolve()
+    assert (target / "config.json").read_text(encoding="utf-8") == "{}"
